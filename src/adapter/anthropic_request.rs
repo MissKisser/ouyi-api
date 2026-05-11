@@ -228,6 +228,7 @@ mod tests {
             top_p: None,
             top_k: None,
             stop_sequences: None,
+            thinking: None,
         }
     }
 
@@ -271,6 +272,7 @@ mod tests {
             top_p: None,
             top_k: None,
             stop_sequences: None,
+            thinking: None,
         };
         let result = convert_anthropic_request(&req, "test", false).unwrap();
         assert!(result.text.contains("<tool_use>"));
@@ -290,6 +292,7 @@ mod tests {
             top_p: None,
             top_k: None,
             stop_sequences: None,
+            thinking: None,
         };
         assert!(convert_anthropic_request(&req, "test", false).is_err());
     }

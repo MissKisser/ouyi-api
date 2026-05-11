@@ -28,6 +28,17 @@ enum BlockType {
     ToolUse,
 }
 
+/// 清理模型输出中的 HTML 实体，还原为标准字符。
+/// 上游模型在生成表格等内容时可能输出 &nbsp; 等 HTML 实体，需要网关侧统一适配。
+fn unescape_html_entities(text: &str) -> String {
+    text.replace("&nbsp;", " ")
+        .replace("&lt;", "<")
+        .replace("&gt;", ">")
+        .replace("&amp;", "&")
+        .replace("&quot;", "\"")
+}
+
+
 /// 扫描字符串尾部，返回可能构成不完整 `<think` 标签前缀的起始位置。
 fn find_tag_cutoff(s: &str) -> usize {
     let bytes = s.as_bytes();
@@ -79,7 +90,11 @@ fn strip_fabricated_tool_results(text: &str) -> String {
     while result.contains("\n\n\n") {
         result = result.replace("\n\n\n", "\n\n");
     }
-    result.trim().to_string()
+    // 仅当结果全为空白字符时返回空字符串，保留换行符以确保表格渲染正确
+    if result.chars().all(|c| c.is_whitespace()) {
+        return String::new();
+    }
+    result
 }
 
 /// 清除 [Tool Result for ...] 和 [End of tool result for ...] 标记
@@ -464,6 +479,7 @@ impl AnthropicStreamConverter {
         }
 
         let cleaned = strip_fabricated_tool_results(&text);
+        let cleaned = unescape_html_entities(&cleaned);
         if cleaned.is_empty() {
             return Vec::new();
         }
