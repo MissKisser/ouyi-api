@@ -6,6 +6,7 @@ mod error;
 mod handler;
 mod model;
 mod router;
+mod tool_runtime;
 
 use std::net::SocketAddr;
 use std::sync::Arc;
@@ -17,13 +18,14 @@ use tower_http::cors::CorsLayer;
 use tower_http::trace::TraceLayer;
 use tracing_subscriber::EnvFilter;
 
-use admin::auth::AdminStore;
 use admin::AccountStore;
+use admin::auth::AdminStore;
 use admin::stats::StatsCollector;
 use client::http::OuyiHttpClient;
 use config::AppConfig;
 use error::AppError;
 use model::mapper::ModelMapper;
+use tool_runtime::ToolLedger;
 
 /// 工具调用会话缓存：tool_use 响应后暂存会话 ID，等待 tool_result 回传时复用
 pub struct CachedToolSession {
@@ -39,6 +41,7 @@ pub struct AppState {
     pub active_sessions: DashMap<i64, ()>,
     /// Anthropic tool_use 会话缓存，key 为对话标识
     pub tool_sessions: DashMap<String, CachedToolSession>,
+    pub tool_ledger: ToolLedger,
     pub model_mapper: ModelMapper,
     pub(crate) admin_store: RwLock<AdminStore>,
     pub account_store: AccountStore,
@@ -48,14 +51,11 @@ pub struct AppState {
 #[tokio::main]
 async fn main() -> Result<(), AppError> {
     tracing_subscriber::fmt()
-        .with_env_filter(
-            EnvFilter::from_default_env().add_directive("info".parse().unwrap()),
-        )
+        .with_env_filter(EnvFilter::from_default_env().add_directive("info".parse().unwrap()))
         .init();
 
-    let config = AppConfig::load().map_err(|e: Box<dyn std::error::Error>| {
-        AppError::Config(e.to_string())
-    })?;
+    let config = AppConfig::load()
+        .map_err(|e: Box<dyn std::error::Error>| AppError::Config(e.to_string()))?;
 
     if config.ouyi.jwt_token.is_empty() {
         tracing::warn!("JWT token 未配置，请设置 config.toml 中的 ouyi.jwt_token");
@@ -126,6 +126,7 @@ async fn main() -> Result<(), AppError> {
         ouyi_client: RwLock::new(ouyi_client),
         active_sessions: DashMap::new(),
         tool_sessions: DashMap::new(),
+        tool_ledger: ToolLedger::new(),
         model_mapper,
         admin_store: RwLock::new(admin_store),
         account_store,
@@ -188,9 +189,7 @@ async fn main() -> Result<(), AppError> {
 
 async fn shutdown_signal() {
     let ctrl_c = async {
-        signal::ctrl_c()
-            .await
-            .expect("failed to listen for ctrl+c");
+        signal::ctrl_c().await.expect("failed to listen for ctrl+c");
     };
 
     #[cfg(unix)]

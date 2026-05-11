@@ -2,32 +2,41 @@ use serde::{Deserialize, Serialize};
 
 // ── Request ────────────────────────────────────────────────────────────────
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct MessagesRequest {
     pub model: String,
     pub messages: Vec<AnthropicMessage>,
     #[serde(default)]
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub system: Option<SystemContent>,
     pub max_tokens: u64,
     #[serde(default)]
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub stream: Option<bool>,
     #[serde(default)]
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub tools: Option<Vec<AnthropicTool>>,
     #[serde(default)]
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub temperature: Option<f64>,
     #[serde(default)]
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub top_p: Option<f64>,
     #[serde(default)]
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub top_k: Option<u32>,
     #[serde(default)]
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub stop_sequences: Option<Vec<String>>,
     #[serde(default)]
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub thinking: Option<ThinkingConfig>,
     #[serde(default)]
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub tool_choice: Option<ToolChoice>,
 }
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct AnthropicMessage {
     pub role: String,
     #[serde(deserialize_with = "deserialize_content")]
@@ -40,6 +49,15 @@ pub enum AnthropicContent {
     Blocks(Vec<ContentBlock>),
 }
 
+impl Serialize for AnthropicContent {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        match self {
+            AnthropicContent::Text(text) => serializer.serialize_str(text),
+            AnthropicContent::Blocks(blocks) => blocks.serialize(serializer),
+        }
+    }
+}
+
 fn deserialize_content<'de, D: serde::Deserializer<'de>>(
     d: D,
 ) -> Result<AnthropicContent, D::Error> {
@@ -50,16 +68,25 @@ fn deserialize_content<'de, D: serde::Deserializer<'de>>(
         serde_json::Value::Array(arr) => {
             let blocks: Result<Vec<ContentBlock>, _> =
                 serde_json::from_value(serde_json::Value::Array(arr));
-            blocks.map(AnthropicContent::Blocks).map_err(de::Error::custom)
+            blocks
+                .map(AnthropicContent::Blocks)
+                .map_err(de::Error::custom)
         }
-        _ => Err(de::Error::custom("content must be a string or array of blocks")),
+        _ => Err(de::Error::custom(
+            "content must be a string or array of blocks",
+        )),
     }
 }
 
 #[derive(Debug, Clone)]
 pub enum ContentBlock {
-    Text { text: String },
-    Thinking { thinking: String, signature: Option<String> },
+    Text {
+        text: String,
+    },
+    Thinking {
+        thinking: String,
+        signature: Option<String>,
+    },
     ToolUse {
         id: String,
         name: String,
@@ -69,6 +96,47 @@ pub enum ContentBlock {
         tool_use_id: String,
         content: String,
     },
+}
+
+impl Serialize for ContentBlock {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        match self {
+            ContentBlock::Text { text } => serde_json::json!({
+                "type": "text",
+                "text": text
+            })
+            .serialize(serializer),
+            ContentBlock::Thinking {
+                thinking,
+                signature,
+            } => {
+                let mut value = serde_json::json!({
+                    "type": "thinking",
+                    "thinking": thinking
+                });
+                if let Some(signature) = signature {
+                    value["signature"] = serde_json::Value::String(signature.clone());
+                }
+                value.serialize(serializer)
+            }
+            ContentBlock::ToolUse { id, name, input } => serde_json::json!({
+                "type": "tool_use",
+                "id": id,
+                "name": name,
+                "input": input
+            })
+            .serialize(serializer),
+            ContentBlock::ToolResult {
+                tool_use_id,
+                content,
+            } => serde_json::json!({
+                "type": "tool_result",
+                "tool_use_id": tool_use_id,
+                "content": content
+            })
+            .serialize(serializer),
+        }
+    }
 }
 
 fn extract_tool_result_text(content: Option<&serde_json::Value>) -> String {
@@ -82,7 +150,9 @@ fn extract_tool_result_text(content: Option<&serde_json::Value>) -> String {
                     if item.is_string() {
                         item.as_str().map(|s| s.to_string())
                     } else if item.get("type").and_then(|v| v.as_str()) == Some("text") {
-                        item.get("text").and_then(|v| v.as_str()).map(|s| s.to_string())
+                        item.get("text")
+                            .and_then(|v| v.as_str())
+                            .map(|s| s.to_string())
                     } else {
                         None
                     }
@@ -130,9 +200,19 @@ impl<'de> Deserialize<'de> for ContentBlock {
                 Ok(ContentBlock::ToolUse { id, name, input })
             }
             "thinking" => {
-                let thinking = value.get("thinking").and_then(|v| v.as_str()).unwrap_or("").to_string();
-                let signature = value.get("signature").and_then(|v| v.as_str()).map(|s| s.to_string());
-                Ok(ContentBlock::Thinking { thinking, signature })
+                let thinking = value
+                    .get("thinking")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("")
+                    .to_string();
+                let signature = value
+                    .get("signature")
+                    .and_then(|v| v.as_str())
+                    .map(|s| s.to_string());
+                Ok(ContentBlock::Thinking {
+                    thinking,
+                    signature,
+                })
             }
             "tool_result" => {
                 let tool_use_id = value
@@ -154,20 +234,20 @@ impl<'de> Deserialize<'de> for ContentBlock {
     }
 }
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(untagged)]
 pub enum SystemContent {
     Text(String),
     Blocks(Vec<SystemBlock>),
 }
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct SystemBlock {
     pub r#type: String,
     pub text: String,
 }
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct AnthropicTool {
     pub name: String,
     #[serde(default)]
@@ -175,7 +255,7 @@ pub struct AnthropicTool {
     pub input_schema: serde_json::Value,
 }
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(tag = "type")]
 pub enum ToolChoice {
     #[serde(rename = "auto")]
@@ -192,13 +272,11 @@ impl ToolChoice {
     }
 }
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(tag = "type")]
 pub enum ThinkingConfig {
     #[serde(rename = "enabled")]
-    Enabled {
-        budget_tokens: u32,
-    },
+    Enabled { budget_tokens: u32 },
     #[serde(rename = "disabled")]
     Disabled,
     #[serde(rename = "adaptive")]
@@ -220,10 +298,7 @@ pub struct MessagesResponse {
 #[serde(tag = "type")]
 pub enum ResponseContentBlock {
     #[serde(rename = "thinking")]
-    Thinking {
-        thinking: String,
-        signature: String,
-    },
+    Thinking { thinking: String, signature: String },
     #[serde(rename = "text")]
     Text { text: String },
     #[serde(rename = "tool_use")]
@@ -281,7 +356,8 @@ pub fn serialize_stream_event(event: &StreamEvent) -> bytes::Bytes {
                 serde_json::to_string(&serde_json::json!({
                     "type": "content_block_stop",
                     "index": index
-                })).unwrap_or_default()
+                }))
+                .unwrap_or_default()
             )
         }
         StreamEvent::MessageDelta { delta, usage } => {
@@ -300,16 +376,16 @@ pub fn serialize_stream_event(event: &StreamEvent) -> bytes::Bytes {
         StreamEvent::MessageStop => {
             "event: message_stop\ndata: {\"type\":\"message_stop\"}\n\n".to_string()
         }
-        StreamEvent::Ping => {
-            "event: ping\ndata: {\"type\":\"ping\"}\n\n".to_string()
-        }
+        StreamEvent::Ping => "event: ping\ndata: {\"type\":\"ping\"}\n\n".to_string(),
     };
     bytes::Bytes::from(s)
 }
 
 #[derive(Debug, Clone)]
 pub enum StreamEvent {
-    MessageStart { message: MessageStartInfo },
+    MessageStart {
+        message: MessageStartInfo,
+    },
     ContentBlockStart {
         index: u32,
         content_block: ContentBlockStart,

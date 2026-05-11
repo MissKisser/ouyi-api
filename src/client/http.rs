@@ -1,6 +1,6 @@
 use crate::error::AppError;
 use crate::model::ouyi::{
-    ChatRequest, CreateSessionResponse, SessionData, TmplResponse,
+    ChatRequest, CreateSessionRequest, CreateSessionResponse, SessionData, TmplResponse,
 };
 
 #[derive(Clone)]
@@ -40,7 +40,10 @@ impl OuyiHttpClient {
             .error_for_status()
             .map_err(|e| AppError::Upstream(e.to_string()))?;
 
-        let body = resp.text().await.map_err(|e| AppError::Upstream(e.to_string()))?;
+        let body = resp
+            .text()
+            .await
+            .map_err(|e| AppError::Upstream(e.to_string()))?;
         tracing::debug!(body = %body, "fetch_tmpl 响应原文");
 
         serde_json::from_str::<TmplResponse>(&body)
@@ -49,9 +52,7 @@ impl OuyiHttpClient {
 
     pub async fn create_session(&self, model: &str) -> Result<SessionData, AppError> {
         let url = format!("{}/api/chat/session", self.base_url);
-        let body = serde_json::json!({
-            "model": model
-        });
+        let body = CreateSessionRequest::new(model);
 
         let resp = self
             .add_auth_headers(self.http_client.post(&url))
@@ -61,7 +62,10 @@ impl OuyiHttpClient {
             .error_for_status()
             .map_err(|e| AppError::Upstream(format!("创建会话失败: {}", e)))?;
 
-        let body = resp.text().await.map_err(|e| AppError::Upstream(e.to_string()))?;
+        let body = resp
+            .text()
+            .await
+            .map_err(|e| AppError::Upstream(e.to_string()))?;
 
         let create_resp: CreateSessionResponse = serde_json::from_str(&body)
             .map_err(|e| AppError::Upstream(format!("会话响应解析失败: {}", e)))?;
@@ -73,7 +77,9 @@ impl OuyiHttpClient {
             )));
         }
 
-        create_resp.data.ok_or_else(|| AppError::Upstream("创建会话返回空数据".to_string()))
+        create_resp
+            .data
+            .ok_or_else(|| AppError::Upstream("创建会话返回空数据".to_string()))
     }
 
     pub async fn delete_session(&self, session_id: i64) -> Result<(), AppError> {

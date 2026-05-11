@@ -96,12 +96,47 @@ pub struct SessionData {
 }
 
 #[derive(Debug, Clone, Serialize)]
+pub struct CreateSessionRequest {
+    pub model: String,
+    pub plugins: Vec<serde_json::Value>,
+    pub mcp: Vec<serde_json::Value>,
+    pub rags: Vec<serde_json::Value>,
+}
+
+impl CreateSessionRequest {
+    pub fn new(model: &str) -> Self {
+        Self {
+            model: model.to_string(),
+            plugins: Vec::new(),
+            mcp: Vec::new(),
+            rags: Vec::new(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize)]
 pub struct ChatRequest {
     pub text: String,
     #[serde(rename = "sessionId")]
     pub session_id: i64,
     pub files: Vec<serde_json::Value>,
     pub thinking: bool,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_create_session_request_matches_ouyi_frontend_shape() {
+        let req = CreateSessionRequest::new("claude_chat::claude-sonnet-4-6");
+        let value = serde_json::to_value(req).unwrap();
+
+        assert_eq!(value["model"], "claude_chat::claude-sonnet-4-6");
+        assert_eq!(value["plugins"], serde_json::json!([]));
+        assert_eq!(value["mcp"], serde_json::json!([]));
+        assert_eq!(value["rags"], serde_json::json!([]));
+    }
 }
 
 #[derive(Debug, Clone, Deserialize)]

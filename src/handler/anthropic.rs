@@ -1,21 +1,22 @@
 use std::sync::Arc;
 
+use axum::Json;
 use axum::extract::State;
 use axum::response::IntoResponse;
-use axum::Json;
 use bytes::Bytes;
 use futures::stream::StreamExt;
 use serde::Serialize;
 use tokio_stream::wrappers::ReceiverStream;
 
+use crate::AppState;
 use crate::adapter::anthropic_request::convert_anthropic_request;
 use crate::adapter::anthropic_response::{AnthropicCollector, AnthropicStreamConverter};
 use crate::client::http::OuyiHttpClient;
-use crate::client::session::{spawn_session_cleanup, GuardedStream};
-use crate::client::sse::{parse_sse_line, SseLineBuffer};
+use crate::client::session::{GuardedStream, spawn_session_cleanup};
+use crate::client::sse::{SseLineBuffer, parse_sse_line};
 use crate::error::AppError;
 use crate::model::anthropic::{AnthropicContent, ContentBlock, MessagesRequest};
-use crate::AppState;
+use crate::tool_runtime;
 
 #[derive(Serialize)]
 struct AnthropicModelEntry {
@@ -62,7 +63,9 @@ fn extract_last_tool_use_id(req: &MessagesRequest) -> Option<String> {
 fn has_tool_result(req: &MessagesRequest) -> bool {
     req.messages.iter().any(|msg| {
         if let AnthropicContent::Blocks(blocks) = &msg.content {
-            blocks.iter().any(|b| matches!(b, ContentBlock::ToolResult { .. }))
+            blocks
+                .iter()
+                .any(|b| matches!(b, ContentBlock::ToolResult { .. }))
         } else {
             false
         }
@@ -111,7 +114,9 @@ fn format_tool_results_for_reuse(req: &MessagesRequest) -> String {
     if parts.is_empty() {
         return String::new();
     }
-    parts.push("请根据以上工具执行结果继续。如果需要再次调用工具，请直接输出工具调用标记。".to_string());
+    parts.push(
+        "请根据以上工具执行结果继续。如果需要再次调用工具，请直接输出工具调用标记。".to_string(),
+    );
     parts.join("\n\n")
 }
 
@@ -166,6 +171,10 @@ pub async fn messages(
         has_tools = req.tools.is_some(),
         "Anthropic messages 请求"
     );
+
+    if tool_runtime::should_use_tool_runtime(&req) {
+        return handle_tool_runtime_message(state, req).await;
+    }
 
     let model_full = state.model_mapper.to_ouyi(&req.model);
     tracing::info!(model = %req.model, full = %model_full, "模型映射结果");
@@ -235,7 +244,11 @@ pub async fn messages(
                     Ok(s) => s,
                     Err(e) => {
                         let msg = format!("创建会话失败: {}", e);
-                        state.stats.record_error(start_time.elapsed().as_millis() as u64, &model_full, &msg);
+                        state.stats.record_error(
+                            start_time.elapsed().as_millis() as u64,
+                            &model_full,
+                            &msg,
+                        );
                         return Err(AppError::Upstream(msg));
                     }
                 };
@@ -262,7 +275,11 @@ pub async fn messages(
             Ok(s) => s,
             Err(e) => {
                 let msg = format!("创建会话失败: {}", e);
-                state.stats.record_error(start_time.elapsed().as_millis() as u64, &model_full, &msg);
+                state.stats.record_error(
+                    start_time.elapsed().as_millis() as u64,
+                    &model_full,
+                    &msg,
+                );
                 return Err(AppError::Upstream(msg));
             }
         };
@@ -289,7 +306,9 @@ pub async fn messages(
         Err(e) => {
             state.active_sessions.remove(&session_id);
             let msg = format!("聊天请求失败: {}", e);
-            state.stats.record_error(start_time.elapsed().as_millis() as u64, &model_full, &msg);
+            state
+                .stats
+                .record_error(start_time.elapsed().as_millis() as u64, &model_full, &msg);
             return Err(AppError::Upstream(msg));
         }
     };
@@ -299,14 +318,69 @@ pub async fn messages(
 
     if stream {
         handle_anthropic_stream(
-            resp, short_model, model_full, session_id, client, state.clone(), cache_key, start_time,
+            resp,
+            short_model,
+            model_full,
+            session_id,
+            client,
+            state.clone(),
+            cache_key,
+            start_time,
         )
         .await
     } else {
         handle_anthropic_non_stream(
-            resp, short_model, session_id, client, state.clone(), cache_key, elapsed,
+            resp,
+            short_model,
+            session_id,
+            client,
+            state.clone(),
+            cache_key,
+            elapsed,
         )
         .await
+    }
+}
+
+async fn handle_tool_runtime_message(
+    state: Arc<AppState>,
+    req: MessagesRequest,
+) -> Result<axum::response::Response, AppError> {
+    let config = state.config.tool_runtime.clone().ok_or_else(|| {
+        AppError::Config(
+            "请求包含 tools，但未配置 [tool_runtime]；Ouyi Claude 不具备原生工具能力".to_string(),
+        )
+    })?;
+
+    if let Some(tool_result_id) = tool_runtime::latest_tool_result_id(&req) {
+        if !tool_runtime::has_matching_tool_use(&req, &tool_result_id) {
+            let key = tool_runtime::session_key_for_request(&req).ok_or_else(|| {
+                AppError::BadRequest("无法为 tool_result 生成工具会话 key".to_string())
+            })?;
+            state
+                .tool_ledger
+                .complete_tool_result(&key, &tool_result_id)?;
+        }
+    } else if let (Some(tool_use_id), Some(tool_name)) = (
+        tool_runtime::latest_tool_use_id(&req),
+        tool_runtime::latest_tool_use_name(&req),
+    ) {
+        let key = tool_runtime::session_key_for_request(&req)
+            .ok_or_else(|| AppError::BadRequest("无法为 tool_use 生成工具会话 key".to_string()))?;
+        state
+            .tool_ledger
+            .record_tool_use(&key, &tool_use_id, &tool_name)?;
+    }
+
+    match config.provider {
+        crate::config::ToolRuntimeProvider::Anthropic => {
+            tool_runtime::native_anthropic::proxy_messages(state.http_client.clone(), config, req)
+                .await
+        }
+        crate::config::ToolRuntimeProvider::OpenaiCompatible => Err(AppError::Config(
+            "tool_runtime.provider=openai-compatible 尚未启用；请使用 provider=\"anthropic\""
+                .to_string(),
+        )),
     }
 }
 
@@ -393,20 +467,21 @@ async fn handle_anthropic_stream(
                     if event_type == crate::client::sse::OuyiEventType::StringChunk {
                         tracing::info!(content_len = content.len(), content_preview = %content.chars().take(200).collect::<String>(), "上游 string 事件");
                     } else {
-                        tracing::info!(event_type = event.event_type, is_done, content_len = content.len(), "上游事件");
+                        tracing::info!(
+                            event_type = event.event_type,
+                            is_done,
+                            content_len = content.len(),
+                            "上游事件"
+                        );
                     }
 
                     if event_type == crate::client::sse::OuyiEventType::Object {
                         if let Some(data) = &event.data {
-                            if let Ok(usage) =
-                                serde_json::from_value::<crate::model::ouyi::OuyiUsage>(
-                                    data.clone(),
-                                )
-                            {
-                                converter.update_usage(
-                                    usage.prompt_tokens,
-                                    usage.completion_tokens,
-                                );
+                            if let Ok(usage) = serde_json::from_value::<crate::model::ouyi::OuyiUsage>(
+                                data.clone(),
+                            ) {
+                                converter
+                                    .update_usage(usage.prompt_tokens, usage.completion_tokens);
                             }
                         }
                     }
@@ -432,7 +507,11 @@ async fn handle_anthropic_stream(
             }
         }
 
-        tracing::info!(chunk_count, has_tool_use = converter.has_tool_use, "流式处理完成");
+        tracing::info!(
+            chunk_count,
+            has_tool_use = converter.has_tool_use,
+            "流式处理完成"
+        );
 
         // 根据 has_tool_use 决定缓存或清理会话
         let has_tool_use = converter.has_tool_use;
@@ -454,11 +533,14 @@ async fn handle_anthropic_stream(
             let last_tool_id = converter.last_tool_use_id.clone();
             if let Some(tool_id) = last_tool_id {
                 let key = session_cache_key(&model_full_for_cache, &tool_id);
-                state_for_stream.tool_sessions.insert(key, crate::CachedToolSession {
-                    session_id,
-                    model: model.clone(),
-                    created_at: std::time::Instant::now(),
-                });
+                state_for_stream.tool_sessions.insert(
+                    key,
+                    crate::CachedToolSession {
+                        session_id,
+                        model: model.clone(),
+                        created_at: std::time::Instant::now(),
+                    },
+                );
                 tracing::info!(session_id, tool_use_id = %tool_id, "缓存工具会话等待 tool_result 回传");
             }
         } else {
@@ -477,9 +559,7 @@ async fn handle_anthropic_stream(
     tracing::info!(session_id, "Anthropic SSE 流构建完成，返回响应");
 
     let stream = ReceiverStream::new(rx);
-    let body = axum::body::Body::from_stream(stream.map(|b| {
-        Ok::<_, std::io::Error>(b)
-    }));
+    let body = axum::body::Body::from_stream(stream.map(|b| Ok::<_, std::io::Error>(b)));
     let response = axum::response::Response::builder()
         .status(200)
         .header("content-type", "text/event-stream")
@@ -561,7 +641,9 @@ async fn handle_anthropic_non_stream(
     let (prompt, completion) = collector.tokens();
     let response = collector.build_response();
 
-    state.stats.record_success(elapsed, prompt, completion, &model);
+    state
+        .stats
+        .record_success(elapsed, prompt, completion, &model);
 
     // 根据 stop_reason 决定缓存或清理会话
     let has_tool_use = response.stop_reason == "tool_use";
@@ -576,11 +658,14 @@ async fn handle_anthropic_non_stream(
         });
         if let Some(tool_id) = last_tool_id {
             let key = session_cache_key(&model, &tool_id);
-            state.tool_sessions.insert(key, crate::CachedToolSession {
-                session_id,
-                model: model.clone(),
-                created_at: std::time::Instant::now(),
-            });
+            state.tool_sessions.insert(
+                key,
+                crate::CachedToolSession {
+                    session_id,
+                    model: model.clone(),
+                    created_at: std::time::Instant::now(),
+                },
+            );
             tracing::info!(session_id, tool_use_id = %tool_id, "缓存工具会话等待 tool_result 回传");
         }
         // 不删除会话，保留给下一轮
@@ -739,12 +824,6 @@ mod tests {
             ]),
         };
         let req = make_messages_request(vec![msg]);
-        assert_eq!(
-            extract_last_tool_use_id(&req),
-            Some("call_1".to_string())
-        );
+        assert_eq!(extract_last_tool_use_id(&req), Some("call_1".to_string()));
     }
 }
-
-
-

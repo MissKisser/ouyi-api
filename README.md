@@ -6,7 +6,7 @@
 
 - **双协议支持** — 同时提供 OpenAI Responses API（`/openai/v1`，面向 Codex）和 Anthropic（`/anthropic`）接口
 - **扩展思考** — 支持 Claude 系列模型的 thinking 模式，流式输出推理过程
-- **工具调用** — 流式和非流式工具调用，兼容 Claude Code 的 function calling
+- **工具调用** — Claude Code 工具请求可路由到原生 Anthropic tools 后端，普通对话继续走欧亿
 - **Usage 统计** — Anthropic 响应包含 input/output token 用量，claude-hud 可正常显示
 - **Web 管理面板** — 仪表盘、模型列表、聊天测试、配置管理、日志查看
 - **多账号池** — 轮询分配上游 token，支持状态追踪和故障切换
@@ -40,6 +40,22 @@ password_hash = "bcrypt哈希，首次启动自动生成"
 ```
 
 也可以通过环境变量 `OUYI_CONFIG` 指定配置文件路径。
+
+### 工具运行时
+
+欧亿 Claude 模型未开放原生 tools 能力。需要稳定运行 Claude Code 的多轮工具链时，应配置原生 Anthropic 工具运行时；网关会将包含 `tools` 的 Anthropic Messages 请求转发到该运行时，普通无工具请求仍使用欧亿。
+
+```toml
+[tool_runtime]
+mode = "native"
+provider = "anthropic"
+base_url = "https://api.anthropic.com"
+api_key_env = "ANTHROPIC_API_KEY"
+model = "claude-sonnet-4-7"
+timeout_secs = 120
+```
+
+`api_key_env` 只填写环境变量名，真实密钥通过运行环境注入。
 
 ### 运行
 
