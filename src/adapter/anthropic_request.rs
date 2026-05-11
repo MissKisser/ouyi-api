@@ -226,6 +226,7 @@ pub fn convert_anthropic_request(
     }
 
     let has_tools = req.tools.as_ref().map(|t| !t.is_empty()).unwrap_or(false);
+    let force_tool = req.tool_choice.as_ref().map(|tc| tc.is_forced()).unwrap_or(false);
 
     let system_prompt = if system_parts.is_empty() {
         None
@@ -236,7 +237,11 @@ pub fn convert_anthropic_request(
     let mut text = text_parts.join("\n");
 
     if has_tools {
-        text.push_str("\n\n<think>\n现在请判断是否需要调用工具。如需调用，请输出：\n\n<|tool\u{2581}calls\u{2581}begin|>\n[{\"name\": \"工具名\", \"arguments\": {\"参数名\": \"值\"}}]\n<|tool\u{2581}calls\u{2581}end|>\n\n请立即决定：需要调用工具吗？需要则直接输出上述标记，不需要则正常回复。");
+        if force_tool {
+            text.push_str("\n\n[System]: 你必须使用工具来完成当前任务。只能回复工具调用，不能回复文字。");
+        }
+        // 借鉴 ds-free-api: 末尾注入不闭合的 <think> 块，让工具格式紧邻模型生成位置
+        text.push_str("\n\n<think>\n现在开始分析任务。如果需要使用工具，我必须按照以下格式输出：\n\n<|tool\u{2581}calls\u{2581}begin|>\n[{\"name\": \"工具名\", \"arguments\": {\"参数名\": \"值\"}}]\n<|tool\u{2581}calls\u{2581}end|>\n\n");
     }
 
     let thinking = should_thinking || model_full.contains("-thinking");
@@ -269,9 +274,9 @@ mod tests {
             top_k: None,
             stop_sequences: None,
             thinking: None,
+            tool_choice: None,
         }
     }
-
     #[test]
     fn test_basic_message() {
         let req = make_req(AnthropicContent::Text("Hello".to_string()));
@@ -313,6 +318,7 @@ mod tests {
             top_k: None,
             stop_sequences: None,
             thinking: None,
+            tool_choice: None,
         };
         let result = convert_anthropic_request(&req, "test", false).unwrap();
         assert!(result.text.contains("tool\u{2581}calls\u{2581}begin"));
@@ -333,6 +339,7 @@ mod tests {
             top_k: None,
             stop_sequences: None,
             thinking: None,
+            tool_choice: None,
         };
         assert!(convert_anthropic_request(&req, "test", false).is_err());
     }

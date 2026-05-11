@@ -23,6 +23,8 @@ pub struct MessagesRequest {
     pub stop_sequences: Option<Vec<String>>,
     #[serde(default)]
     pub thinking: Option<ThinkingConfig>,
+    #[serde(default)]
+    pub tool_choice: Option<ToolChoice>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -171,6 +173,23 @@ pub struct AnthropicTool {
     #[serde(default)]
     pub description: String,
     pub input_schema: serde_json::Value,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(tag = "type")]
+pub enum ToolChoice {
+    #[serde(rename = "auto")]
+    Auto,
+    #[serde(rename = "any")]
+    Any,
+    #[serde(rename = "tool")]
+    Tool { name: String },
+}
+
+impl ToolChoice {
+    pub fn is_forced(&self) -> bool {
+        matches!(self, ToolChoice::Any | ToolChoice::Tool { .. })
+    }
 }
 
 #[derive(Debug, Clone, Deserialize)]

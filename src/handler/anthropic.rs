@@ -93,7 +93,7 @@ fn format_tool_results_for_reuse(req: &MessagesRequest) -> String {
                         .unwrap_or(tool_use_id.as_str());
                     let display_content = if content.len() > 2000 {
                         format!(
-                            "{}\n\n[...content truncated, {} characters total...]",
+                            "{}\n\n[...内容截断，共 {} 字符...]",
                             &content[..2000],
                             content.len()
                         )
@@ -101,13 +101,17 @@ fn format_tool_results_for_reuse(req: &MessagesRequest) -> String {
                         content.clone()
                     };
                     parts.push(format!(
-                        "[Tool Result for {}]:\n<tool_result name=\"{}\">\n{}\n</tool_result>\n[End of tool result for {}. Continue your response based on this result.]",
-                        tool_name, tool_name, display_content, tool_name
+                        "工具 {} 的执行结果：\n{}",
+                        tool_name, display_content
                     ));
                 }
             }
         }
     }
+    if parts.is_empty() {
+        return String::new();
+    }
+    parts.push("请根据以上工具执行结果继续。如果需要再次调用工具，请直接输出工具调用标记。".to_string());
     parts.join("\n\n")
 }
 
@@ -633,6 +637,7 @@ mod tests {
             top_k: None,
             stop_sequences: None,
             thinking: None,
+            tool_choice: None,
         }
     }
 
@@ -642,10 +647,10 @@ mod tests {
         let req = make_messages_request(vec![tool_result]);
 
         let result = format_tool_results_for_reuse(&req);
-        assert!(result.contains("Tool Result for call_0"));
+        assert!(result.contains("call_0"));
         assert!(result.contains("file1.rs"));
         assert!(result.contains("file2.rs"));
-        assert!(result.contains("Continue your response based on this result"));
+        assert!(result.contains("请根据以上工具执行结果继续"));
         // 不应包含工具指令
         assert!(!result.contains("You have access to the following tools"));
         assert!(!result.contains("[System]"));
@@ -682,8 +687,8 @@ mod tests {
         let req = make_messages_request(vec![tool_result]);
 
         let result = format_tool_results_for_reuse(&req);
-        assert!(result.contains("truncated"));
-        assert!(result.contains("3000 characters total"));
+        assert!(result.contains("截断"));
+        assert!(result.contains("3000"));
         assert!(result.len() < long_content.len() + 200); // 应远小于原始大小
     }
 

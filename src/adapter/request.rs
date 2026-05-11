@@ -169,7 +169,7 @@ pub fn convert_request(
         }
     }
 
-    let has_tools = openai_req.tools.is_some();
+    let has_tools = openai_req.tools.as_ref().is_some_and(|t| !t.is_empty());
     if has_tools {
         let tool_text = build_tool_instruction_text(openai_req);
         if !tool_text.is_empty() {
@@ -186,7 +186,8 @@ pub fn convert_request(
     let mut text = text_parts.join("\n\n");
 
     if has_tools {
-        text.push_str("\n\n<think>\n现在请判断是否需要调用工具。如需调用，请输出：\n\n<|tool\u{2581}calls\u{2581}begin|>\n[{\"name\": \"工具名\", \"arguments\": {\"参数名\": \"值\"}}]\n<|tool\u{2581}calls\u{2581}end|>\n\n请立即决定：需要调用工具吗？需要则直接输出上述标记，不需要则正常回复。");
+        // 借鉴 ds-free-api: 末尾注入不闭合的 <think> 块
+        text.push_str("\n\n<think>\n现在开始分析任务。如果需要使用工具，我必须按照以下格式输出：\n\n<|tool\u{2581}calls\u{2581}begin|>\n[{\"name\": \"工具名\", \"arguments\": {\"参数名\": \"值\"}}]\n<|tool\u{2581}calls\u{2581}end|>\n\n");
     }
 
     let thinking = should_thinking || model_full.contains("-thinking");
