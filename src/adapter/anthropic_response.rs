@@ -1,0 +1,879 @@
+use crate::adapter::tool_call::ToolCallParser;
+use crate::model::anthropic::*;
+
+const THINK_OPEN: &str = "<think";
+const THINK_CLOSE: &str = "</think>";
+
+pub struct AnthropicStreamConverter {
+    model: String,
+    task_id: String,
+    tool_parser: ToolCallParser,
+    next_block_index: u32,
+    current_block_type: Option<BlockType>,
+    pub started: bool,
+    in_thinking: bool,
+    think_buffer: String,
+    pub has_tool_use: bool,
+    pub last_tool_use_id: Option<String>,
+    usage: ResponseUsage,
+    pending_text: String,
+    pub has_content: bool,
+}
+
+#[derive(Clone)]
+enum BlockType {
+    Thinking,
+    Text,
+    ToolUse,
+}
+
+/// 扫描字符串尾部，返回可能构成不完整 `<think` 标签前缀的起始位置。
+fn find_tag_cutoff(s: &str) -> usize {
+    let bytes = s.as_bytes();
+    let len = bytes.len();
+    if len == 0 {
+        return 0;
+    }
+    for i in (0..len).rev() {
+        if bytes[i] == b'<' {
+            let tail = &s[i..];
+            if THINK_OPEN.starts_with(tail) {
+                return i;
+            }
+            return len;
+        }
+        if !bytes[i].is_ascii_alphabetic() {
+            return len;
+        }
+    }
+    len
+}
+
+
+/// 剥离文本中模型自造的 `<tool_result>` 块及其包裹标记。
+/// 上游模型在决定调用工具时，常会在文本中自行编造 tool_result 内容，
+/// 真实的 Anthropic API 不会这样做，需要在响应中清除。
+fn strip_fabricated_tool_results(text: &str) -> String {
+    let mut result = String::new();
+    let mut remaining = text;
+    while !remaining.is_empty() {
+        // 查找 <tool_result 开始标签
+        if let Some(open_pos) = remaining.find("<tool_result") {
+            // 保留标签之前的内容（但清除包裹标记）
+            let before = &remaining[..open_pos];
+            result.push_str(&strip_tool_result_markers(before));
+            // 查找 </tool_result> 闭合标签
+            if let Some(close_pos) = remaining.find("</tool_result>") {
+                remaining = &remaining[close_pos + "</tool_result>".len()..];
+            } else {
+                // 没有闭合标签，跳过到末尾
+                break;
+            }
+        } else {
+            result.push_str(&strip_tool_result_markers(remaining));
+            break;
+        }
+    }
+    // 清理多余空行
+    while result.contains("\n\n\n") {
+        result = result.replace("\n\n\n", "\n\n");
+    }
+    result.trim().to_string()
+}
+
+/// 清除 [Tool Result for ...] 和 [End of tool result for ...] 标记
+fn strip_tool_result_markers(text: &str) -> String {
+    let mut result = text.to_string();
+    loop {
+        let changed = false;
+        // 移除 [Tool Result for xxx]:
+        if let Some(start) = result.find("[Tool Result for ") {
+            if let Some(end) = result[start..].find("]:\n") {
+                result = format!("{}{}", &result[..start], &result[start + end + 3..]);
+                continue;
+            }
+        }
+        // 移除 [End of tool result for xxx.]
+        if let Some(start) = result.find("[End of tool result for ") {
+            if let Some(end) = result[start..].find(".]") {
+                result = format!("{}{}", &result[..start], &result[start + end + 2..]);
+                continue;
+            }
+        }
+        if !changed {
+            break;
+        }
+    }
+    result
+}
+
+
+/// 查找 `<think>` 标签的起始位置，返回 (标签起始位置, 标签内容开始位置)。
+fn find_think_open(s: &str) -> Option<(usize, usize)> {
+    let start_pos = s.find(THINK_OPEN)?;
+    let after_tag = &s[start_pos + THINK_OPEN.len()..];
+    let close_pos = after_tag.find('>')?;
+    Some((start_pos, start_pos + THINK_OPEN.len() + close_pos + 1))
+}
+
+/// 查找 `</think>` 闭合标签的位置，返回 (标签起始位置, 标签结束位置)。
+fn find_think_close(s: &str) -> Option<(usize, usize)> {
+    let start_pos = s.find(THINK_CLOSE)?;
+    Some((start_pos, start_pos + THINK_CLOSE.len()))
+}
+
+/// 扫描 thinking 内容尾部，检查是否有不完整的 `</think` 前缀。
+fn find_think_close_cutoff(s: &str) -> usize {
+    let bytes = s.as_bytes();
+    let len = bytes.len();
+    if len == 0 {
+        return 0;
+    }
+    for i in (0..len).rev() {
+        if bytes[i] == b'<' {
+            let tail = &s[i..];
+            if THINK_CLOSE.starts_with(tail) {
+                return i;
+            }
+            return len;
+        }
+        if !bytes[i].is_ascii_alphabetic() && bytes[i] != b'/' {
+            return len;
+        }
+    }
+    len
+}
+
+impl AnthropicStreamConverter {
+    pub fn new(model: String, task_id: String) -> Self {
+        Self {
+            model,
+            task_id,
+            tool_parser: ToolCallParser::new(),
+            next_block_index: 0,
+            current_block_type: None,
+            started: false,
+            in_thinking: false,
+            think_buffer: String::new(),
+            has_tool_use: false,
+            last_tool_use_id: None,
+            usage: ResponseUsage { input_tokens: 0, output_tokens: 0 },
+            pending_text: String::new(),
+            has_content: false,
+        }
+    }
+
+    pub fn start_event(&self) -> String {
+        serialize_stream_event(&StreamEvent::MessageStart {
+            message: MessageStartInfo {
+                r#type: "message_start",
+                message: MessageStartMessage {
+                    id: self.task_id.clone(),
+                    r#type: "message",
+                    role: "assistant",
+                    model: self.model.clone(),
+                    content: vec![],
+                    stop_reason: None,
+                    stop_sequence: None,
+                    usage: self.usage.clone(),
+                },
+            },
+        })
+    }
+
+    pub fn process_ouyi_event(&mut self, text: &str, is_done: bool) -> Vec<String> {
+        let mut events = Vec::new();
+
+        if is_done {
+            if self.in_thinking && !self.has_tool_use {
+                events.extend(self.flush_thinking());
+            }
+            if !self.has_tool_use {
+                events.extend(self.flush_pending_text());
+            }
+            if !self.has_content {
+                events.extend(self.emit_empty_text());
+            }
+            if self.current_block_type.is_some() {
+                let idx = self.next_block_index.saturating_sub(1);
+                events.push(serialize_stream_event(&StreamEvent::ContentBlockStop {
+                    index: idx,
+                }));
+                self.current_block_type = None;
+            }
+            let stop_reason = if self.has_tool_use {
+                "tool_use"
+            } else {
+                "end_turn"
+            };
+            events.push(serialize_stream_event(&StreamEvent::MessageDelta {
+                delta: MessageDeltaInfo {
+                    stop_reason: stop_reason.to_string(),
+                    stop_sequence: None,
+                },
+                usage: self.usage.clone(),
+            }));
+            events.push(serialize_stream_event(&StreamEvent::MessageStop));
+            return events;
+        }
+
+        if text.is_empty() {
+            return events;
+        }
+
+        if self.has_tool_use {
+            return events;
+        }
+
+        self.think_buffer.push_str(text);
+        let buffer = std::mem::take(&mut self.think_buffer);
+        let mut remaining = buffer.as_str();
+
+        while !remaining.is_empty() {
+            if self.in_thinking {
+                if let Some((close_start, close_end)) = find_think_close(remaining) {
+                    let think_content = &remaining[..close_start];
+                    if !think_content.is_empty() {
+                        events.push(serialize_stream_event(
+                            &StreamEvent::ContentBlockDelta {
+                                index: self.next_block_index - 1,
+                                delta: DeltaContent::ThinkingDelta {
+                                    thinking: think_content.to_string(),
+                                },
+                            },
+                        ));
+                    }
+                    let idx = self.next_block_index.saturating_sub(1);
+                    events.push(serialize_stream_event(
+                        &StreamEvent::ContentBlockDelta {
+                            index: idx,
+                            delta: DeltaContent::SignatureDelta {
+                                signature: generate_signature(),
+                            },
+                        },
+                    ));
+                    events.push(serialize_stream_event(&StreamEvent::ContentBlockStop {
+                        index: idx,
+                    }));
+                    self.current_block_type = None;
+                    self.in_thinking = false;
+                    remaining = &remaining[close_end..];
+                } else {
+                    let cutoff = find_think_close_cutoff(remaining);
+                    let safe_content = &remaining[..cutoff];
+                    let tail = &remaining[cutoff..];
+                    if !safe_content.is_empty() {
+                        events.push(serialize_stream_event(
+                            &StreamEvent::ContentBlockDelta {
+                                index: self.next_block_index - 1,
+                                delta: DeltaContent::ThinkingDelta {
+                                    thinking: safe_content.to_string(),
+                                },
+                            },
+                        ));
+                    }
+                    self.think_buffer = tail.to_string();
+                    return events;
+                }
+            } else if let Some((open_start, content_start)) = find_think_open(remaining) {
+                let before = &remaining[..open_start];
+                if !before.is_empty() {
+                    let parsed = self.tool_parser.process_chunk(before);
+                    if !parsed.normal_text.is_empty() {
+                        events.extend(self.emit_text(parsed.normal_text));
+                    }
+                    for delta in parsed.tool_deltas {
+                        events.extend(self.emit_tool_start(&delta));
+                        events.extend(self.emit_tool_delta(&delta));
+                    }
+                }
+                self.in_thinking = true;
+                events.extend(self.emit_thinking_start());
+                remaining = &remaining[content_start..];
+            } else {
+                let cutoff = find_tag_cutoff(remaining);
+                if cutoff > 0 {
+                    let safe_content = &remaining[..cutoff];
+                    let parsed = self.tool_parser.process_chunk(safe_content);
+                    if !parsed.normal_text.is_empty() {
+                        events.extend(self.emit_text(parsed.normal_text));
+                    }
+                    for delta in parsed.tool_deltas {
+                        events.extend(self.emit_tool_start(&delta));
+                        events.extend(self.emit_tool_delta(&delta));
+                    }
+                }
+                let tail = &remaining[cutoff..];
+                if tail.is_empty() {
+                    return events;
+                }
+                self.think_buffer = tail.to_string();
+                return events;
+            }
+        }
+
+        events
+    }
+
+    fn emit_thinking_start(&mut self) -> Vec<String> {
+        let mut events = Vec::new();
+        if matches!(self.current_block_type, Some(BlockType::ToolUse)) {
+            let idx = self.next_block_index.saturating_sub(1);
+            events.push(serialize_stream_event(&StreamEvent::ContentBlockStop {
+                index: idx,
+            }));
+            self.current_block_type = None;
+        }
+        if self.current_block_type.is_some() {
+            let idx = self.next_block_index.saturating_sub(1);
+            events.push(serialize_stream_event(&StreamEvent::ContentBlockStop {
+                index: idx,
+            }));
+            self.current_block_type = None;
+        }
+        let idx = self.next_block_index;
+        events.push(serialize_stream_event(&StreamEvent::ContentBlockStart {
+            index: idx,
+            content_block: ContentBlockStart::Thinking {
+                thinking: String::new(),
+                signature: String::new(),
+            },
+        }));
+        self.current_block_type = Some(BlockType::Thinking);
+        self.next_block_index += 1;
+        self.has_content = true;
+        events
+    }
+
+    fn flush_thinking(&mut self) -> Vec<String> {
+        let mut events = Vec::new();
+        if !self.think_buffer.is_empty() {
+            events.push(serialize_stream_event(&StreamEvent::ContentBlockDelta {
+                index: self.next_block_index - 1,
+                delta: DeltaContent::ThinkingDelta {
+                    thinking: std::mem::take(&mut self.think_buffer),
+                },
+            }));
+        }
+        let idx = self.next_block_index.saturating_sub(1);
+        events.push(serialize_stream_event(&StreamEvent::ContentBlockDelta {
+            index: idx,
+            delta: DeltaContent::SignatureDelta {
+                signature: generate_signature(),
+            },
+        }));
+        events.push(serialize_stream_event(&StreamEvent::ContentBlockStop {
+            index: idx,
+        }));
+        self.current_block_type = None;
+        self.in_thinking = false;
+        events
+    }
+
+    fn emit_tool_start(&mut self, delta: &crate::model::openai::ToolCallDelta) -> Vec<String> {
+        let mut events = Vec::new();
+        if let Some(func) = &delta.function {
+            self.discard_pending_text();
+
+            if self.current_block_type.is_some() {
+                let idx = self.next_block_index.saturating_sub(1);
+                events.push(serialize_stream_event(
+                    &StreamEvent::ContentBlockStop { index: idx },
+                ));
+                self.current_block_type = None;
+            }
+
+            if self.current_block_type.is_none() {
+                let idx = self.next_block_index;
+                let name = func.name.as_deref().unwrap_or("unknown");
+                let id = delta.id.as_deref().unwrap_or("call_0");
+                events.push(serialize_stream_event(
+                    &StreamEvent::ContentBlockStart {
+                        index: idx,
+                        content_block: ContentBlockStart::ToolUse {
+                            id: id.to_string(),
+                            name: name.to_string(),
+                        },
+                    },
+                ));
+                self.current_block_type = Some(BlockType::ToolUse);
+                self.has_tool_use = true;
+                self.has_content = true;
+                self.last_tool_use_id = Some(id.to_string());
+                self.next_block_index += 1;
+            }
+        }
+        events
+    }
+
+    fn emit_tool_delta(&mut self, delta: &crate::model::openai::ToolCallDelta) -> Vec<String> {
+        let mut events = Vec::new();
+        if let Some(func) = &delta.function {
+            if let Some(args) = &func.arguments {
+                events.push(serialize_stream_event(
+                    &StreamEvent::ContentBlockDelta {
+                        index: self.next_block_index - 1,
+                        delta: DeltaContent::InputJsonDelta {
+                            partial_json: args.clone(),
+                        },
+                    },
+                ));
+            }
+        }
+        events
+    }
+
+    pub fn emit_empty_text(&mut self) -> Vec<String> {
+        let mut events = Vec::new();
+        let idx = self.next_block_index;
+        events.push(serialize_stream_event(&StreamEvent::ContentBlockStart {
+            index: idx,
+            content_block: ContentBlockStart::Text {
+                text: String::new(),
+            },
+        }));
+        self.next_block_index += 1;
+        self.has_content = true;
+        events.push(serialize_stream_event(&StreamEvent::ContentBlockStop {
+            index: idx,
+        }));
+        events
+    }
+
+    pub fn update_usage(&mut self, input_tokens: u64, output_tokens: u64) {
+        self.usage.input_tokens = input_tokens;
+        self.usage.output_tokens = output_tokens;
+    }
+
+    pub fn tokens(&self) -> (u64, u64) {
+        (self.usage.input_tokens, self.usage.output_tokens)
+    }
+
+    fn emit_text(&mut self, text: String) -> Vec<String> {
+        if self.has_tool_use {
+            return Vec::new();
+        }
+
+        let cleaned = strip_fabricated_tool_results(&text);
+        if cleaned.is_empty() {
+            return Vec::new();
+        }
+
+        self.pending_text.push_str(&cleaned);
+
+        // 累积超过阈值时刷新（纯文本响应的安全刷新点）
+        const FLUSH_THRESHOLD: usize = 200;
+        if self.pending_text.len() >= FLUSH_THRESHOLD {
+            return self.flush_pending_text();
+        }
+
+        Vec::new()
+    }
+
+    fn flush_pending_text(&mut self) -> Vec<String> {
+        if self.pending_text.is_empty() {
+            return Vec::new();
+        }
+
+        let text = std::mem::take(&mut self.pending_text);
+        let mut events = Vec::new();
+
+        if matches!(self.current_block_type, Some(BlockType::ToolUse))
+            || matches!(self.current_block_type, Some(BlockType::Thinking))
+        {
+            let idx = self.next_block_index.saturating_sub(1);
+            events.push(serialize_stream_event(
+                &StreamEvent::ContentBlockStop { index: idx },
+            ));
+            self.current_block_type = None;
+        }
+
+        if self.current_block_type.is_none() {
+            let idx = self.next_block_index;
+            events.push(serialize_stream_event(
+                &StreamEvent::ContentBlockStart {
+                    index: idx,
+                    content_block: ContentBlockStart::Text {
+                        text: String::new(),
+                    },
+                },
+            ));
+            self.current_block_type = Some(BlockType::Text);
+            self.next_block_index += 1;
+        }
+
+        events.push(serialize_stream_event(&StreamEvent::ContentBlockDelta {
+            index: self.next_block_index - 1,
+            delta: DeltaContent::TextDelta { text },
+        }));
+
+        self.has_content = true;
+        events
+    }
+
+    fn discard_pending_text(&mut self) {
+        self.pending_text.clear();
+    }
+}
+
+fn generate_signature() -> String {
+    use std::time::{SystemTime, UNIX_EPOCH};
+    let ts = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_nanos();
+    format!("EqoBCkIIC{}", base64_encode_signature(ts))
+}
+
+fn base64_encode_signature(n: u128) -> String {
+    const CHARSET: &[u8] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    let mut bytes = Vec::new();
+    let mut n = n;
+    for _ in 0..32 {
+        bytes.push(CHARSET[(n % 64) as usize]);
+        n /= 64;
+    }
+    String::from_utf8(bytes).unwrap_or_default()
+}
+
+// ── Non-streaming Collector ───────────────────────────────────────────────
+
+pub struct AnthropicCollector {
+    content_parts: Vec<String>,
+    model: String,
+    task_id: String,
+    tool_parser: ToolCallParser,
+    usage: Option<crate::model::ouyi::OuyiUsage>,
+}
+
+impl AnthropicCollector {
+    pub fn new(model: String, task_id: String) -> Self {
+        Self {
+            content_parts: Vec::new(),
+            model,
+            task_id,
+            tool_parser: ToolCallParser::new(),
+            usage: None,
+        }
+    }
+
+    pub fn push_event(&mut self, event: &crate::model::ouyi::OuyiSseEvent) {
+        let event_type = crate::client::sse::OuyiEventType::from(event.event_type.as_str());
+        match event_type {
+            crate::client::sse::OuyiEventType::StringChunk => {
+                if let Some(data) = &event.data
+                    && let Some(text) = data.as_str()
+                    && !text.is_empty()
+                {
+                    self.content_parts.push(text.to_string());
+                }
+            }
+            crate::client::sse::OuyiEventType::Object => {
+                if let Some(data) = &event.data
+                    && let Ok(usage) =
+                        serde_json::from_value::<crate::model::ouyi::OuyiUsage>(data.clone())
+                {
+                    self.usage = Some(usage);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    pub fn tokens(&self) -> (u64, u64) {
+        match &self.usage {
+            Some(u) => (u.prompt_tokens, u.completion_tokens),
+            None => (0, 0),
+        }
+    }
+
+    pub fn build_response(mut self) -> MessagesResponse {
+        let full_text: String = self.content_parts.join("");
+
+        let mut content_blocks: Vec<ResponseContentBlock> = Vec::new();
+        let mut remaining = full_text.as_str();
+
+        while !remaining.is_empty() {
+            if let Some((open_start, content_start)) = find_think_open(remaining) {
+                let before = &remaining[..open_start];
+                if !before.is_empty() {
+                    let parsed = self.tool_parser.process_chunk(before);
+                    if !parsed.normal_text.is_empty() {
+                        let cleaned = strip_fabricated_tool_results(&parsed.normal_text);
+                        if !cleaned.is_empty() {
+                            content_blocks.push(ResponseContentBlock::Text {
+                                text: cleaned,
+                            });
+                        }
+                    }
+                    for delta in parsed.tool_deltas {
+                        if let Some(func) = &delta.function {
+                            let input: serde_json::Value = func
+                                .arguments
+                                .as_deref()
+                                .and_then(|a| serde_json::from_str(a).ok())
+                                .unwrap_or(serde_json::Value::Object(Default::default()));
+                            content_blocks.push(ResponseContentBlock::ToolUse {
+                                id: delta.id.clone().unwrap_or_default(),
+                                name: func.name.clone().unwrap_or_default(),
+                                input,
+                            });
+                        }
+                    }
+                }
+                if let Some((close_start, close_end)) = find_think_close(&remaining[content_start..]) {
+                    let think_content = &remaining[content_start..content_start + close_start];
+                    content_blocks.push(ResponseContentBlock::Thinking {
+                        thinking: think_content.to_string(),
+                        signature: generate_signature(),
+                    });
+                    remaining = &remaining[content_start + close_end..];
+                } else {
+                    let think_content = &remaining[content_start..];
+                    content_blocks.push(ResponseContentBlock::Thinking {
+                        thinking: think_content.to_string(),
+                        signature: generate_signature(),
+                    });
+                    break;
+                }
+            } else {
+                let parsed = self.tool_parser.process_chunk(remaining);
+                if !parsed.normal_text.is_empty() {
+                    let cleaned = strip_fabricated_tool_results(&parsed.normal_text);
+                    if !cleaned.is_empty() {
+                        content_blocks.push(ResponseContentBlock::Text {
+                            text: cleaned,
+                        });
+                    }
+                }
+                for delta in parsed.tool_deltas {
+                    if let Some(func) = &delta.function {
+                        let input: serde_json::Value = func
+                            .arguments
+                            .as_deref()
+                            .and_then(|a| serde_json::from_str(a).ok())
+                            .unwrap_or(serde_json::Value::Object(Default::default()));
+                        content_blocks.push(ResponseContentBlock::ToolUse {
+                            id: delta.id.clone().unwrap_or_default(),
+                            name: func.name.clone().unwrap_or_default(),
+                            input,
+                        });
+                    }
+                }
+                break;
+            }
+        }
+
+        if content_blocks.is_empty() {
+            content_blocks.push(ResponseContentBlock::Text {
+                text: String::new(),
+            });
+        }
+
+        let has_tool_use = content_blocks
+            .iter()
+            .any(|b| matches!(b, ResponseContentBlock::ToolUse { .. }));
+
+        if has_tool_use {
+            content_blocks.retain(|b| !matches!(b, ResponseContentBlock::Text { .. }));
+        }
+
+        let stop_reason = if has_tool_use {
+            "tool_use"
+        } else {
+            "end_turn"
+        };
+
+        let usage = match &self.usage {
+            Some(u) => ResponseUsage {
+                input_tokens: u.prompt_tokens,
+                output_tokens: u.completion_tokens,
+            },
+            None => ResponseUsage {
+                input_tokens: 0,
+                output_tokens: 0,
+            },
+        };
+
+        MessagesResponse {
+            id: self.task_id,
+            r#type: "message",
+            role: "assistant",
+            model: self.model,
+            content: content_blocks,
+            stop_reason: stop_reason.to_string(),
+            usage,
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// 模拟上游返回 tool_use 文本 → 验证 SSE 事件包含 tool_use 块
+    /// 流式转换器会缓冲短文本（<200 字符），通过 done 事件统一刷新。
+    #[test]
+    fn test_stream_converter_tool_use_detection() {
+        let mut conv = AnthropicStreamConverter::new("test-model".into(), "msg_1".into());
+
+        // 发送普通文本（缓冲中，低于 FLUSH_THRESHOLD 时不立即输出事件）
+        conv.process_ouyi_event("Let me check that.", false);
+
+        // 发送 tool_use（触发前文刷新 + tool_use 块输出）
+        let events = conv.process_ouyi_event(
+            r#"<tool_use>
+{"name": "get_weather", "arguments": {"city": "Beijing"}}
+</tool_use>"#,
+            false,
+        );
+        let joined = events.join("\n");
+        // tool_use 触发时，之前缓冲的文本也会被刷新
+        assert!(joined.contains("content_block_start"), "应包含 content_block_start: {}", joined);
+        assert!(joined.contains("tool_use"), "应包含 tool_use 块: {}", joined);
+        assert!(joined.contains("get_weather"), "应包含工具名: {}", joined);
+        assert!(joined.contains("partial_json"), "应包含 input_json_delta: {}", joined);
+        assert!(joined.contains("Beijing"), "应包含城市参数: {}", joined);
+
+        assert!(conv.has_tool_use, "has_tool_use 应为 true");
+        assert!(conv.last_tool_use_id.is_some(), "应记录 last_tool_use_id");
+
+        // 发送 done 事件
+        let done_events = conv.process_ouyi_event("", true);
+        let done_joined = done_events.join("\n");
+        assert!(
+            done_joined.contains(r#""stop_reason":"tool_use""#),
+            "stop_reason 应为 tool_use: {}",
+            done_joined
+        );
+        assert!(
+            done_joined.contains("message_stop"),
+            "应包含 message_stop: {}",
+            done_joined
+        );
+    }
+
+    /// 验证 has_tool_use 为 true 后，后续文本被忽略（防止混杂输出）
+    #[test]
+    fn test_stream_converter_ignores_text_after_tool_use() {
+        let mut conv = AnthropicStreamConverter::new("test-model".into(), "msg_1".into());
+
+        conv.process_ouyi_event(r#"<tool_use>{"name":"test","arguments":{}}</tool_use>"#, false);
+        assert!(conv.has_tool_use);
+
+        // 后续文本应被忽略
+        let events = conv.process_ouyi_event("This should be ignored", false);
+        let joined = events.join("\n");
+        assert!(!joined.contains("text_delta"), "tool_use 后的文本应被忽略: {}", joined);
+    }
+
+    /// 验证纯文本响应正常结束
+    #[test]
+    fn test_stream_converter_text_response_done() {
+        let mut conv = AnthropicStreamConverter::new("test-model".into(), "msg_1".into());
+
+        conv.process_ouyi_event("Hello world", false);
+
+        let done_events = conv.process_ouyi_event("", true);
+        let done_joined = done_events.join("\n");
+        assert!(
+            done_joined.contains(r#""stop_reason":"end_turn""#),
+            "纯文本响应 stop_reason 应为 end_turn: {}",
+            done_joined
+        );
+        assert!(
+            done_joined.contains("message_stop"),
+            "应包含 message_stop: {}",
+            done_joined
+        );
+    }
+
+    /// 模拟完整工具调用流：首次 text → tool_use → done → 模拟 tool_result 响应
+    #[test]
+    fn test_stream_converter_full_tool_flow() {
+        // === 轮次 1: 带 tool_use 的响应 ===
+        let mut conv = AnthropicStreamConverter::new("test-model".into(), "msg_1".into());
+
+        conv.process_ouyi_event("I'll check the weather.\n", false);
+        conv.process_ouyi_event(
+            r#"<tool_use>
+{"name": "get_weather", "arguments": {"city": "Beijing"}}
+</tool_use>"#,
+            false,
+        );
+
+        assert!(conv.has_tool_use);
+        assert_eq!(conv.last_tool_use_id, Some("call_0".to_string()));
+
+        let done = conv.process_ouyi_event("", true);
+        let done_str = done.join("\n");
+        assert!(done_str.contains(r#""stop_reason":"tool_use""#));
+
+        // === 轮次 2: tool_result 后的最终文本响应 ===
+        let mut conv2 = AnthropicStreamConverter::new("test-model".into(), "msg_2".into());
+
+        // 发送足够长的文本以触发 FLUSH_THRESHOLD（200 字符）
+        let long_text = format!("The weather in Beijing is sunny, 25°C. {}", "x".repeat(200));
+        conv2.process_ouyi_event(&long_text, false);
+
+        assert!(
+            conv2.has_content,
+            "长文本应触发 flush，has_content 应为 true"
+        );
+
+        // 发送 done 获得完整事件
+        let done2 = conv2.process_ouyi_event("", true);
+        let done2_str = done2.join("\n");
+        assert!(
+            done2_str.contains(r#""stop_reason":"end_turn""#),
+            "最终响应 stop_reason 应为 end_turn: {}",
+            done2_str
+        );
+    }
+
+    /// 验证 strip_fabricated_tool_results 正确清除模型自造的 tool_result
+    #[test]
+    fn test_strip_fabricated_tool_results_removes_tags() {
+        let input = r#"Let me think about this.
+<tool_result name="search">
+some results
+</tool_result>
+Now I can answer."#;
+
+        let cleaned = strip_fabricated_tool_results(input);
+        assert!(!cleaned.contains("<tool_result"), "应移除 <tool_result 标签");
+        assert!(!cleaned.contains("</tool_result>"), "应移除 </tool_result> 标签");
+        assert!(cleaned.contains("Let me think about this"));
+        assert!(cleaned.contains("Now I can answer"));
+        assert!(!cleaned.contains("some results"), "应移除 tool_result 内容");
+    }
+
+    /// 验证 tool_use_id 使用合成 ID 从 ToolCallParser 正确传递
+    #[test]
+    fn test_tool_use_id_generation() {
+        let mut parser = ToolCallParser::new();
+
+        let output = parser.process_chunk(
+            r#"<tool_use>
+{"name": "search", "arguments": {"query": "rust"}}
+</tool_use>"#,
+        );
+
+        assert_eq!(output.tool_deltas.len(), 1);
+        let delta = &output.tool_deltas[0];
+        assert_eq!(delta.index, 0);
+        assert_eq!(delta.id, Some("call_0".to_string()));
+
+        // 第二个 tool_use 应有不同 ID
+        let output2 = parser.process_chunk(
+            r#"<tool_use>
+{"name": "read", "arguments": {"path": "/tmp"}}
+</tool_use>"#,
+        );
+
+        assert_eq!(output2.tool_deltas.len(), 1);
+        let delta2 = &output2.tool_deltas[0];
+        assert_eq!(delta2.index, 1);
+        assert_eq!(delta2.id, Some("call_1".to_string()));
+    }
+}

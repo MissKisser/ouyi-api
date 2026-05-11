@@ -1,0 +1,587 @@
+use std::sync::Arc;
+
+use axum::extract::State;
+use axum::response::IntoResponse;
+use axum::response::sse::{Event, Sse};
+use axum::Json;
+use futures::stream::StreamExt;
+use tokio_stream::wrappers::ReceiverStream;
+
+use crate::adapter::request::convert_request;
+use crate::adapter::response::SseCollector;
+use crate::client::http::OuyiHttpClient;
+use crate::client::session::{spawn_session_cleanup, GuardedStream};
+use crate::client::sse::{parse_sse_line, SseLineBuffer};
+use crate::error::AppError;
+use crate::model::openai::*;
+use crate::AppState;
+
+pub async fn responses(
+    State(state): State<Arc<AppState>>,
+    Json(req): Json<ResponsesRequest>,
+) -> Result<axum::response::Response, AppError> {
+    let chat_req = convert_responses_to_chat(&req)?;
+    let is_stream = req.stream;
+
+    let model_full = state.model_mapper.to_ouyi(&chat_req.model);
+    let should_thinking = state.model_mapper.should_thinking(&chat_req.model);
+
+    state.stats.record_start();
+    let start_time = std::time::Instant::now();
+
+    let ouyi_req =
+        convert_request(&chat_req, &model_full, should_thinking).map_err(AppError::Internal)?;
+
+    let jwt_token = match state.account_store.get_next_token().await {
+        Some(token) => token,
+        None => state.config.ouyi.jwt_token.clone(),
+    };
+
+    if jwt_token.is_empty() {
+        return Err(AppError::BadRequest(
+            "未配置 JWT token 且无可用账号 token".to_string(),
+        ));
+    }
+
+    let client = OuyiHttpClient::new(
+        state.http_client.clone(),
+        state.config.ouyi.base_url.clone(),
+        jwt_token,
+        state.config.ouyi.app_version.clone(),
+    );
+
+    let session_data = match client.create_session(&model_full).await {
+        Ok(s) => s,
+        Err(e) => {
+            let msg = format!("创建会话失败: {}", e);
+            state.stats.record_error(start_time.elapsed().as_millis() as u64, &model_full, &msg);
+            return Err(AppError::Upstream(msg));
+        }
+    };
+    let session_id = session_data.id;
+
+    state.active_sessions.insert(session_id, ());
+
+    let final_text = if let Some(sys_prompt) = &ouyi_req.system_prompt {
+        format!("[System]: {}\n\n{}", sys_prompt, ouyi_req.text)
+    } else {
+        ouyi_req.text.clone()
+    };
+
+    let resp = match client
+        .chat_stream(session_id, final_text, ouyi_req.thinking)
+        .await
+    {
+        Ok(r) => r,
+        Err(e) => {
+            state.active_sessions.remove(&session_id);
+            return Err(AppError::Upstream(format!("聊天请求失败: {}", e)));
+        }
+    };
+
+    let elapsed = start_time.elapsed().as_millis() as u64;
+
+    let task_id = format!("resp_{}", uuid_short());
+    let short_model = state
+        .model_mapper
+        .get_all_short_names()
+        .iter()
+        .find(|s| state.model_mapper.to_ouyi(s) == model_full)
+        .cloned()
+        .unwrap_or_else(|| req.model.clone());
+
+    if is_stream {
+        handle_responses_stream(resp, task_id, short_model, model_full, session_id, client, state, start_time).await
+    } else {
+        handle_responses_non_stream(resp, task_id, short_model, model_full, session_id, client, state, elapsed).await
+    }
+}
+
+async fn handle_responses_stream(
+    resp: reqwest::Response,
+    task_id: String,
+    model: String,
+    model_full: String,
+    session_id: i64,
+    client: OuyiHttpClient,
+    state: Arc<AppState>,
+    start_time: std::time::Instant,
+) -> Result<axum::response::Response, AppError> {
+    let byte_stream = resp.bytes_stream();
+    let guarded = GuardedStream::new(
+        byte_stream.map(|result| result.map_err(std::io::Error::other)),
+        session_id,
+        client,
+    );
+
+    let task_id_for_init = task_id.clone();
+    let model_for_stream = model.clone();
+    let model_for_stats = model_full.clone();
+
+    let (tx, rx) = tokio::sync::mpsc::channel::<Result<Event, axum::Error>>(32);
+
+    tokio::spawn(async move {
+        let mut sse_buffer = SseLineBuffer::new();
+        let mut partial = Vec::new();
+        let mut text_buffer = String::new();
+        let mut prompt_tokens: u64 = 0;
+        let mut completion_tokens: u64 = 0;
+        let created = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs();
+        let msg_id = format!("msg_{}", uuid_short());
+
+        let created_event = serde_json::json!({
+            "type": "response.created",
+            "response": {
+                "id": task_id_for_init,
+                "object": "response",
+                "created_at": created,
+                "model": model_for_stream,
+                "output": [],
+                "status": "in_progress"
+            }
+        });
+        let _ = tx.send(Ok(Event::default().event("response.created").data(created_event.to_string()))).await;
+
+        let output_item_added = serde_json::json!({
+            "type": "response.output_item.added",
+            "output_index": 0,
+            "item": {
+                "type": "message",
+                "id": msg_id,
+                "status": "in_progress",
+                "role": "assistant",
+                "content": []
+            }
+        });
+        let _ = tx.send(Ok(Event::default().event("response.output_item.added").data(output_item_added.to_string()))).await;
+
+        let content_part_added = serde_json::json!({
+            "type": "response.content_part.added",
+            "item_id": msg_id,
+            "output_index": 0,
+            "content_index": 0,
+            "part": {
+                "type": "output_text",
+                "text": "",
+                "annotations": []
+            }
+        });
+        let _ = tx.send(Ok(Event::default().event("response.content_part.added").data(content_part_added.to_string()))).await;
+
+        futures::pin_mut!(guarded);
+
+        while let Some(chunk_result) = guarded.next().await {
+            let chunk = match chunk_result {
+                Ok(bytes) => bytes,
+                Err(_) => break,
+            };
+
+            let mut bytes = chunk.to_vec();
+            if !partial.is_empty() {
+                let mut combined = std::mem::take(&mut partial);
+                combined.extend_from_slice(&bytes);
+                bytes = combined;
+            }
+            let text = match String::from_utf8(bytes) {
+                Ok(t) => t,
+                Err(e) => {
+                    partial = e.into_bytes();
+                    continue;
+                }
+            };
+
+            let lines = sse_buffer.push_chunk(&text);
+            for line in lines {
+                if let Some(event) = parse_sse_line(&line) {
+                    let event_type =
+                        crate::client::sse::OuyiEventType::from(event.event_type.as_str());
+                    match event_type {
+                        crate::client::sse::OuyiEventType::StringChunk => {
+                            if let Some(data) = &event.data {
+                                if let Some(t) = data.as_str() {
+                                    text_buffer.push_str(t);
+                                    let delta = serde_json::json!({
+                                        "type": "response.output_text.delta",
+                                        "item_id": msg_id,
+                                        "output_index": 0,
+                                        "content_index": 0,
+                                        "delta": t
+                                    });
+                                    if tx.send(Ok(Event::default().event("response.output_text.delta").data(delta.to_string()))).await.is_err() {
+                                        return;
+                                    }
+                                }
+                            }
+                        }
+                        crate::client::sse::OuyiEventType::Object => {
+                            if let Some(data) = &event.data {
+                                if let Ok(usage) =
+                                    serde_json::from_value::<crate::model::ouyi::OuyiUsage>(data.clone())
+                                {
+                                    prompt_tokens = usage.prompt_tokens;
+                                    completion_tokens = usage.completion_tokens;
+                                }
+                            }
+                        }
+                        crate::client::sse::OuyiEventType::Done => {
+                            if let Some(data) = &event.data {
+                                if let Ok(usage) =
+                                    serde_json::from_value::<crate::model::ouyi::OuyiUsage>(data.clone())
+                                {
+                                    prompt_tokens = usage.prompt_tokens;
+                                    completion_tokens = usage.completion_tokens;
+                                }
+                            }
+                        }
+                        _ => {}
+                    }
+                }
+            }
+        }
+
+        let output_text_done = serde_json::json!({
+            "type": "response.output_text.done",
+            "item_id": msg_id,
+            "output_index": 0,
+            "content_index": 0,
+            "text": text_buffer
+        });
+        let _ = tx.send(Ok(Event::default().event("response.output_text.done").data(output_text_done.to_string()))).await;
+
+        let content_part_done = serde_json::json!({
+            "type": "response.content_part.done",
+            "item_id": msg_id,
+            "output_index": 0,
+            "content_index": 0,
+            "part": {
+                "type": "output_text",
+                "text": text_buffer,
+                "annotations": []
+            }
+        });
+        let _ = tx.send(Ok(Event::default().event("response.content_part.done").data(content_part_done.to_string()))).await;
+
+        let output_item_done = serde_json::json!({
+            "type": "response.output_item.done",
+            "output_index": 0,
+            "item": {
+                "type": "message",
+                "id": msg_id,
+                "status": "completed",
+                "role": "assistant",
+                "content": [{
+                    "type": "output_text",
+                    "text": text_buffer,
+                    "annotations": []
+                }]
+            }
+        });
+        let _ = tx.send(Ok(Event::default().event("response.output_item.done").data(output_item_done.to_string()))).await;
+
+        let completed = serde_json::json!({
+            "type": "response.completed",
+            "response": {
+                "id": task_id_for_init,
+                "object": "response",
+                "created_at": created,
+                "model": model_for_stream,
+                "output": [{
+                    "type": "message",
+                    "id": msg_id,
+                    "status": "completed",
+                    "role": "assistant",
+                    "content": [{
+                        "type": "output_text",
+                        "text": text_buffer,
+                        "annotations": []
+                    }]
+                }],
+                "usage": {
+                    "input_tokens": prompt_tokens,
+                    "output_tokens": completion_tokens,
+                    "total_tokens": prompt_tokens + completion_tokens
+                }
+            }
+        });
+        let _ = tx.send(Ok(Event::default().event("response.completed").data(completed.to_string()))).await;
+
+        let stream_elapsed = start_time.elapsed().as_millis() as u64;
+        state.stats.record_success(stream_elapsed, prompt_tokens, completion_tokens, &model_for_stats);
+        state.active_sessions.remove(&session_id);
+    });
+
+    let stream = ReceiverStream::new(rx);
+    let sse = Sse::new(stream).keep_alive(
+        axum::response::sse::KeepAlive::new()
+            .interval(std::time::Duration::from_secs(15))
+            .text("ping"),
+    );
+
+    Ok(sse.into_response())
+}
+
+async fn handle_responses_non_stream(
+    resp: reqwest::Response,
+    task_id: String,
+    model: String,
+    model_full: String,
+    session_id: i64,
+    client: OuyiHttpClient,
+    state: Arc<AppState>,
+    elapsed: u64,
+) -> Result<axum::response::Response, AppError> {
+    let mut collector = SseCollector::new(model.clone(), format!("chatcmpl-{}", uuid_short()));
+    let mut sse_buffer = SseLineBuffer::new();
+
+    let byte_stream = resp.bytes_stream();
+    let guarded = GuardedStream::new(
+        byte_stream.map(|result| result.map_err(std::io::Error::other)),
+        session_id,
+        client.clone(),
+    );
+
+    futures::pin_mut!(guarded);
+
+    let mut total_bytes: usize = 0;
+    let max_bytes = state.config.limits.max_response_bytes;
+    let mut partial = Vec::new();
+
+    while let Some(chunk_result) = guarded.next().await {
+        let chunk = match chunk_result {
+            Ok(bytes) => bytes,
+            Err(e) => {
+                tracing::error!(error = %e, "SSE字节流读取错误");
+                break;
+            }
+        };
+
+        total_bytes += chunk.len();
+        if total_bytes > max_bytes {
+            break;
+        }
+
+        let mut bytes = chunk.to_vec();
+        if !partial.is_empty() {
+            let mut combined = std::mem::take(&mut partial);
+            combined.extend_from_slice(&bytes);
+            bytes = combined;
+        }
+        let text = match String::from_utf8(bytes) {
+            Ok(t) => t,
+            Err(e) => {
+                partial = e.into_bytes();
+                continue;
+            }
+        };
+
+        let lines = sse_buffer.push_chunk(&text);
+        for line in lines {
+            if let Some(event) = parse_sse_line(&line) {
+                collector.push_event(&event);
+            }
+        }
+    }
+
+    if let Some(remaining) = sse_buffer.drain_remaining()
+        && let Some(event) = parse_sse_line(&remaining)
+    {
+        collector.push_event(&event);
+    }
+
+    let (prompt, completion) = collector.tokens();
+    let chat_response = collector.build_response();
+
+    spawn_session_cleanup(client, session_id);
+    state.active_sessions.remove(&session_id);
+    state.stats.record_success(elapsed, prompt, completion, &model_full);
+
+    let response = build_responses_response(&model, task_id, chat_response);
+    Ok(Json(response).into_response())
+}
+
+fn convert_responses_to_chat(req: &ResponsesRequest) -> Result<ChatCompletionRequest, AppError> {
+    let messages = match &req.input {
+        serde_json::Value::String(text) => {
+            let mut msgs = Vec::new();
+            if let Some(instructions) = &req.instructions {
+                msgs.push(ChatMessage {
+                    role: "system".to_string(),
+                    content: Some(instructions.clone()),
+                    tool_calls: None,
+                    tool_call_id: None,
+                    name: None,
+                });
+            }
+            msgs.push(ChatMessage {
+                role: "user".to_string(),
+                content: Some(text.clone()),
+                tool_calls: None,
+                tool_call_id: None,
+                name: None,
+            });
+            msgs
+        }
+        serde_json::Value::Array(items) => {
+            let mut msgs: Vec<ChatMessage> = Vec::new();
+
+            if let Some(instructions) = &req.instructions {
+                msgs.push(ChatMessage {
+                    role: "system".to_string(),
+                    content: Some(instructions.clone()),
+                    tool_calls: None,
+                    tool_call_id: None,
+                    name: None,
+                });
+            }
+
+            for item in items {
+                let role = item
+                    .get("role")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("user")
+                    .to_string();
+
+                let content = match role.as_str() {
+                    "developer" => {
+                        let c = extract_text_content(item.get("content"));
+                        let mut msg = ChatMessage {
+                            role: "system".to_string(),
+                            content: Some(c),
+                            tool_calls: None,
+                            tool_call_id: None,
+                            name: None,
+                        };
+                        if msgs.first().map(|m| m.role.as_str()) == Some("system") {
+                            let existing = msgs[0].content.take().unwrap_or_default();
+                            msgs[0].content =
+                                Some(format!("{}\n\n{}", existing, msg.content.take().unwrap()));
+                            continue;
+                        }
+                        msgs.push(msg);
+                        continue;
+                    }
+                    _ => extract_text_content(item.get("content")),
+                };
+
+                msgs.push(ChatMessage {
+                    role,
+                    content: Some(content),
+                    tool_calls: None,
+                    tool_call_id: None,
+                    name: None,
+                });
+            }
+            msgs
+        }
+        _ => {
+            return Err(AppError::BadRequest(
+                "input 字段必须是字符串或消息数组".to_string(),
+            ));
+        }
+    };
+
+    if messages.is_empty() {
+        return Err(AppError::BadRequest("消息列表为空".to_string()));
+    }
+
+    Ok(ChatCompletionRequest {
+        model: req.model.clone(),
+        messages,
+        stream: false,
+        temperature: req.temperature,
+        max_tokens: req.max_output_tokens,
+        tools: req.tools.as_ref().map(|tools| convert_responses_tools(tools)),
+    })
+}
+
+fn convert_responses_tools(tools: &[serde_json::Value]) -> Vec<ToolDef> {
+    tools
+        .iter()
+        .filter_map(|tool| {
+            let name = tool
+                .get("name")
+                .and_then(|v| v.as_str())
+                .unwrap_or("unknown");
+            let description = tool
+                .get("description")
+                .and_then(|v| v.as_str())
+                .map(|s| s.to_string());
+            let parameters = tool.get("parameters").cloned();
+            Some(ToolDef {
+                tool_type: "function".to_string(),
+                function: ToolFunction {
+                    name: name.to_string(),
+                    description,
+                    parameters,
+                },
+            })
+        })
+        .collect()
+}
+
+fn extract_text_content(content: Option<&serde_json::Value>) -> String {
+    match content {
+        Some(serde_json::Value::String(s)) => s.clone(),
+        Some(serde_json::Value::Array(parts)) => {
+            parts
+                .iter()
+                .filter_map(|p| {
+                    if p.get("type").and_then(|t| t.as_str()) == Some("input_text") {
+                        p.get("text").and_then(|t| t.as_str()).map(|s| s.to_string())
+                    } else {
+                        None
+                    }
+                })
+                .collect::<Vec<_>>()
+                .join("")
+        }
+        _ => String::new(),
+    }
+}
+
+fn build_responses_response(
+    model: &str,
+    task_id: String,
+    chat_response: ChatCompletionResponse,
+) -> ResponsesResponse {
+    let choice = &chat_response.choices[0];
+    let text = choice.message.content.clone().unwrap_or_default();
+
+    let msg_id = format!("msg_{}", uuid_short());
+    let output = ResponseOutputItem {
+        item_type: "message".to_string(),
+        id: msg_id,
+        status: "completed".to_string(),
+        role: "assistant".to_string(),
+        content: vec![ResponseContentPart {
+            content_type: "output_text".to_string(),
+            text,
+            annotations: Vec::new(),
+        }],
+    };
+
+    ResponsesResponse {
+        id: task_id,
+        object: "response".to_string(),
+        created_at: chat_response.created,
+        model: model.to_string(),
+        output: vec![output],
+        usage: ResponseUsage {
+            input_tokens: chat_response.usage.prompt_tokens,
+            output_tokens: chat_response.usage.completion_tokens,
+            total_tokens: chat_response.usage.total_tokens,
+        },
+    }
+}
+
+fn uuid_short() -> String {
+    use std::time::{SystemTime, UNIX_EPOCH};
+    let ts = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_nanos();
+    format!("{:x}", ts % 0xFFFFFF)
+}

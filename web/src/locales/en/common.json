@@ -1,0 +1,207 @@
+{
+  "nav": {
+    "dashboard": "Dashboard",
+    "models": "Models",
+    "chat": "Chat Test",
+    "config": "Config",
+    "logs": "Logs",
+    "logout": "Logout"
+  },
+  "login": {
+    "title": "DS Free API",
+    "setupDescription": "First time use, please set an admin password",
+    "loginDescription": "Enter password to access admin panel",
+    "passwordLabel": "Password",
+    "confirmPasswordLabel": "Confirm Password",
+    "setPasswordLabel": "Set Password",
+    "passwordPlaceholder": "Admin password",
+    "setPasswordPlaceholder": "At least 6 characters",
+    "confirmPasswordPlaceholder": "Re-enter password",
+    "setupButton": "Set Password",
+    "loginButton": "Login",
+    "errorPasswordLength": "Password must be at least 6 characters",
+    "errorPasswordMismatch": "Passwords do not match",
+    "errorSetupFailed": "Setup failed",
+    "errorLoginFailed": "Login failed",
+    "networkError": "Network error, please check connection",
+    "checking": "Checking...",
+    "settingUp": "Setting up...",
+    "verifying": "Verifying..."
+  },
+  "dashboard": {
+    "title": "Dashboard",
+    "stats": {
+      "totalRequests": "Total Requests",
+      "successRate": "Success Rate",
+      "avgLatency": "Avg Latency",
+      "uptime": "Uptime",
+      "totalTokens": "Total Tokens",
+      "promptTokens": "Prompt Tokens",
+      "completionTokens": "Completion Tokens",
+      "models": "Model Statistics",
+      "model": "Model",
+      "requests": "Requests",
+      "prompt": "Prompt Tokens",
+      "completion": "Completion Tokens",
+      "days": "d",
+      "hours": "h",
+      "minutes": "m"
+    },
+    "accountPool": {
+      "title": "Account Pool",
+      "total": "Total",
+      "idle": "Idle",
+      "busy": "Busy",
+      "error": "Error",
+      "invalid": "Invalid"
+    }
+  },
+  "config": {
+    "title": "Configuration",
+    "saveSuccess": "Saved successfully, config hot-reloaded",
+    "saveFailed": "Save failed: {{error}}",
+    "loadFailed": "Failed to load config",
+    "loading": "Loading...",
+    "cancelConfirm": "Discard all unsaved changes?",
+    "saving": "Saving...",
+    "cancel": "Cancel",
+    "save": "Save Configuration",
+    "sections": {
+      "accounts": "Accounts",
+      "apiKeys": "API Keys",
+      "admin": "Admin",
+      "server": "Server",
+      "ouyi": "Ouyi API",
+      "deepseek": "DeepSeek",
+      "models": "Model Types",
+      "toolCallTags": "Tool Call Tags",
+      "proxy": "Proxy"
+    },
+    "accounts": {
+      "email": "Email",
+      "mobile": "Mobile",
+      "areaCode": "Area Code",
+      "password": "Password",
+      "token": "Token",
+      "enabled": "Enabled",
+      "add": "Add Account"
+    },
+    "apiKeys": {
+      "description": "Description",
+      "placeholder": "Description",
+      "add": "Add API Key",
+      "copyTitle": "Copy"
+    },
+    "admin": {
+      "passwordSet": "Password set",
+      "passwordNotSet": "Password not set",
+      "oldPassword": "Old Password",
+      "newPassword": "New Password",
+      "oldPasswordPlaceholder": "Enter old password to change",
+      "newPasswordPlaceholder": "At least 6 characters"
+    },
+    "server": {
+      "host": "Listen Address",
+      "port": "Port",
+      "corsOrigins": "CORS Origins (comma separated)"
+    },
+    "deepseek": {
+      "apiBase": "API Base",
+      "wasmUrl": "WASM URL",
+      "userAgent": "User-Agent",
+      "clientVersion": "Client Version",
+      "clientPlatform": "Client Platform",
+      "clientLocale": "Client Locale"
+    },
+    "modelsSection": {
+      "typeName": "Type Name",
+      "maxInput": "Max Input",
+      "maxOutput": "Max Output",
+      "alias": "Alias (optional)",
+      "add": "Add Model Type"
+    },
+    "toolCallTags": {
+      "extraStarts": "Extra Start Tags",
+      "extraEnds": "Extra End Tags",
+      "placeholder": "New tag, press Enter to add"
+    },
+    "proxy": {
+      "url": "Proxy URL (leave empty to disable)",
+      "placeholder": "http://127.0.0.1:7890"
+    }
+  },
+  "logs": {
+    "title": "Logs",
+    "tabs": {
+      "request": "Request Logs",
+      "runtime": "Runtime Logs"
+    },
+    "requestLogs": {
+      "description": "Last 100 requests (auto-refresh every 5s)",
+      "time": "Time",
+      "model": "Model",
+      "apiKey": "API Key",
+      "promptTokens": "Prompt",
+      "completionTokens": "Completion",
+      "latency": "Latency",
+      "status": "Status",
+      "success": "Success",
+      "failure": "Failure",
+      "loading": "Loading...",
+      "empty": "No request logs"
+    },
+    "runtimeLogs": {
+      "description": "Runtime logs (total {total}, auto-refresh every 3s)",
+      "time": "Time",
+      "level": "Level",
+      "module": "Module",
+      "message": "Message",
+      "loading": "Loading...",
+      "empty": "No runtime logs",
+      "pageInfo": "Page {current} / {total}",
+      "prev": "Prev",
+      "next": "Next"
+    }
+  },
+  "models": {
+    "title": "Models",
+    "type": "Type",
+    "available": "available",
+    "loading": "Loading...",
+    "empty": "No models found",
+    "clickToCopy": "Click to copy model ID"
+  },
+  "chat": {
+    "selectModel": "Select Model",
+    "params": "Params",
+    "temperature": "Temperature",
+    "topP": "Top P",
+    "maxTokens": "Max Tokens",
+    "presencePenalty": "Presence Penalty",
+    "frequencyPenalty": "Frequency Penalty",
+    "thinking": "Thinking",
+    "thinkingBudget": "Thinking Budget",
+    "resetParams": "Reset Params",
+    "welcome": "Select a model to start chatting",
+    "streaming": "Generating...",
+    "placeholder": "Type a message, Enter to send, Shift+Enter for new line",
+    "stop": "Stop",
+    "hint": "Ouyi AI Reverse Proxy Chat Test Page"
+  },
+  "language": {
+    "zh": "中文",
+    "en": "English"
+  },
+  "common": {
+    "loading": "Loading...",
+    "loadError": "Failed to load, please refresh",
+    "save": "Save",
+    "cancel": "Cancel",
+    "delete": "Delete",
+    "copy": "Copy",
+    "copied": "Copied",
+    "confirm": "Confirm",
+    "success": "Success",
+    "error": "Error"
+  }
+}

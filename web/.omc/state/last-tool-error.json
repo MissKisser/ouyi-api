@@ -1,0 +1,7 @@
+{
+  "tool_name": "Read",
+  "tool_input_preview": "{\"file_path\":\"C:\\\\Users\\\\missk\\\\.playwright-mcp\\\\console-2026-05-09T06-41-48-778Z.log\"}",
+  "error": "File does not exist. Note: your current working directory is D:\\document\\Projects\\ouyi-api\\web.",
+  "timestamp": "2026-05-09T06:43:10.274Z",
+  "retry_count": 1
+}
