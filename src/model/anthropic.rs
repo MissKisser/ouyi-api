@@ -21,6 +21,8 @@ pub struct MessagesRequest {
     pub top_k: Option<u32>,
     #[serde(default)]
     pub stop_sequences: Option<Vec<String>>,
+    #[serde(default)]
+    pub thinking: Option<ThinkingConfig>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -171,7 +173,18 @@ pub struct AnthropicTool {
     pub input_schema: serde_json::Value,
 }
 
-// ── Non-streaming Response ─────────────────────────────────────────────────
+#[derive(Debug, Clone, Deserialize)]
+#[serde(tag = "type")]
+pub enum ThinkingConfig {
+    #[serde(rename = "enabled")]
+    Enabled {
+        budget_tokens: u32,
+    },
+    #[serde(rename = "disabled")]
+    Disabled,
+    #[serde(rename = "adaptive")]
+    Adaptive,
+}
 
 #[derive(Debug, Clone, Serialize)]
 pub struct MessagesResponse {
@@ -210,8 +223,8 @@ pub struct ResponseUsage {
 
 // ── Streaming SSE Events ───────────────────────────────────────────────────
 
-pub fn serialize_stream_event(event: &StreamEvent) -> String {
-    match event {
+pub fn serialize_stream_event(event: &StreamEvent) -> bytes::Bytes {
+    let s = match event {
         StreamEvent::MessageStart { message } => {
             format!(
                 "event: message_start\ndata: {}\n\n",
@@ -253,14 +266,16 @@ pub fn serialize_stream_event(event: &StreamEvent) -> String {
             )
         }
         StreamEvent::MessageDelta { delta, usage } => {
+            let mut obj = serde_json::json!({
+                "type": "message_delta",
+                "delta": delta,
+            });
+            if usage.output_tokens > 0 {
+                obj["usage"] = serde_json::json!({"output_tokens": usage.output_tokens});
+            }
             format!(
                 "event: message_delta\ndata: {}\n\n",
-                serde_json::to_string(&serde_json::json!({
-                    "type": "message_delta",
-                    "delta": delta,
-                    "usage": usage,
-                }))
-                .unwrap_or_default()
+                serde_json::to_string(&obj).unwrap_or_default()
             )
         }
         StreamEvent::MessageStop => {
@@ -269,7 +284,8 @@ pub fn serialize_stream_event(event: &StreamEvent) -> String {
         StreamEvent::Ping => {
             "event: ping\ndata: {\"type\":\"ping\"}\n\n".to_string()
         }
-    }
+    };
+    bytes::Bytes::from(s)
 }
 
 #[derive(Debug, Clone)]

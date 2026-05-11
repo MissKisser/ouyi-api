@@ -1,8 +1,9 @@
+use bytes::Bytes;
 use crate::adapter::tool_call::ToolCallParser;
 use crate::model::anthropic::*;
 
 const THINK_OPEN: &str = "<think";
-const THINK_CLOSE: &str = "</think>";
+const THINK_CLOSE: &str = "</thinking>";
 
 pub struct AnthropicStreamConverter {
     model: String,
@@ -10,7 +11,6 @@ pub struct AnthropicStreamConverter {
     tool_parser: ToolCallParser,
     next_block_index: u32,
     current_block_type: Option<BlockType>,
-    pub started: bool,
     in_thinking: bool,
     think_buffer: String,
     pub has_tool_use: bool,
@@ -18,6 +18,7 @@ pub struct AnthropicStreamConverter {
     usage: ResponseUsage,
     pending_text: String,
     pub has_content: bool,
+    pub done_processed: bool,
 }
 
 #[derive(Clone)]
@@ -118,8 +119,11 @@ fn find_think_open(s: &str) -> Option<(usize, usize)> {
 
 /// 查找 `</think>` 闭合标签的位置，返回 (标签起始位置, 标签结束位置)。
 fn find_think_close(s: &str) -> Option<(usize, usize)> {
-    let start_pos = s.find(THINK_CLOSE)?;
-    Some((start_pos, start_pos + THINK_CLOSE.len()))
+    if let Some(start_pos) = s.find("</thinking>") {
+        return Some((start_pos, start_pos + "</thinking>".len()));
+    }
+    let start_pos = s.find("</think>")?;
+    Some((start_pos, start_pos + "</think>".len()))
 }
 
 /// 扫描 thinking 内容尾部，检查是否有不完整的 `</think` 前缀。
@@ -152,7 +156,6 @@ impl AnthropicStreamConverter {
             tool_parser: ToolCallParser::new(),
             next_block_index: 0,
             current_block_type: None,
-            started: false,
             in_thinking: false,
             think_buffer: String::new(),
             has_tool_use: false,
@@ -160,10 +163,11 @@ impl AnthropicStreamConverter {
             usage: ResponseUsage { input_tokens: 0, output_tokens: 0 },
             pending_text: String::new(),
             has_content: false,
+            done_processed: false,
         }
     }
 
-    pub fn start_event(&self) -> String {
+    pub fn start_event(&self) -> Bytes {
         serialize_stream_event(&StreamEvent::MessageStart {
             message: MessageStartInfo {
                 r#type: "message_start",
@@ -181,10 +185,15 @@ impl AnthropicStreamConverter {
         })
     }
 
-    pub fn process_ouyi_event(&mut self, text: &str, is_done: bool) -> Vec<String> {
-        let mut events = Vec::new();
+    pub fn process_ouyi_event(&mut self, text: &str, is_done: bool) -> Vec<Bytes> {
+        let mut events: Vec<Bytes> = Vec::new();
 
         if is_done {
+            if self.done_processed {
+                return events;
+            }
+            self.done_processed = true;
+
             if self.in_thinking && !self.has_tool_use {
                 events.extend(self.flush_thinking());
             }
@@ -315,7 +324,7 @@ impl AnthropicStreamConverter {
         events
     }
 
-    fn emit_thinking_start(&mut self) -> Vec<String> {
+    fn emit_thinking_start(&mut self) -> Vec<Bytes> {
         let mut events = Vec::new();
         if matches!(self.current_block_type, Some(BlockType::ToolUse)) {
             let idx = self.next_block_index.saturating_sub(1);
@@ -345,7 +354,7 @@ impl AnthropicStreamConverter {
         events
     }
 
-    fn flush_thinking(&mut self) -> Vec<String> {
+    fn flush_thinking(&mut self) -> Vec<Bytes> {
         let mut events = Vec::new();
         if !self.think_buffer.is_empty() {
             events.push(serialize_stream_event(&StreamEvent::ContentBlockDelta {
@@ -370,7 +379,7 @@ impl AnthropicStreamConverter {
         events
     }
 
-    fn emit_tool_start(&mut self, delta: &crate::model::openai::ToolCallDelta) -> Vec<String> {
+    fn emit_tool_start(&mut self, delta: &crate::model::openai::ToolCallDelta) -> Vec<Bytes> {
         let mut events = Vec::new();
         if let Some(func) = &delta.function {
             self.discard_pending_text();
@@ -406,7 +415,7 @@ impl AnthropicStreamConverter {
         events
     }
 
-    fn emit_tool_delta(&mut self, delta: &crate::model::openai::ToolCallDelta) -> Vec<String> {
+    fn emit_tool_delta(&mut self, delta: &crate::model::openai::ToolCallDelta) -> Vec<Bytes> {
         let mut events = Vec::new();
         if let Some(func) = &delta.function {
             if let Some(args) = &func.arguments {
@@ -423,7 +432,7 @@ impl AnthropicStreamConverter {
         events
     }
 
-    pub fn emit_empty_text(&mut self) -> Vec<String> {
+    pub fn emit_empty_text(&mut self) -> Vec<Bytes> {
         let mut events = Vec::new();
         let idx = self.next_block_index;
         events.push(serialize_stream_event(&StreamEvent::ContentBlockStart {
@@ -449,7 +458,7 @@ impl AnthropicStreamConverter {
         (self.usage.input_tokens, self.usage.output_tokens)
     }
 
-    fn emit_text(&mut self, text: String) -> Vec<String> {
+    fn emit_text(&mut self, text: String) -> Vec<Bytes> {
         if self.has_tool_use {
             return Vec::new();
         }
@@ -460,17 +469,10 @@ impl AnthropicStreamConverter {
         }
 
         self.pending_text.push_str(&cleaned);
-
-        // 累积超过阈值时刷新（纯文本响应的安全刷新点）
-        const FLUSH_THRESHOLD: usize = 200;
-        if self.pending_text.len() >= FLUSH_THRESHOLD {
-            return self.flush_pending_text();
-        }
-
-        Vec::new()
+        return self.flush_pending_text();
     }
 
-    fn flush_pending_text(&mut self) -> Vec<String> {
+    fn flush_pending_text(&mut self) -> Vec<Bytes> {
         if self.pending_text.is_empty() {
             return Vec::new();
         }
@@ -711,14 +713,19 @@ impl AnthropicCollector {
 mod tests {
     use super::*;
 
+    fn join_bytes(events: Vec<Bytes>) -> String {
+        events.iter().map(|b| String::from_utf8_lossy(b).to_string()).collect::<Vec<_>>().join("\n")
+    }
+
     /// 模拟上游返回 tool_use 文本 → 验证 SSE 事件包含 tool_use 块
-    /// 流式转换器会缓冲短文本（<200 字符），通过 done 事件统一刷新。
+    /// 文本不再缓冲，立即透传输出。
     #[test]
     fn test_stream_converter_tool_use_detection() {
         let mut conv = AnthropicStreamConverter::new("test-model".into(), "msg_1".into());
 
-        // 发送普通文本（缓冲中，低于 FLUSH_THRESHOLD 时不立即输出事件）
-        conv.process_ouyi_event("Let me check that.", false);
+        // 发送普通文本（由于 flush_threshold=0，立即输出 content_block_start + text_delta）
+        let events = conv.process_ouyi_event("Let me check that.", false);
+        let _joined = join_bytes(events);
 
         // 发送 tool_use（触发前文刷新 + tool_use 块输出）
         let events = conv.process_ouyi_event(
@@ -727,9 +734,7 @@ mod tests {
 </tool_use>"#,
             false,
         );
-        let joined = events.join("\n");
-        // tool_use 触发时，之前缓冲的文本也会被刷新
-        assert!(joined.contains("content_block_start"), "应包含 content_block_start: {}", joined);
+        let joined = join_bytes(events);
         assert!(joined.contains("tool_use"), "应包含 tool_use 块: {}", joined);
         assert!(joined.contains("get_weather"), "应包含工具名: {}", joined);
         assert!(joined.contains("partial_json"), "应包含 input_json_delta: {}", joined);
@@ -740,7 +745,7 @@ mod tests {
 
         // 发送 done 事件
         let done_events = conv.process_ouyi_event("", true);
-        let done_joined = done_events.join("\n");
+        let done_joined = join_bytes(done_events);
         assert!(
             done_joined.contains(r#""stop_reason":"tool_use""#),
             "stop_reason 应为 tool_use: {}",
@@ -763,19 +768,24 @@ mod tests {
 
         // 后续文本应被忽略
         let events = conv.process_ouyi_event("This should be ignored", false);
-        let joined = events.join("\n");
+        let joined = join_bytes(events);
         assert!(!joined.contains("text_delta"), "tool_use 后的文本应被忽略: {}", joined);
     }
 
-    /// 验证纯文本响应正常结束
+    /// 验证纯文本响应正常结束（文本立即输出，不再缓冲到 done）
     #[test]
     fn test_stream_converter_text_response_done() {
         let mut conv = AnthropicStreamConverter::new("test-model".into(), "msg_1".into());
 
-        conv.process_ouyi_event("Hello world", false);
+        // 文本立即输出（flush_threshold=0）
+        let events = conv.process_ouyi_event("Hello world", false);
+        let joined = join_bytes(events);
+        assert!(joined.contains(r#""type":"content_block_start""#), "应立即输出 content_block_start: {}", joined);
+        assert!(joined.contains("text_delta"), "应立即输出 text_delta: {}", joined);
+        assert!(joined.contains("Hello world"), "应包含文本内容: {}", joined);
 
         let done_events = conv.process_ouyi_event("", true);
-        let done_joined = done_events.join("\n");
+        let done_joined = join_bytes(done_events);
         assert!(
             done_joined.contains(r#""stop_reason":"end_turn""#),
             "纯文本响应 stop_reason 应为 end_turn: {}",
@@ -806,24 +816,25 @@ mod tests {
         assert_eq!(conv.last_tool_use_id, Some("call_0".to_string()));
 
         let done = conv.process_ouyi_event("", true);
-        let done_str = done.join("\n");
+        let done_str = join_bytes(done);
         assert!(done_str.contains(r#""stop_reason":"tool_use""#));
 
         // === 轮次 2: tool_result 后的最终文本响应 ===
         let mut conv2 = AnthropicStreamConverter::new("test-model".into(), "msg_2".into());
 
-        // 发送足够长的文本以触发 FLUSH_THRESHOLD（200 字符）
-        let long_text = format!("The weather in Beijing is sunny, 25°C. {}", "x".repeat(200));
-        conv2.process_ouyi_event(&long_text, false);
+        // 文本立即输出
+        let long_text = format!("The weather in Beijing is sunny, 25°C. {}", "x".repeat(50));
+        let events = conv2.process_ouyi_event(&long_text, false);
+        let _joined = join_bytes(events);
 
         assert!(
             conv2.has_content,
-            "长文本应触发 flush，has_content 应为 true"
+            "文本应立即输出，has_content 应为 true"
         );
 
         // 发送 done 获得完整事件
         let done2 = conv2.process_ouyi_event("", true);
-        let done2_str = done2.join("\n");
+        let done2_str = join_bytes(done2);
         assert!(
             done2_str.contains(r#""stop_reason":"end_turn""#),
             "最终响应 stop_reason 应为 end_turn: {}",

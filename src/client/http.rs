@@ -41,6 +41,7 @@ impl OuyiHttpClient {
             .map_err(|e| AppError::Upstream(e.to_string()))?;
 
         let body = resp.text().await.map_err(|e| AppError::Upstream(e.to_string()))?;
+        tracing::debug!(body = %body, "fetch_tmpl 响应原文");
 
         serde_json::from_str::<TmplResponse>(&body)
             .map_err(|e| AppError::Upstream(format!("tmpl解析失败: {}", e)))

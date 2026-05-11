@@ -81,6 +81,7 @@ async fn main() -> Result<(), AppError> {
         Ok(tmpl_resp) => {
             model_mapper.load_from_tmpl(&tmpl_resp);
             tracing::info!("模型列表加载成功: {} 个模型", model_mapper.model_count());
+            tracing::debug!(models = ?tmpl_resp.data.as_ref().map(|d| d.models.len()), "tmpl 数据详情");
         }
         Err(e) => {
             tracing::warn!("模型列表加载失败: {}, 使用静态fallback", e);

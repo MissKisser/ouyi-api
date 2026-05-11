@@ -3,6 +3,7 @@ use std::sync::Arc;
 use axum::extract::State;
 use axum::response::IntoResponse;
 use axum::Json;
+use bytes::Bytes;
 use futures::stream::StreamExt;
 use serde::Serialize;
 use tokio_stream::wrappers::ReceiverStream;
@@ -154,8 +155,24 @@ pub async fn messages(
     State(state): State<Arc<AppState>>,
     Json(req): Json<MessagesRequest>,
 ) -> Result<axum::response::Response, AppError> {
+    tracing::info!(
+        model = %req.model,
+        messages_count = req.messages.len(),
+        stream = ?req.stream,
+        has_tools = req.tools.is_some(),
+        "Anthropic messages 请求"
+    );
+
     let model_full = state.model_mapper.to_ouyi(&req.model);
-    let should_thinking = state.model_mapper.should_thinking(&req.model);
+    tracing::info!(model = %req.model, full = %model_full, "模型映射结果");
+
+    let short_model = req.model.clone();
+    let should_thinking = state.model_mapper.should_thinking(&req.model)
+        || matches!(
+            req.thinking,
+            Some(crate::model::anthropic::ThinkingConfig::Enabled { .. })
+                | Some(crate::model::anthropic::ThinkingConfig::Adaptive)
+        );
 
     prune_stale_tool_sessions(&state);
 
@@ -278,12 +295,12 @@ pub async fn messages(
 
     if stream {
         handle_anthropic_stream(
-            resp, model_full, session_id, client, state.clone(), cache_key, start_time,
+            resp, short_model, model_full, session_id, client, state.clone(), cache_key, start_time,
         )
         .await
     } else {
         handle_anthropic_non_stream(
-            resp, model_full, session_id, client, state.clone(), cache_key, elapsed,
+            resp, short_model, session_id, client, state.clone(), cache_key, elapsed,
         )
         .await
     }
@@ -292,6 +309,7 @@ pub async fn messages(
 async fn handle_anthropic_stream(
     resp: reqwest::Response,
     model: String,
+    model_full: String,
     session_id: i64,
     client: OuyiHttpClient,
     state: Arc<AppState>,
@@ -309,11 +327,14 @@ async fn handle_anthropic_stream(
 
     let model_for_stats = model.clone();
     let model_for_task = model.clone();
+    let model_full_for_cache = model_full.clone();
     let task_id_for_task = task_id.clone();
 
     let state_for_stream = state.clone();
 
-    let (tx, rx) = tokio::sync::mpsc::channel::<String>(32);
+    let (tx, rx) = tokio::sync::mpsc::channel::<Bytes>(32);
+
+    tracing::info!(session_id, "启动 Anthropic 流式响应");
 
     tokio::spawn(async move {
         let mut converter = AnthropicStreamConverter::new(model_for_task, task_id_for_task);
@@ -322,15 +343,26 @@ async fn handle_anthropic_stream(
 
         futures::pin_mut!(guarded);
 
-        if tx.send(converter.start_event()).await.is_err() {
+        let start_evt = converter.start_event();
+        tracing::info!(event_len = start_evt.len(), "发送 message_start");
+        if tx.send(start_evt).await.is_err() {
+            tracing::warn!("发送 message_start 失败，channel 已关闭");
             return;
         }
 
+        let mut chunk_count = 0u64;
         while let Some(chunk_result) = guarded.next().await {
             let chunk = match chunk_result {
                 Ok(bytes) => bytes,
-                Err(_) => break,
+                Err(_) => {
+                    tracing::warn!("上游字节流读取错误");
+                    break;
+                }
             };
+
+            if chunk_count % 10 == 0 {
+                tracing::debug!(chunk_count, chunk_len = chunk.len(), "读取上游数据块");
+            }
 
             let mut bytes = chunk.to_vec();
             if !partial.is_empty() {
@@ -354,6 +386,12 @@ async fn handle_anthropic_stream(
                     let content = event.data.as_ref().and_then(|d| d.as_str()).unwrap_or("");
                     let is_done = event_type == crate::client::sse::OuyiEventType::Done;
 
+                    if event_type == crate::client::sse::OuyiEventType::StringChunk {
+                        tracing::info!(content_len = content.len(), content_preview = %content.chars().take(200).collect::<String>(), "上游 string 事件");
+                    } else {
+                        tracing::info!(event_type = event.event_type, is_done, content_len = content.len(), "上游事件");
+                    }
+
                     if event_type == crate::client::sse::OuyiEventType::Object {
                         if let Some(data) = &event.data {
                             if let Ok(usage) =
@@ -369,18 +407,28 @@ async fn handle_anthropic_stream(
                         }
                     }
 
-                    for evt_str in converter.process_ouyi_event(content, is_done) {
-                        if tx.send(evt_str).await.is_err() {
+                    for evt in converter.process_ouyi_event(content, is_done) {
+                        let evt_str = String::from_utf8_lossy(&evt);
+                        let preview: String = evt_str.chars().take(120).collect();
+                        tracing::debug!(preview = %preview, "发送 Anthropic SSE 事件");
+                        if tx.send(evt).await.is_err() {
+                            tracing::warn!("发送 SSE 事件失败，channel 已关闭");
                             return;
                         }
                     }
                 }
             }
+            chunk_count += 1;
         }
 
-        for evt_str in converter.process_ouyi_event("", true) {
-            let _ = tx.send(evt_str).await;
+        if !converter.done_processed {
+            tracing::info!("上游流结束，发送 done 事件");
+            for evt in converter.process_ouyi_event("", true) {
+                let _ = tx.send(evt).await;
+            }
         }
+
+        tracing::info!(chunk_count, has_tool_use = converter.has_tool_use, "流式处理完成");
 
         // 根据 has_tool_use 决定缓存或清理会话
         let has_tool_use = converter.has_tool_use;
@@ -401,7 +449,7 @@ async fn handle_anthropic_stream(
             // 缓存会话 ID 供下一轮 tool_result 复用
             let last_tool_id = converter.last_tool_use_id.clone();
             if let Some(tool_id) = last_tool_id {
-                let key = session_cache_key(&model, &tool_id);
+                let key = session_cache_key(&model_full_for_cache, &tool_id);
                 state_for_stream.tool_sessions.insert(key, crate::CachedToolSession {
                     session_id,
                     model: model.clone(),
@@ -421,9 +469,15 @@ async fn handle_anthropic_stream(
     // 流式模式：立即返回响应，不在此处删除会话
     // 会话的清理/缓存在 spawn 的 task 中根据 has_tool_use 决定
 
-    let stream = ReceiverStream::new(rx).map(|s| Ok::<_, std::convert::Infallible>(s));
-    let body = axum::body::Body::from_stream(stream);
+    // 确保 hs 日志能在调试时被看到
+    tracing::info!(session_id, "Anthropic SSE 流构建完成，返回响应");
+
+    let stream = ReceiverStream::new(rx);
+    let body = axum::body::Body::from_stream(stream.map(|b| {
+        Ok::<_, std::io::Error>(b)
+    }));
     let response = axum::response::Response::builder()
+        .status(200)
         .header("content-type", "text/event-stream")
         .header("cache-control", "no-cache")
         .header("connection", "keep-alive")

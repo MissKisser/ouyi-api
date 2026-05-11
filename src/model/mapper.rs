@@ -57,11 +57,21 @@ impl ModelMapper {
     pub fn load_from_tmpl(&self, resp: &TmplResponse) {
         let data = match &resp.data {
             Some(d) => d,
-            None => return,
+            None => {
+                tracing::warn!("模型列表响应 data 为空，使用静态fallback");
+                self.load_fallback();
+                return;
+            }
         };
         let mut new_short_to_full: Vec<(String, ModelEntry)> = Vec::new();
         let mut new_full_to_short: Vec<(String, String)> = Vec::new();
         let mut new_all_models: Vec<(String, TmplModel)> = Vec::new();
+
+        if data.models.is_empty() {
+            tracing::warn!("模型列表响应 models 为空，使用静态fallback");
+            self.load_fallback();
+            return;
+        }
 
         for model in &data.models {
             let full_value = model.value.clone();
