@@ -1,26 +1,104 @@
 use crate::model::openai::ChatCompletionRequest;
 
-const TOOL_PROMPT_TEMPLATE: &str = r#"
+const TOOL_CALL_FORMAT: &str = concat!(
+    "## 工具调用（必须严格遵守）\n\n",
+    "当用户的任务需要使用工具才能完成时，你必须调用工具。禁止猜测你不知道的信息、直接回答需要实时数据的问题、或假装已有答案。\n\n",
+    "### 格式\n",
+    "```text\n",
+    "<|tool▁calls▁begin|>\n",
+    "[{\"name\": \"工具名\", \"arguments\": {\"参数名\": \"值\"}}]\n",
+    "<|tool▁calls▁end|>\n",
+    "```\n\n",
+    "单个工具用单个 JSON 对象，多个工具用 JSON 数组。\n\n",
+    "### 规则\n",
+    "1. 标记之间只能包含 JSON 对象或 JSON 数组\n",
+    "2. 单次回复只能有一个标记块，多工具以数组形式放在同一块内\n",
+    "3. 标记之前你可以先思考要调用哪个工具以及参数（<think>...</think>），然后直接输出工具调用标记\n",
+    "4. 不能包裹在 markdown 代码块（```json 等）中——标记内的 JSON 必须裸写\n",
+    "5. JSON 必须包含 \"name\"（字符串）和 \"arguments\"（JSON 对象）字段\n",
+    "6. arguments 键名必须用双引号，值必须是合法 JSON 类型\n",
+    "7. 不允许注释或尾部逗号\n",
+    "8. 工具调用之后不要附带任何解释文字\n",
+    "9. 如果你确信不需要调用工具即可完整回答，正常回复即可（但涉及文件系统、网络、外部命令时必须调用工具）\n",
+    "10. 永远不要编造 <tool_result> 标签——工具结果由系统自动注入\n",
+    "11. arguments 的值必须是纯文本，禁止 markdown/LaTeX\n",
+);
 
-You have access to the following tools. To use a tool, wrap your tool call in <tool_use> tags as shown below:
-
-<tool_use>
-{"name": "tool_name", "arguments": {"param1": "value1"}}
-</tool_use>
-
-Rules:
-1. You may make multiple tool calls by using multiple <tool_use> blocks.
-2. Each <tool_use> block must contain valid JSON with "name" and "arguments" fields.
-3. The "arguments" must be a JSON object matching the tool's parameter schema.
-4. Do NOT wrap tool calls in code blocks or any other formatting.
-5. If you do not need to use any tools, respond normally without <tool_use> blocks.
-6. You can mix regular text with tool calls in your response.
-"#;
+const TOOL_CALL_REMINDER: &str = concat!(
+    "\n\n【工具调用提醒】如果你无法仅凭已有知识完成当前任务，请思考需要调用哪个工具，然后直接输出工具调用标记。不要犹豫，直接行动。",
+);
 
 pub struct OuyiRequest {
     pub system_prompt: Option<String>,
     pub text: String,
     pub thinking: bool,
+}
+
+fn build_tool_instruction_text(req: &ChatCompletionRequest) -> String {
+    let tools = match &req.tools {
+        Some(t) => t,
+        None => return String::new(),
+    };
+
+    if tools.is_empty() {
+        return String::new();
+    }
+
+    let defs = tools
+        .iter()
+        .map(|t| {
+            let desc = t
+                .function
+                .description
+                .as_deref()
+                .unwrap_or("No description");
+            let params = t
+                .function
+                .parameters
+                .as_ref()
+                .map(|p| {
+                    let props = p
+                        .get("properties")
+                        .and_then(|v| v.as_object())
+                        .map(|obj| {
+                            obj.iter()
+                                .map(|(k, v)| {
+                                    let desc = v
+                                        .get("description")
+                                        .and_then(|d| d.as_str())
+                                        .unwrap_or("");
+                                    format!("      - **{}**: {}", k, desc)
+                                })
+                                .collect::<Vec<_>>()
+                                .join(",\n")
+                        })
+                        .unwrap_or_default();
+                    let required: Vec<&str> = p
+                        .get("required")
+                        .and_then(|r| r.as_array())
+                        .map(|a| a.iter().filter_map(|v| v.as_str()).collect())
+                        .unwrap_or_default();
+                    let required_str = if required.is_empty() {
+                        String::new()
+                    } else {
+                        format!(" (必填: {})", required.join(", "))
+                    };
+                    format!("参数:{{{} }}{}", props, required_str)
+                })
+                .unwrap_or_else(|| "参数: {}".to_string());
+
+            format!(
+                "- **{}** (function)\n  - 说明: {}\n  - {}",
+                t.function.name, desc, params
+            )
+        })
+        .collect::<Vec<_>>()
+        .join("\n\n");
+
+    format!(
+        "{}\n\n### 可用工具\n\n{}\n{}",
+        TOOL_CALL_FORMAT, defs, TOOL_CALL_REMINDER
+    )
 }
 
 pub fn convert_request(
@@ -56,17 +134,21 @@ pub fn convert_request(
             }
             "assistant" => {
                 if let Some(tool_calls) = &msg.tool_calls {
-                    for tc in tool_calls {
-                        let args: serde_json::Value = serde_json::from_str(&tc.function.arguments)
-                            .unwrap_or(serde_json::Value::Object(serde_json::Map::new()));
-                        text_parts.push(format!(
-                            "[Assistant]: <tool_use>\n{}\n</tool_use>",
+                    let calls: Vec<serde_json::Value> = tool_calls
+                        .iter()
+                        .map(|tc| {
+                            let args: serde_json::Value = serde_json::from_str(&tc.function.arguments)
+                                .unwrap_or(serde_json::Value::Object(serde_json::Map::new()));
                             serde_json::json!({
                                 "name": tc.function.name,
                                 "arguments": args,
                             })
-                        ));
-                    }
+                        })
+                        .collect();
+                    text_parts.push(format!(
+                        "[Assistant]: <|tool\u{2581}calls\u{2581}begin|>\n{}\n<|tool\u{2581}calls\u{2581}end|>",
+                        serde_json::to_string(&calls).unwrap_or_default()
+                    ));
                     if !content.is_empty() {
                         text_parts.push(format!("[Assistant]: {}", content));
                     }
@@ -89,11 +171,10 @@ pub fn convert_request(
 
     let has_tools = openai_req.tools.is_some();
     if has_tools {
-        let tool_descriptions = build_tool_descriptions(openai_req);
-        system_parts.push(format!(
-            "{}\n\nAvailable tools:\n{}",
-            TOOL_PROMPT_TEMPLATE, tool_descriptions
-        ));
+        let tool_text = build_tool_instruction_text(openai_req);
+        if !tool_text.is_empty() {
+            system_parts.push(tool_text);
+        }
     }
 
     let system_prompt = if system_parts.is_empty() {
@@ -102,7 +183,12 @@ pub fn convert_request(
         Some(system_parts.join("\n\n"))
     };
 
-    let text = text_parts.join("\n\n");
+    let mut text = text_parts.join("\n\n");
+
+    if has_tools {
+        text.push_str("\n\n<think>\n现在请判断是否需要调用工具。如需调用，请输出：\n\n<|tool\u{2581}calls\u{2581}begin|>\n[{\"name\": \"工具名\", \"arguments\": {\"参数名\": \"值\"}}]\n<|tool\u{2581}calls\u{2581}end|>\n\n请立即决定：需要调用工具吗？需要则直接输出上述标记，不需要则正常回复。");
+    }
+
     let thinking = should_thinking || model_full.contains("-thinking");
 
     Ok(OuyiRequest {
@@ -110,35 +196,6 @@ pub fn convert_request(
         text,
         thinking,
     })
-}
-
-fn build_tool_descriptions(req: &ChatCompletionRequest) -> String {
-    let tools = match &req.tools {
-        Some(t) => t,
-        None => return String::new(),
-    };
-
-    tools
-        .iter()
-        .map(|t| {
-            let desc = t
-                .function
-                .description
-                .as_deref()
-                .unwrap_or("No description");
-            let params = t
-                .function
-                .parameters
-                .as_ref()
-                .map(|p| serde_json::to_string(p).unwrap_or_else(|_| "{}".to_string()))
-                .unwrap_or_else(|| "{}".to_string());
-            format!(
-                "- {}: {}\n  Parameters: {}",
-                t.function.name, desc, params
-            )
-        })
-        .collect::<Vec<_>>()
-        .join("\n")
 }
 
 #[cfg(test)]
@@ -270,7 +327,7 @@ mod tests {
         };
         let result = convert_request(&req, "test", false).unwrap();
         let sys = result.system_prompt.unwrap();
-        assert!(sys.contains("<tool_use>"));
+        assert!(sys.contains("tool\u{2581}calls\u{2581}begin"));
         assert!(sys.contains("read_file"));
     }
 

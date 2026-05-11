@@ -1,7 +1,12 @@
 use crate::model::openai::{ToolCall, ToolCallFunction, ToolCallDelta, ToolCallFunctionDelta};
 
+const TOOL_CALL_START: &str = "<|tool\u{2581}calls\u{2581}begin|>";
+const TOOL_CALL_END: &str = "<|tool\u{2581}calls\u{2581}end|>";
 const TOOL_USE_OPEN: &str = "<tool_use>";
 const TOOL_USE_CLOSE: &str = "</tool_use>";
+
+const KNOWN_START_TAGS: &[&str] = &[TOOL_CALL_START, TOOL_USE_OPEN];
+const KNOWN_END_TAGS: &[&str] = &[TOOL_CALL_END, TOOL_USE_CLOSE];
 
 fn eq_tag_char(a: char, b: char) -> bool {
     a == b || norm_tag_char(a) == norm_tag_char(b)
@@ -20,7 +25,7 @@ fn norm_tag_char(c: char) -> char {
 fn fuzzy_match_tag(haystack: &str, needle: &str) -> bool {
     let h_chars: Vec<char> = haystack.chars().collect();
     let n_chars: Vec<char> = needle.chars().collect();
-    if h_chars.len() > n_chars.len() {
+    if h_chars.len() != n_chars.len() {
         return false;
     }
     for (i, hc) in h_chars.iter().enumerate() {
@@ -28,7 +33,7 @@ fn fuzzy_match_tag(haystack: &str, needle: &str) -> bool {
             return false;
         }
     }
-    h_chars.len() == n_chars.len()
+    true
 }
 
 fn fuzzy_prefix_match(haystack: &str, needle: &str) -> bool {
@@ -43,6 +48,22 @@ fn fuzzy_prefix_match(haystack: &str, needle: &str) -> bool {
         }
     }
     true
+}
+
+fn matches_any_start_tag(buf: &str) -> bool {
+    KNOWN_START_TAGS.iter().any(|tag| fuzzy_match_tag(buf, tag))
+}
+
+fn could_match_any_start_tag(buf: &str) -> bool {
+    KNOWN_START_TAGS.iter().any(|tag| fuzzy_prefix_match(buf, tag))
+}
+
+fn matches_any_end_tag(buf: &str) -> bool {
+    KNOWN_END_TAGS.iter().any(|tag| fuzzy_match_tag(buf, tag))
+}
+
+fn could_match_any_end_tag(buf: &str) -> bool {
+    KNOWN_END_TAGS.iter().any(|tag| fuzzy_prefix_match(buf, tag))
 }
 
 fn is_tag_start_char(ch: char) -> bool {
@@ -189,11 +210,11 @@ impl ToolCallParser {
                 ParseState::TagDetect => {
                     self.tag_buf.push(ch);
                     let tag = &self.tag_buf;
-                    if fuzzy_match_tag(tag, TOOL_USE_OPEN) {
+                    if matches_any_start_tag(tag) {
                         self.json_buf.clear();
                         self.in_tool = true;
                         self.state = ParseState::InToolJson;
-                    } else if is_tag_end_char(ch) || !could_match_tag_fuzzy(tag) {
+                    } else if is_tag_end_char(ch) || !could_match_any_start_tag(tag) {
                         normal_text.push_str(tag);
                         self.state = ParseState::Normal;
                     }
@@ -209,14 +230,16 @@ impl ToolCallParser {
                 }
                 ParseState::CloseTagDetect => {
                     self.tag_buf.push(ch);
-                    if fuzzy_match_tag(&self.tag_buf, TOOL_USE_CLOSE) {
+                    if matches_any_end_tag(&self.tag_buf) {
                         let json_content = std::mem::take(&mut self.json_buf);
-                        if let Some(delta) = self.parse_tool_json_repair(&json_content) {
-                            tool_deltas.push(delta);
+                        let new_deltas = self.parse_tool_calls_from_text(&json_content);
+                        if new_deltas.is_empty() {
+                            self.in_tool = false;
+                        } else {
+                            tool_deltas.extend(new_deltas);
                         }
-                        self.in_tool = false;
                         self.state = ParseState::Normal;
-                    } else if is_tag_end_char(ch) || !could_match_close_tag_fuzzy(&self.tag_buf) {
+                    } else if is_tag_end_char(ch) || !could_match_any_end_tag(&self.tag_buf) {
                         self.json_buf.push_str(&self.tag_buf);
                         self.state = ParseState::InToolJson;
                     }
@@ -230,53 +253,206 @@ impl ToolCallParser {
         }
     }
 
-    fn parse_tool_json_repair(&mut self, raw: &str) -> Option<ToolCallDelta> {
+    /// 解析工具调用内容，支持三种格式：
+    /// 1. 单对象: {"name": "...", "arguments": {...}}
+    /// 2. 数组: [{"name": "...", "arguments": {...}}, ...]
+    /// 3. <invoke name="..."> 标签格式
+    fn parse_tool_calls_from_text(&mut self, raw: &str) -> Vec<ToolCallDelta> {
         let trimmed = raw.trim();
-
-        // Layer 1: 直接 JSON 解析
-        if let Ok(parsed) = serde_json::from_str::<serde_json::Value>(trimmed)
-            && let Some(tc) = self.json_to_tool_call_delta(&parsed)
-        {
-            return Some(tc);
+        if trimmed.is_empty() {
+            return Vec::new();
         }
 
-        // Layer 2: 文本修复（剥离代码块 → 尝试解析）
-        let cleaned = strip_code_fences(trimmed);
-        if cleaned != trimmed {
-            if let Ok(parsed) = serde_json::from_str::<serde_json::Value>(&cleaned)
-                && let Some(tc) = self.json_to_tool_call_delta(&parsed)
-            {
-                return Some(tc);
+        let mut results = Vec::new();
+
+        // 尝试数组格式 [...]
+        if let Some(arr_start) = trimmed.find('[') {
+            let after_start = &trimmed[arr_start..];
+            if let Some(arr_end) = after_start.rfind(']') {
+                let json_str = &after_start[..=arr_end];
+                results = self.parse_tool_call_array(json_str);
             }
         }
 
-        // Layer 3: JSON 修复（反斜杠修复 → 无引号 key 修复）
-        if let Some(repaired) = repair_json(&cleaned) {
-            if let Ok(parsed) = serde_json::from_str::<serde_json::Value>(&repaired)
-                && let Some(tc) = self.json_to_tool_call_delta(&parsed)
-            {
-                return Some(tc);
-            }
-        }
-        if let Some(repaired) = repair_json(trimmed) {
-            if let Ok(parsed) = serde_json::from_str::<serde_json::Value>(&repaired)
-                && let Some(tc) = self.json_to_tool_call_delta(&parsed)
-            {
-                return Some(tc);
-            }
+        // 如果数组解析成功
+        if !results.is_empty() {
+            return results;
         }
 
-        // Layer 4: 字段提取（兼容格式不完整的 JSON）
-        if let Some(tc) = self.extract_tool_call(&cleaned) {
-            return Some(tc);
+        // 尝试单对象格式
+        let obj_str = if let Some(obj_start) = trimmed.find('{') {
+            if let Some(obj_end) = trimmed[obj_start..].rfind('}') {
+                let end = obj_start + obj_end + 1;
+                &trimmed[obj_start..end]
+            } else {
+                trimmed
+            }
+        } else {
+            trimmed
+        };
+
+        if let Some(delta) = self.parse_single_tool_call(obj_str) {
+            return vec![delta];
         }
-        if let Some(tc) = self.extract_tool_call(trimmed) {
-            return Some(tc);
+        if let Some(delta) = self.parse_single_tool_call(trimmed) {
+            return vec![delta];
+        }
+
+        // 尝试 <invoke> 标签格式
+        if let Some(deltas) = self.parse_invoke_calls(trimmed) {
+            if !deltas.is_empty() {
+                return deltas;
+            }
         }
 
         self.in_tool = false;
-        tracing::warn!(raw_len = trimmed.len(), "tool call 四层解析全部失败，降级为普通文本");
+        tracing::warn!(raw_len = trimmed.len(), "工具调用解析失败，降级为普通文本");
+        Vec::new()
+    }
+
+    /// 三层自修复解析单对象
+    fn parse_single_tool_call(&mut self, raw: &str) -> Option<ToolCallDelta> {
+        let trimmed = raw.trim();
+        if trimmed.is_empty() {
+            return None;
+        }
+
+        let candidates = [
+            (trimmed, "raw"),
+            (&strip_code_fences(trimmed), "code_fence_stripped"),
+        ];
+
+        for (text, _label) in &candidates {
+            if text.is_empty() {
+                continue;
+            }
+
+            // L1: 直接 JSON 解析
+            if let Ok(parsed) = serde_json::from_str::<serde_json::Value>(text) {
+                if let Some(tc) = self.json_to_tool_call_delta(&parsed) {
+                    return Some(tc);
+                }
+            }
+
+            // L2: JSON 修复管道
+            if let Some(repaired) = repair_json(text) {
+                if let Ok(parsed) = serde_json::from_str::<serde_json::Value>(&repaired) {
+                    if let Some(tc) = self.json_to_tool_call_delta(&parsed) {
+                        return Some(tc);
+                    }
+                }
+            }
+
+            // L3: 字符串字段提取（最后的兜底方案）
+            if let Some(tc) = self.extract_tool_call(text) {
+                return Some(tc);
+            }
+        }
+
         None
+    }
+
+    /// 解析 JSON 数组格式的工具调用列表
+    fn parse_tool_call_array(&mut self, json_str: &str) -> Vec<ToolCallDelta> {
+        let mut results = Vec::new();
+
+        // L1: 直接解析数组
+        if let Ok(arr) = serde_json::from_str::<Vec<serde_json::Value>>(json_str) {
+            for item in arr {
+                if let Some(tc) = self.json_to_tool_call_delta(&item) {
+                    results.push(tc);
+                }
+            }
+            if !results.is_empty() {
+                return results;
+            }
+        }
+
+        // L2: 修复后解析数组
+        if let Some(repaired) = repair_json(json_str) {
+            if let Ok(arr) = serde_json::from_str::<Vec<serde_json::Value>>(&repaired) {
+                for item in arr {
+                    if let Some(tc) = self.json_to_tool_call_delta(&item) {
+                        results.push(tc);
+                    }
+                }
+                if !results.is_empty() {
+                    return results;
+                }
+            }
+        }
+
+        // L3: 提取单个对象作为回退
+        let obj_str = json_str.trim_start_matches('[');
+        if let Some(obj_start) = obj_str.find('{') {
+            if let Some(obj_end) = obj_str.rfind('}') {
+                let single_obj = &obj_str[obj_start..=obj_end];
+                if let Some(tc) = self.parse_single_tool_call(single_obj) {
+                    results.push(tc);
+                }
+            }
+        }
+
+        results
+    }
+
+    /// 解析 <invoke> 标签格式: <invoke name="X"><parameter name="Y">V</parameter></invoke>
+    fn parse_invoke_calls(&mut self, raw: &str) -> Option<Vec<ToolCallDelta>> {
+        let mut results = Vec::new();
+        let mut remaining = raw;
+        let mut found = false;
+
+        while let Some(invoke_start) = remaining.find("<invoke") {
+            remaining = &remaining[invoke_start..];
+            if let Some(tag_end) = remaining.find('>') {
+                let invoke_end = remaining.find("</invoke>")?;
+                let invoke_content = &remaining[..invoke_end + "</invoke>".len()];
+
+                let name = extract_xml_attr(invoke_content, "name")?;
+                let mut args = serde_json::Map::new();
+
+                let inner = &remaining[tag_end + 1..invoke_end];
+                let mut param_remaining = inner;
+                while let Some(param_start) = param_remaining.find("<parameter") {
+                    param_remaining = &param_remaining[param_start..];
+                    let param_name = extract_xml_attr(param_remaining, "name").unwrap_or_default();
+                    if let Some(param_content_start) = param_remaining.find('>') {
+                        if let Some(param_end) = param_remaining.find("</parameter>") {
+                            let value = param_remaining[param_content_start + 1..param_end]
+                                .trim()
+                                .to_string();
+                            args.insert(param_name, serde_json::Value::String(value));
+                            param_remaining = &param_remaining[param_end + "</parameter>".len()..];
+                            continue;
+                        }
+                    }
+                    break;
+                }
+
+                let idx = self.tool_call_index;
+                self.tool_call_index += 1;
+                results.push(ToolCallDelta {
+                    index: idx,
+                    id: Some(format!("call_{}", idx)),
+                    call_type: Some("function".to_string()),
+                    function: Some(ToolCallFunctionDelta {
+                        name: Some(name),
+                        arguments: Some(serde_json::to_string(&args).unwrap_or_default()),
+                    }),
+                });
+
+                found = true;
+                remaining = &remaining[invoke_content.len()..];
+            } else {
+                break;
+            }
+        }
+
+        if found {
+            Some(results)
+        } else {
+            None
+        }
     }
 
     fn json_to_tool_call_delta(&mut self, v: &serde_json::Value) -> Option<ToolCallDelta> {
@@ -324,12 +500,20 @@ impl ToolCallParser {
     }
 }
 
-fn could_match_tag_fuzzy(buf: &str) -> bool {
-    fuzzy_prefix_match(buf, TOOL_USE_OPEN)
-}
-
-fn could_match_close_tag_fuzzy(buf: &str) -> bool {
-    fuzzy_prefix_match(buf, TOOL_USE_CLOSE)
+fn extract_xml_attr(tag: &str, attr_name: &str) -> Option<String> {
+    let pattern = format!("{}=", attr_name);
+    let pos = tag.find(&pattern)?;
+    let after = &tag[pos + pattern.len()..];
+    let trimmed = after.trim_start();
+    if let Some(rest) = trimmed.strip_prefix('"') {
+        let end = rest.find('"')?;
+        Some(rest[..end].to_string())
+    } else if let Some(rest) = trimmed.strip_prefix('\'') {
+        let end = rest.find('\'')?;
+        Some(rest[..end].to_string())
+    } else {
+        None
+    }
 }
 
 fn extract_json_string_field(raw: &str, field: &str) -> Option<String> {
@@ -403,7 +587,7 @@ mod tests {
     }
 
     #[test]
-    fn test_tool_call_parsing() {
+    fn test_tool_use_tag_parsing() {
         let mut parser = ToolCallParser::new();
         let input = r#"Some text <tool_use>
 {"name": "read_file", "arguments": {"path": "/tmp/test"}}
@@ -419,7 +603,46 @@ mod tests {
     }
 
     #[test]
-    fn test_multiple_tool_calls() {
+    fn test_tool_call_tag_parsing() {
+        let mut parser = ToolCallParser::new();
+        let input = concat!(
+            "Some text <|tool\u{2581}calls\u{2581}begin|>\n",
+            r#"{"name": "read_file", "arguments": {"path": "/tmp/test"}}"#,
+            "\n<|tool\u{2581}calls\u{2581}end|> more text"
+        );
+        let out = parser.process_chunk(input);
+        assert!(!out.normal_text.contains("tool"));
+        assert_eq!(out.tool_deltas.len(), 1);
+        assert_eq!(
+            out.tool_deltas[0].function.as_ref().unwrap().name.as_deref(),
+            Some("read_file")
+        );
+    }
+
+    #[test]
+    fn test_tool_call_array_parsing() {
+        let mut parser = ToolCallParser::new();
+        let input = concat!(
+            "<|tool\u{2581}calls\u{2581}begin|>\n",
+            r#"[{"name": "tool1", "arguments": {"a": 1}}, {"name": "tool2", "arguments": {"b": 2}}]"#,
+            "\n<|tool\u{2581}calls\u{2581}end|>"
+        );
+        let out = parser.process_chunk(input);
+        assert_eq!(out.tool_deltas.len(), 2);
+        assert_eq!(out.tool_deltas[0].index, 0);
+        assert_eq!(out.tool_deltas[1].index, 1);
+        assert_eq!(
+            out.tool_deltas[0].function.as_ref().unwrap().name.as_deref(),
+            Some("tool1")
+        );
+        assert_eq!(
+            out.tool_deltas[1].function.as_ref().unwrap().name.as_deref(),
+            Some("tool2")
+        );
+    }
+
+    #[test]
+    fn test_multiple_tool_use_calls() {
         let mut parser = ToolCallParser::new();
         let input = r#"<tool_use>
 {"name": "tool1", "arguments": {}}
@@ -442,7 +665,7 @@ mod tests {
     }
 
     #[test]
-    fn test_malformed_json_layer2() {
+    fn test_malformed_json_repair() {
         let mut parser = ToolCallParser::new();
         let input = r#"<tool_use>
 {"name": "broken_tool", "arguments": {invalid json}}
@@ -529,8 +752,8 @@ mod tests {
         assert!(fuzzy_match_tag("<tool_use>", "<tool_use>"));
         assert!(fuzzy_match_tag("\u{ff1c}tool_use\u{ff1e}", "<tool_use>"));
         assert!(!fuzzy_match_tag("<div>", "<tool_use>"));
-        assert!(!fuzzy_match_tag("<tool_", "<tool_use>"));  // 部分匹配返回 false
-        assert!(fuzzy_prefix_match("<tool_", "<tool_use>"));  // 前缀匹配返回 true
+        assert!(!fuzzy_match_tag("<tool_", "<tool_use>"));
+        assert!(fuzzy_prefix_match("<tool_", "<tool_use>"));
         assert!(!fuzzy_prefix_match("<div", "<tool_use>"));
     }
 
@@ -543,5 +766,24 @@ mod tests {
         let input2 = "```xml\n<tool_use>\n{...}\n</tool_use>\n```";
         let cleaned2 = strip_code_fences(input2);
         assert!(!cleaned2.contains("```"));
+    }
+
+    #[test]
+    fn test_invoke_tag_parsing() {
+        let mut parser = ToolCallParser::new();
+        let input = r#"<tool_use>
+<invoke name="bash"><parameter name="command">ls -la</parameter></invoke>
+<invoke name="read"><parameter name="path">/tmp/test</parameter></invoke>
+</tool_use>"#;
+        let out = parser.process_chunk(input);
+        assert_eq!(out.tool_deltas.len(), 2);
+        assert_eq!(
+            out.tool_deltas[0].function.as_ref().unwrap().name.as_deref(),
+            Some("bash")
+        );
+        assert_eq!(
+            out.tool_deltas[1].function.as_ref().unwrap().name.as_deref(),
+            Some("read")
+        );
     }
 }
