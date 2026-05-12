@@ -1,4 +1,9 @@
+use crate::adapter::tool_call::ToolCallParser;
 use crate::model::anthropic::AnthropicTool;
+
+fn broker_id() -> String {
+    format!("call_broker_{}", uuid::Uuid::new_v4().simple())
+}
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum BrokerDecision {
@@ -15,6 +20,82 @@ pub struct BrokerToolCall {
 
 pub fn find_tool<'a>(tools: &'a [AnthropicTool], name: &str) -> Option<&'a AnthropicTool> {
     tools.iter().find(|tool| tool.name == name)
+}
+
+pub fn parse_marked_tool_calls(
+    ouyi_output: &str,
+    tools: &[AnthropicTool],
+) -> Result<Vec<BrokerToolCall>, String> {
+    let mut parser = ToolCallParser::new();
+    let parsed = parser.process_chunk(ouyi_output);
+    let mut calls = Vec::new();
+
+    for delta in parsed.tool_deltas {
+        let func = delta
+            .function
+            .ok_or_else(|| "工具调用缺少 function".to_string())?;
+        let name = func
+            .name
+            .filter(|name| !name.is_empty())
+            .ok_or_else(|| "工具调用缺少 name".to_string())?;
+        if find_tool(tools, &name).is_none() {
+            return Err(format!("未知工具: {}", name));
+        }
+        let arguments = func
+            .arguments
+            .unwrap_or_else(|| "{}".to_string());
+        let input: serde_json::Value = serde_json::from_str(&arguments)
+            .map_err(|e| format!("工具参数不是合法 JSON: {}", e))?;
+        calls.push(BrokerToolCall {
+            id: broker_id(),
+            name,
+            input,
+        });
+    }
+
+    Ok(calls)
+}
+
+pub fn parse_rule_tool_intent(
+    ouyi_output: &str,
+    tools: &[AnthropicTool],
+) -> Result<Vec<BrokerToolCall>, String> {
+    let text = ouyi_output.trim();
+
+    if find_tool(tools, "Bash").is_some() {
+        for marker in ["执行命令：", "执行命令:", "Bash 执行命令：", "Bash 执行命令:"] {
+            if let Some((_, command)) = text.rsplit_once(marker) {
+                let command = command.trim().trim_matches('`').trim();
+                if !command.is_empty() {
+                    return Ok(vec![BrokerToolCall {
+                        id: broker_id(),
+                        name: "Bash".to_string(),
+                        input: serde_json::json!({
+                            "command": command,
+                            "description": "执行欧亿主模型请求的命令"
+                        }),
+                    }]);
+                }
+            }
+        }
+    }
+
+    if find_tool(tools, "Read").is_some() {
+        for marker in ["读取文件 ", "读取文件：", "读取文件:", "Read 文件 "] {
+            if let Some((_, path)) = text.rsplit_once(marker) {
+                let path = path.trim().trim_matches('`').trim();
+                if !path.is_empty() && !path.contains('\n') {
+                    return Ok(vec![BrokerToolCall {
+                        id: broker_id(),
+                        name: "Read".to_string(),
+                        input: serde_json::json!({ "file_path": path }),
+                    }]);
+                }
+            }
+        }
+    }
+
+    Ok(Vec::new())
 }
 
 #[cfg(test)]
@@ -42,5 +123,64 @@ mod tests {
         let found = find_tool(&tools, "Bash").unwrap();
         assert_eq!(found.name, "Bash");
         assert!(find_tool(&tools, "bash").is_none());
+    }
+
+    #[test]
+    fn test_parse_marked_ouyi_tool_call() {
+        let tools = vec![bash_tool()];
+        let output = concat!(
+            "<|tool▁calls▁begin|>",
+            "[{\"name\":\"Bash\",\"arguments\":{\"command\":\"pwd\",\"description\":\"print cwd\"}}]",
+            "<|tool▁calls▁end|>"
+        );
+
+        let calls = parse_marked_tool_calls(output, &tools).unwrap();
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].name, "Bash");
+        assert_eq!(calls[0].input["command"], "pwd");
+        assert!(calls[0].id.starts_with("call_broker_"));
+    }
+
+    #[test]
+    fn test_parse_marked_tool_call_rejects_unknown_tool() {
+        let tools = vec![bash_tool()];
+        let output = concat!(
+            "<|tool▁calls▁begin|>",
+            "[{\"name\":\"Nope\",\"arguments\":{\"command\":\"pwd\"}}]",
+            "<|tool▁calls▁end|>"
+        );
+
+        let err = parse_marked_tool_calls(output, &tools).unwrap_err();
+        assert!(err.contains("未知工具"));
+    }
+
+    #[test]
+    fn test_rule_parse_bash_intent() {
+        let tools = vec![bash_tool()];
+        let output = "需要使用 Bash 执行命令：pwd";
+
+        let calls = parse_rule_tool_intent(output, &tools).unwrap();
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].name, "Bash");
+        assert_eq!(calls[0].input["command"], "pwd");
+    }
+
+    #[test]
+    fn test_rule_parse_read_intent() {
+        let tools = vec![AnthropicTool {
+            name: "Read".to_string(),
+            description: "Read file".to_string(),
+            input_schema: serde_json::json!({
+                "type": "object",
+                "properties": {"file_path": {"type": "string"}},
+                "required": ["file_path"]
+            }),
+        }];
+        let output = "需要读取文件 probe.txt";
+
+        let calls = parse_rule_tool_intent(output, &tools).unwrap();
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].name, "Read");
+        assert_eq!(calls[0].input["file_path"], "probe.txt");
     }
 }
