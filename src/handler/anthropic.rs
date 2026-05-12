@@ -270,14 +270,18 @@ fn maybe_build_long_task_poll_response(
     let Some((tool_use_id, content)) = latest_tool_result_content(req) else {
         return Ok(None);
     };
-    let _session_key = format!("{}:{}", req.model, tool_use_id);
+    let session_key = format!("{}:{}", req.model, tool_use_id);
     let Some(task) = state.tool_ledger.long_task_for_tool_use(&tool_use_id, &req.model) else {
         return Ok(None);
     };
 
     use crate::tool_runtime::broker::LongTaskResult;
     match crate::tool_runtime::broker::classify_long_task_result(&content, &task.done_marker) {
-        LongTaskResult::Done => Ok(None),
+        LongTaskResult::Done => {
+            // 长时任务完成，清理 ledger 中的 pending 条目和 long task
+            state.tool_ledger.complete_long_task(&task.task_id);
+            Ok(None)
+        }
         LongTaskResult::Failed(msg) => Err(AppError::Upstream(msg)),
         LongTaskResult::Pending => {
             let updated = state
@@ -285,11 +289,17 @@ fn maybe_build_long_task_poll_response(
                 .increment_long_task_poll_by_task_id(&task.task_id)
                 .ok_or_else(|| AppError::BadRequest("长时任务状态不存在".to_string()))?;
             if updated.polls > updated.max_polls {
+                state.tool_ledger.complete_long_task(&task.task_id);
                 return Err(AppError::Upstream(format!(
                     "长时任务轮询超限: {}",
                     updated.file_path
                 )));
             }
+            // 记录新的 poll 工具调用到 ledger
+            let poll_key = format!("{}:poll_{}", req.model, uuid_short());
+            state.tool_ledger.record_tool_use(&poll_key, &poll_key, "Bash")?;
+            state.tool_ledger.link_poll_to_long_task(&poll_key, &task.task_id)?;
+
             let plan = crate::tool_runtime::broker::LongTaskPlan {
                 file_path: updated.file_path,
                 done_marker: updated.done_marker,
