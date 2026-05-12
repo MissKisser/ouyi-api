@@ -141,6 +141,59 @@ pub struct LongTaskPlan {
     pub max_polls: u32,
 }
 
+/// 从 echo > 重定向模式中提取文件路径和完成标记。
+/// 匹配类似 `echo DONE > file.txt` 的命令。
+fn detect_echo_redirect(command: &str) -> Option<(String, String)> {
+    let file_path = command
+        .split('>')
+        .nth(1)
+        .and_then(|tail| tail.split_whitespace().next())
+        .map(|s| s.trim_matches('"').trim_matches('\'').to_string())?;
+    let done_marker = command
+        .split("echo")
+        .nth(1)
+        .and_then(|tail| tail.split('>').next())
+        .map(|s| s.trim().trim_matches('"').trim_matches('\'').to_string())
+        .filter(|s| !s.is_empty())?;
+    Some((file_path, done_marker))
+}
+
+/// 从 PowerShell Set-Content 模式中提取文件路径和完成标记。
+/// 匹配类似 `Set-Content -LiteralPath file.txt -Value MARKER` 的命令。
+fn detect_powershell_set_content(command: &str) -> Option<(String, String)> {
+    let ps_start = command.find("Set-Content")?;
+    let after = &command[ps_start..];
+
+    let path = after
+        .split("-LiteralPath")
+        .nth(1)
+        .or_else(|| after.split("-Path").nth(1))
+        .and_then(|tail| {
+            let trimmed = tail.trim();
+            let end = trimmed
+                .find(" -")
+                .unwrap_or(trimmed.len());
+            Some(trimmed[..end].trim().trim_matches('"').trim_matches('\'').to_string())
+        })?;
+
+    let marker = after
+        .split("-Value")
+        .nth(1)
+        .and_then(|tail| {
+            let trimmed = tail.trim();
+            let end = trimmed
+                .find(" -")
+                .unwrap_or(trimmed.find(';').unwrap_or(trimmed.len()));
+            Some(trimmed[..end].trim().trim_matches('"').trim_matches('\'').to_string())
+        })?;
+
+    if !path.is_empty() && !marker.is_empty() {
+        Some((path, marker))
+    } else {
+        None
+    }
+}
+
 pub fn detect_long_task(call: &BrokerToolCall) -> Option<LongTaskPlan> {
     if call.name != "Bash" {
         return None;
@@ -154,24 +207,25 @@ pub fn detect_long_task(call: &BrokerToolCall) -> Option<LongTaskPlan> {
         return None;
     }
 
-    let file_path = command
-        .split('>')
-        .nth(1)
-        .and_then(|tail| tail.split_whitespace().next())
-        .map(|s| s.trim_matches('"').trim_matches('\'').to_string())?;
-    let done_marker = command
-        .split("echo")
-        .nth(1)
-        .and_then(|tail| tail.split('>').next())
-        .map(|s| s.trim().trim_matches('"').trim_matches('\'').to_string())
-        .filter(|s| !s.is_empty())?;
+    if let Some((file_path, done_marker)) = detect_powershell_set_content(command) {
+        return Some(LongTaskPlan {
+            file_path,
+            done_marker,
+            interval_secs: 5,
+            max_polls: 3,
+        });
+    }
 
-    Some(LongTaskPlan {
-        file_path,
-        done_marker,
-        interval_secs: 5,
-        max_polls: 8,
-    })
+    if let Some((file_path, done_marker)) = detect_echo_redirect(command) {
+        return Some(LongTaskPlan {
+            file_path,
+            done_marker,
+            interval_secs: 5,
+            max_polls: 8,
+        });
+    }
+
+    None
 }
 
 pub fn build_poll_call(
@@ -181,18 +235,21 @@ pub fn build_poll_call(
     if find_tool(tools, "Bash").is_none() {
         return Err("长时任务轮询需要 Bash 工具".to_string());
     }
+    let escaped_path = plan.file_path.replace('\'', "'\\''");
+    let marker = plan.done_marker.replace('\'', "'\\''");
     let command = format!(
-        "sleep {}; if test -f '{}'; then cat '{}'; else echo PENDING; fi",
+        "sleep {}; if test -f '{}' && grep -q '{}' '{}'; then echo DONE; else echo PENDING; fi",
         plan.interval_secs,
-        plan.file_path.replace('\'', "'\\''"),
-        plan.file_path.replace('\'', "'\\''")
+        escaped_path,
+        marker,
+        escaped_path
     );
     Ok(BrokerToolCall {
         id: broker_id(),
         name: "Bash".to_string(),
         input: serde_json::json!({
             "command": command,
-            "description": format!("检查长时任务是否输出 {}", plan.done_marker)
+            "description": format!("检查长时任务是否完成: {}", marker)
         }),
     })
 }
@@ -234,7 +291,9 @@ pub async fn decide_with_broker(
     }
 
     let Some(config) = tool_runtime_config else {
-        return Ok(BrokerDecision::FinalAnswer { usage: None });
+        return Err(AppError::Config(
+            "无法解析工具意图且未配置工具编译器".to_string(),
+        ));
     };
 
     let compiled = crate::tool_runtime::openai_compiler::compile_tool_decision_with_usage(
@@ -381,6 +440,35 @@ mod tests {
         assert_eq!(calls.len(), 1);
         assert_eq!(calls[0].name, "Bash");
         assert_eq!(calls[0].input["command"], "Get-Location");
+    }
+
+    #[test]
+    fn test_detect_long_task_from_powershell_set_content() {
+        let call = BrokerToolCall {
+            id: "call_1".to_string(),
+            name: "Bash".to_string(),
+            input: serde_json::json!({
+                "command": "powershell -NoProfile -Command \"Start-Sleep -Seconds 20; Set-Content -LiteralPath longtask.txt -Value DONE_MARKER\""
+            }),
+        };
+        let plan = detect_long_task(&call).unwrap();
+        assert_eq!(plan.file_path, "longtask.txt");
+        assert_eq!(plan.done_marker, "DONE_MARKER");
+    }
+
+    #[test]
+    fn test_build_poll_call_checks_done_marker() {
+        let tools = vec![bash_tool()];
+        let plan = LongTaskPlan {
+            file_path: "longtask.txt".to_string(),
+            done_marker: "DONE_MARKER".to_string(),
+            interval_secs: 5,
+            max_polls: 3,
+        };
+        let call = build_poll_call(&plan, &tools).unwrap();
+        let command = call.input["command"].as_str().unwrap();
+        assert!(command.contains("DONE_MARKER"));
+        assert!(command.contains("PENDING"));
     }
 
     #[test]
