@@ -1,5 +1,12 @@
 import { useEffect, useState } from 'react';
-import { apiFetchConfig, apiSaveConfig, type FullConfig, type AccountEntry } from '@/lib/api';
+import {
+  apiFetchConfig,
+  apiSaveConfig,
+  apiTestToolRuntime,
+  type FullConfig,
+  type AccountEntry,
+  type ToolRuntimeTestResponse,
+} from '@/lib/api';
 import { Card, CardContent, CardHeader, CardTitle } from '@/components/ui/card';
 import { Button } from '@/components/ui/button';
 import { Input } from '@/components/ui/input';
@@ -14,9 +21,10 @@ import {
   EyeOff,
   Plus,
   Save,
+  PlugZap,
   X,
   Server,
-  Cpu,
+  Wrench,
   User,
   Shield,
 } from 'lucide-react';
@@ -37,10 +45,7 @@ function Section({
   const [open, setOpen] = useState(defaultOpen);
   return (
     <Card>
-      <CardHeader
-        className="cursor-pointer select-none"
-        onClick={() => setOpen(!open)}
-      >
+      <CardHeader className="cursor-pointer select-none" onClick={() => setOpen(!open)}>
         <CardTitle className="flex items-center gap-2 text-lg">
           <Icon className="h-5 w-5" />
           {title}
@@ -61,7 +66,9 @@ export function ConfigPage() {
   const [message, setMessage] = useState<{ type: 'ok' | 'err'; text: string } | null>(null);
   const [oldPassword, setOldPassword] = useState('');
   const [newPassword, setNewPassword] = useState('');
-  const [showJwt, setShowJwt] = useState(false);
+  const [showToolApiKey, setShowToolApiKey] = useState(false);
+  const [testingToolRuntime, setTestingToolRuntime] = useState(false);
+  const [toolRuntimeTest, setToolRuntimeTest] = useState<ToolRuntimeTestResponse | null>(null);
 
   const loadConfig = () => {
     apiFetchConfig()
@@ -69,7 +76,7 @@ export function ConfigPage() {
       .catch(() => setMessage({ type: 'err', text: t('config.loadFailed') }));
   };
 
-  useEffect(loadConfig, []);
+  useEffect(loadConfig, [t]);
 
   if (!config) {
     return <div className="p-4 text-muted-foreground">{t('config.loading')}</div>;
@@ -97,11 +104,6 @@ export function ConfigPage() {
           host: config.server.host,
           port: config.server.port,
         },
-        deepseek: {
-          api_base: config.deepseek.api_base,
-          jwt_token: config.deepseek.jwt_token,
-          client_version: config.deepseek.client_version,
-        },
         admin: {
           old_password: oldPassword || undefined,
           new_password: newPassword || undefined,
@@ -114,6 +116,7 @@ export function ConfigPage() {
           token: a.token,
           enabled: a.enabled,
         })),
+        tool_runtime: config.tool_runtime,
       };
       await apiSaveConfig(body);
       setMessage({ type: 'ok', text: t('config.saveSuccess') });
@@ -122,7 +125,10 @@ export function ConfigPage() {
       const fresh = await apiFetchConfig();
       setConfig(fresh);
     } catch (e: unknown) {
-      setMessage({ type: 'err', text: t('config.saveFailed', { error: e instanceof Error ? e.message : String(e) }) });
+      setMessage({
+        type: 'err',
+        text: t('config.saveFailed', { error: e instanceof Error ? e.message : String(e) }),
+      });
     } finally {
       setSaving(false);
     }
@@ -131,6 +137,28 @@ export function ConfigPage() {
   const handleCancel = () => {
     if (confirm(t('config.cancelConfirm'))) {
       loadConfig();
+    }
+  };
+
+  const handleToolRuntimeTest = async () => {
+    if (!config.tool_runtime) return;
+    setTestingToolRuntime(true);
+    setToolRuntimeTest(null);
+    try {
+      const result = await apiTestToolRuntime(config.tool_runtime);
+      setToolRuntimeTest(result);
+    } catch (e: unknown) {
+      setToolRuntimeTest({
+        success: false,
+        message: e instanceof Error ? e.message : String(e),
+        latency_ms: 0,
+        mode: 'compiler',
+        provider: config.tool_runtime.provider,
+        model: config.tool_runtime.model,
+        base_url: config.tool_runtime.base_url,
+      });
+    } finally {
+      setTestingToolRuntime(false);
     }
   };
 
@@ -161,7 +189,7 @@ export function ConfigPage() {
         </div>
       )}
 
-      {/* ── Accounts ──────────────────────────────────────────── */}
+      {/* Accounts */}
       <Card>
         <CardHeader>
           <CardTitle className="flex items-center gap-2 text-lg">
@@ -207,12 +235,7 @@ export function ConfigPage() {
               <div className="flex-1 min-w-[120px]">
                 <label className="text-xs text-muted-foreground">{t('config.accounts.token')}</label>
                 <div className="flex items-center gap-1">
-                  <Input
-                    type="password"
-                    value={a.token || ''}
-                    readOnly
-                    className="bg-muted/50"
-                  />
+                  <Input type="password" value={a.token || ''} readOnly className="bg-muted/50" />
                   <Button
                     variant="ghost"
                     size="icon"
@@ -251,7 +274,14 @@ export function ConfigPage() {
             onClick={() =>
               update(['accounts'], [
                 ...config.accounts,
-                { email: '', mobile: '', area_code: '', password: '', token: '', enabled: true } as AccountEntry,
+                {
+                  email: '',
+                  mobile: '',
+                  area_code: '',
+                  password: '',
+                  token: '',
+                  enabled: true,
+                } as AccountEntry,
               ])
             }
           >
@@ -260,62 +290,142 @@ export function ConfigPage() {
         </CardContent>
       </Card>
 
-      {/* ── Ouyi API ─────────────────────────────────────────── */}
-      <Section title={t('config.sections.ouyi')} icon={Cpu}>
-        <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
-          <div>
-            <label className="text-sm text-muted-foreground block mb-1">API Base</label>
-            <Input
-              value={config.deepseek.api_base}
-              onChange={(e) => update(['deepseek', 'api_base'], e.target.value)}
-            />
-          </div>
-          <div>
-            <label className="text-sm text-muted-foreground block mb-1">Client Version</label>
-            <Input
-              value={config.deepseek.client_version}
-              onChange={(e) => update(['deepseek', 'client_version'], e.target.value)}
-            />
-          </div>
-          <div className="md:col-span-2">
-            <label className="text-sm text-muted-foreground block mb-1">JWT Token</label>
-            <div className="flex items-center gap-1">
-              <Input
-                type={showJwt ? 'text' : 'password'}
-                value={config.deepseek.jwt_token}
-                onChange={(e) => update(['deepseek', 'jwt_token'], e.target.value)}
-                className="font-mono text-xs"
+      {/* Tool Runtime */}
+      <Section title={t('config.sections.toolRuntime')} icon={Wrench}>
+        <div className="space-y-4">
+          <div className="flex flex-wrap items-center justify-between gap-3">
+            <div className="flex items-center gap-2">
+              <label className="text-sm text-muted-foreground">{t('config.toolRuntime.enabled')}</label>
+              <Switch
+                checked={config.tool_runtime?.enabled ?? false}
+                onCheckedChange={(checked) => {
+                  const current = config.tool_runtime ?? {
+                    enabled: false,
+                    provider: 'openai-compatible',
+                    base_url: '',
+                    api_key: '',
+                    model: '',
+                    timeout_secs: 30,
+                  };
+                  update(['tool_runtime'], { ...current, enabled: checked });
+                  setToolRuntimeTest(null);
+                }}
               />
-              <Button
-                variant="ghost"
-                size="icon"
-                className="shrink-0"
-                onClick={() => setShowJwt(!showJwt)}
-              >
-                {showJwt ? <EyeOff className="h-4 w-4" /> : <Eye className="h-4 w-4" />}
-              </Button>
-              <Button
-                variant="ghost"
-                size="icon"
-                className="shrink-0"
-                onClick={() => copyToClipboard(config.deepseek.jwt_token)}
-              >
-                <Copy className="h-4 w-4" />
-              </Button>
             </div>
+            <Button
+              variant="outline"
+              size="sm"
+              onClick={handleToolRuntimeTest}
+              disabled={testingToolRuntime || !(config.tool_runtime?.enabled ?? false)}
+            >
+              <PlugZap className="h-4 w-4 mr-1" />
+              {testingToolRuntime ? t('config.toolRuntime.testing') : t('config.toolRuntime.testConnection')}
+            </Button>
           </div>
-          <div>
-            <label className="text-sm text-muted-foreground block mb-1">Refresh Interval (secs)</label>
-            <Input
-              type="number"
-              value={config.deepseek.model_refresh_interval_secs}
-              onChange={(e) => update(['deepseek', 'model_refresh_interval_secs'], Number(e.target.value))}
-            />
-          </div>
+          {(config.tool_runtime?.enabled ?? false) && (
+            <>
+              <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
+                <div>
+                  <label className="text-sm text-muted-foreground block mb-1">
+                    {t('config.toolRuntime.provider')}
+                  </label>
+                  <select
+                    className="w-full border rounded-md p-2"
+                    value={config.tool_runtime?.provider ?? 'openai-compatible'}
+                    onChange={(e) => {
+                      update(['tool_runtime', 'provider'], e.target.value);
+                      setToolRuntimeTest(null);
+                    }}
+                  >
+                    <option value="anthropic">{t('config.toolRuntime.providerAnthropic')}</option>
+                    <option value="openai-compatible">{t('config.toolRuntime.providerOpenaiCompatible')}</option>
+                  </select>
+                </div>
+                <div>
+                  <label className="text-sm text-muted-foreground block mb-1">
+                    {t('config.toolRuntime.baseUrl')}
+                  </label>
+                  <Input
+                    value={config.tool_runtime?.base_url ?? ''}
+                    onChange={(e) => {
+                      update(['tool_runtime', 'base_url'], e.target.value);
+                      setToolRuntimeTest(null);
+                    }}
+                    placeholder="https://api.example.com/v1"
+                  />
+                </div>
+                <div>
+                  <label className="text-sm text-muted-foreground block mb-1">{t('config.toolRuntime.model')}</label>
+                  <Input
+                    value={config.tool_runtime?.model ?? ''}
+                    onChange={(e) => {
+                      update(['tool_runtime', 'model'], e.target.value);
+                      setToolRuntimeTest(null);
+                    }}
+                    placeholder="cheap-tool-model"
+                  />
+                </div>
+                <div className="md:col-span-2">
+                  <label className="text-sm text-muted-foreground block mb-1">{t('config.toolRuntime.apiKey')}</label>
+                  <div className="flex items-center gap-1">
+                    <Input
+                      type={showToolApiKey ? 'text' : 'password'}
+                      value={config.tool_runtime?.api_key ?? ''}
+                      onChange={(e) => {
+                        update(['tool_runtime', 'api_key'], e.target.value);
+                        setToolRuntimeTest(null);
+                      }}
+                      className="font-mono text-xs"
+                    />
+                    <Button
+                      variant="ghost"
+                      size="icon"
+                      className="shrink-0"
+                      onClick={() => setShowToolApiKey(!showToolApiKey)}
+                    >
+                      {showToolApiKey ? <EyeOff className="h-4 w-4" /> : <Eye className="h-4 w-4" />}
+                    </Button>
+                    <Button
+                      variant="ghost"
+                      size="icon"
+                      className="shrink-0"
+                      onClick={() => config.tool_runtime?.api_key && copyToClipboard(config.tool_runtime.api_key)}
+                      disabled={!config.tool_runtime?.api_key}
+                    >
+                      <Copy className="h-4 w-4" />
+                    </Button>
+                  </div>
+                </div>
+                <div>
+                  <label className="text-sm text-muted-foreground block mb-1">{t('config.toolRuntime.timeout')}</label>
+                  <Input
+                    type="number"
+                    value={config.tool_runtime?.timeout_secs ?? 30}
+                    onChange={(e) => {
+                      update(['tool_runtime', 'timeout_secs'], Number(e.target.value));
+                      setToolRuntimeTest(null);
+                    }}
+                  />
+                </div>
+              </div>
+              {toolRuntimeTest && (
+                <div
+                  className={`p-3 rounded-md text-sm ${
+                    toolRuntimeTest.success ? 'bg-green-50 text-green-700' : 'bg-red-50 text-red-700'
+                  }`}
+                >
+                  <div className="font-medium">{toolRuntimeTest.message}</div>
+                  <div className="mt-1 text-xs opacity-80">
+                    {toolRuntimeTest.provider} · {toolRuntimeTest.model || '-'} · {toolRuntimeTest.latency_ms}ms
+                  </div>
+                </div>
+              )}
+            </>
+          )}
         </div>
       </Section>
 
-      {/* ── Server ────────────────────────────────────────────── */}
+      {/* Server */}
       <Section title={t('config.sections.server')} icon={Server}>
         <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
           <div>
@@ -333,7 +443,7 @@ export function ConfigPage() {
         </div>
       </Section>
 
-      {/* ── Admin ─────────────────────────────────────────────── */}
+      {/* Admin */}
       <Section title="Admin" icon={Shield}>
         <div className="space-y-3">
           <div className="flex items-center gap-2">
@@ -366,7 +476,7 @@ export function ConfigPage() {
 
       <Separator className="my-2" />
 
-      {/* ── Action buttons ────────────────────────────────────── */}
+      {/* Action buttons */}
       <div className="flex justify-end gap-3">
         <Button variant="outline" onClick={handleCancel} disabled={saving}>
           {t('config.cancel')}
