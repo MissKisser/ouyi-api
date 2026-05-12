@@ -460,6 +460,13 @@ pub async fn messages(
         "Anthropic messages 请求"
     );
 
+    // 优先检查长时任务轮询（broker continuation 统一入口）
+    if has_tool_result(&req) {
+        if let Some(response) = maybe_build_long_task_poll_response(&state, &req, &req.model)? {
+            return Ok(response);
+        }
+    }
+
     // 使用新的路由决策
     let config = state.config.read().await.clone();
     let route = runtime_route(&req, config.tool_runtime.as_ref());
@@ -494,11 +501,6 @@ async fn handle_original_ouyi_message(
 
     state.stats.record_start();
     let start_time = std::time::Instant::now();
-
-    // 优先检查长时任务轮询
-    if let Some(response) = maybe_build_long_task_poll_response(&state, &req, &req.model)? {
-        return Ok(response);
-    }
 
     let ouyi_req = convert_anthropic_request(&req, &model_full, should_thinking)
         .map_err(|e| AppError::BadRequest(e))?;
