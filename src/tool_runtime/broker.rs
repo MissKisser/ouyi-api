@@ -65,6 +65,33 @@ pub fn parse_marked_tool_calls(
     Ok(calls)
 }
 
+/// 从文本中提取代码块或单行命令。
+/// 支持 ``` 包裹的命令（可带语言标记），或单行纯文本命令。
+/// 多行自然语言会被拒绝。
+fn extract_explicit_command(raw: &str) -> Option<String> {
+    let text = raw.trim();
+    if let Some(start) = text.find("```") {
+        let after = &text[start + 3..];
+        let after = after.strip_prefix("powershell\n")
+            .or_else(|| after.strip_prefix("bash\n"))
+            .or_else(|| after.strip_prefix("sh\n"))
+            .or_else(|| after.strip_prefix("powershell\r\n"))
+            .or_else(|| after.strip_prefix("bash\r\n"))
+            .or_else(|| after.strip_prefix("sh\r\n"))
+            .unwrap_or(after);
+        let end = after.find("```")?;
+        let command = after[..end].trim();
+        if !command.is_empty() {
+            return Some(command.to_string());
+        }
+    }
+    if text.contains('\n') || text.contains('\r') {
+        return None;
+    }
+    let command = text.trim_matches('`').trim();
+    if command.is_empty() { None } else { Some(command.to_string()) }
+}
+
 pub fn parse_rule_tool_intent(
     ouyi_output: &str,
     tools: &[AnthropicTool],
@@ -73,9 +100,8 @@ pub fn parse_rule_tool_intent(
 
     if find_tool(tools, "Bash").is_some() {
         for marker in ["执行命令：", "执行命令:", "Bash 执行命令：", "Bash 执行命令:"] {
-            if let Some((_, command)) = text.rsplit_once(marker) {
-                let command = command.trim().trim_matches('`').trim();
-                if !command.is_empty() {
+            if let Some((_, after_marker)) = text.rsplit_once(marker) {
+                if let Some(command) = extract_explicit_command(after_marker) {
                     return Ok(vec![BrokerToolCall {
                         id: broker_id(),
                         name: "Bash".to_string(),
@@ -327,6 +353,34 @@ mod tests {
         assert_eq!(calls.len(), 1);
         assert_eq!(calls[0].name, "Read");
         assert_eq!(calls[0].input["file_path"], "probe.txt");
+    }
+
+    #[test]
+    fn test_rule_parse_bash_rejects_multiline_natural_language() {
+        let tools = vec![bash_tool()];
+        let calls = parse_rule_tool_intent(
+            "需要执行命令：pwd\n然后读取 probe.txt 分析结果",
+            &tools,
+        ).unwrap();
+        assert!(calls.is_empty());
+    }
+
+    #[test]
+    fn test_rule_parse_bash_accepts_single_line_command() {
+        let tools = vec![bash_tool()];
+        let calls = parse_rule_tool_intent("执行命令：pwd", &tools).unwrap();
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].name, "Bash");
+        assert_eq!(calls[0].input["command"], "pwd");
+    }
+
+    #[test]
+    fn test_rule_parse_bash_accepts_fenced_command() {
+        let tools = vec![bash_tool()];
+        let calls = parse_rule_tool_intent("执行命令：```powershell\nGet-Location\n```", &tools).unwrap();
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].name, "Bash");
+        assert_eq!(calls[0].input["command"], "Get-Location");
     }
 
     #[test]
