@@ -270,7 +270,7 @@ fn maybe_build_long_task_poll_response(
     let Some((tool_use_id, content)) = latest_tool_result_content(req) else {
         return Ok(None);
     };
-    let session_key = format!("{}:{}", req.model, tool_use_id);
+    let _session_key = format!("{}:{}", req.model, tool_use_id);
     let Some(task) = state.tool_ledger.long_task_for_tool_use(&tool_use_id, &req.model) else {
         return Ok(None);
     };
