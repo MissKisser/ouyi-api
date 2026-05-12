@@ -1,14 +1,23 @@
 use crate::adapter::tool_call::ToolCallParser;
+use crate::config::ToolRuntimeConfig;
+use crate::error::AppError;
 use crate::model::anthropic::AnthropicTool;
+use crate::model::anthropic::MessagesRequest;
 
 fn broker_id() -> String {
     format!("call_broker_{}", uuid::Uuid::new_v4().simple())
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone)]
+pub struct BrokerUsage {
+    pub prompt_tokens: u64,
+    pub completion_tokens: u64,
+}
+
+#[derive(Debug, Clone)]
 pub enum BrokerDecision {
     ToolCalls(Vec<BrokerToolCall>),
-    FinalAnswer,
+    FinalAnswer { usage: Option<BrokerUsage> },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -175,6 +184,62 @@ pub fn classify_long_task_result(content: &str, done_marker: &str) -> LongTaskRe
         LongTaskResult::Pending
     } else {
         LongTaskResult::Pending
+    }
+}
+
+pub async fn decide_with_broker(
+    http_client: reqwest::Client,
+    tool_runtime_config: Option<&ToolRuntimeConfig>,
+    req: &MessagesRequest,
+    ouyi_output: &str,
+) -> Result<BrokerDecision, AppError> {
+    let tools = req.tools.as_deref().unwrap_or(&[]);
+
+    let marked = parse_marked_tool_calls(ouyi_output, tools)
+        .map_err(AppError::BadRequest)?;
+    if !marked.is_empty() {
+        return Ok(BrokerDecision::ToolCalls(marked));
+    }
+
+    let rule_calls = parse_rule_tool_intent(ouyi_output, tools)
+        .map_err(AppError::BadRequest)?;
+    if !rule_calls.is_empty() {
+        return Ok(BrokerDecision::ToolCalls(rule_calls));
+    }
+
+    let Some(config) = tool_runtime_config else {
+        return Ok(BrokerDecision::FinalAnswer { usage: None });
+    };
+
+    let compiled = crate::tool_runtime::openai_compiler::compile_tool_decision_with_usage(
+        http_client,
+        config,
+        req,
+        ouyi_output,
+    )
+    .await?;
+
+    match compiled.decision {
+        crate::tool_runtime::openai_compiler::CompilerDecision::ToolCalls(calls) => {
+            Ok(BrokerDecision::ToolCalls(
+                calls
+                    .into_iter()
+                    .map(|call| BrokerToolCall {
+                        id: call.id,
+                        name: call.name,
+                        input: call.input,
+                    })
+                    .collect(),
+            ))
+        }
+        crate::tool_runtime::openai_compiler::CompilerDecision::FinalAnswer => {
+            Ok(BrokerDecision::FinalAnswer {
+                usage: Some(BrokerUsage {
+                    prompt_tokens: compiled.usage.prompt_tokens,
+                    completion_tokens: compiled.usage.completion_tokens,
+                }),
+            })
+        }
     }
 }
 

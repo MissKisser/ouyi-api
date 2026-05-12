@@ -29,7 +29,18 @@ const TOOL_CALL_FORMAT: &str = concat!(
     "8. 工具调用之后不要附带任何解释文字\n",
     "9. 如果你确信不需要调用工具即可完整回答，正常回复即可（但涉及文件系统、网络、外部命令时必须调用工具）\n",
     "10. 永远不要编造 <tool_result> 标签——工具结果由系统自动注入\n",
-    "11. arguments 的值必须是纯文本，禁止 markdown/LaTeX\n",
+    "11. arguments 的值必须是纯文本，禁止 markdown/LaTeX\n\n",
+    "### 工具动作意图\n",
+    "如果你无法稳定输出 JSON 标记，也必须用自然语言明确表达工具动作，例如：\n",
+    "- 需要执行命令时：\"执行命令：你的命令\"\n",
+    "- 需要读取文件时：\"读取文件 路径\"\n",
+    "系统会解析这些自然语言意图并转换为对应的工具调用。\n\n",
+    "### 长时任务协议\n",
+    "如果命令需要长时间运行（如 sleep、Start-Sleep 等），请在命令末尾添加信号：\n",
+    "```text\n",
+    "<|tool▁calls▁begin|>[{\"name\": \"Bash\", \"arguments\": {\"command\": \"你的命令 && echo DONE > 标记文件.txt\", \"description\": \"长时任务描述\"}}]<|tool▁calls▁end|>\n",
+    "```\n",
+    "系统会自动轮询标记文件，检测 \"DONE\" 信号以判断任务是否完成。\n",
 );
 
 const TOOL_CALL_REMINDER: &str = concat!(
@@ -73,13 +84,17 @@ fn format_tool_params(tool: &AnthropicTool) -> String {
             let fields: Vec<String> = p
                 .iter()
                 .map(|(k, v)| {
-                    let required_mark = if required.contains(&k.as_str()) { " (必填)" } else { "" };
-                    let desc = v
-                        .get("description")
-                        .and_then(|d| d.as_str())
-                        .unwrap_or("");
+                    let required_mark = if required.contains(&k.as_str()) {
+                        " (必填)"
+                    } else {
+                        ""
+                    };
+                    let desc = v.get("description").and_then(|d| d.as_str()).unwrap_or("");
                     let example = example_value_for_key(k, v);
-                    format!("      - **{}**{}: {}  [示例: {}]", k, required_mark, desc, example)
+                    format!(
+                        "      - **{}**{}: {}  [示例: {}]",
+                        k, required_mark, desc, example
+                    )
                 })
                 .collect();
             let obj = format!("{{\n{}\n    }}", fields.join(",\n"));
@@ -226,7 +241,11 @@ pub fn convert_anthropic_request(
     }
 
     let has_tools = req.tools.as_ref().map(|t| !t.is_empty()).unwrap_or(false);
-    let force_tool = req.tool_choice.as_ref().map(|tc| tc.is_forced()).unwrap_or(false);
+    let force_tool = req
+        .tool_choice
+        .as_ref()
+        .map(|tc| tc.is_forced())
+        .unwrap_or(false);
 
     let system_prompt = if system_parts.is_empty() {
         None
@@ -238,7 +257,9 @@ pub fn convert_anthropic_request(
 
     if has_tools {
         if force_tool {
-            text.push_str("\n\n[System]: 你必须使用工具来完成当前任务。只能回复工具调用，不能回复文字。");
+            text.push_str(
+                "\n\n[System]: 你必须使用工具来完成当前任务。只能回复工具调用，不能回复文字。",
+            );
         }
         // 借鉴 ds-free-api: 末尾注入不闭合的 <think> 块，让工具格式紧邻模型生成位置
         text.push_str("\n\n<think>\n现在开始分析任务。如果需要使用工具，我必须按照以下格式输出：\n\n<|tool\u{2581}calls\u{2581}begin|>\n[{\"name\": \"工具名\", \"arguments\": {\"参数名\": \"值\"}}]\n<|tool\u{2581}calls\u{2581}end|>\n\n");
@@ -370,6 +391,10 @@ mod tests {
         assert!(block.contains("bash"));
         assert!(block.contains("Execute a command"));
         assert!(block.contains("必填"));
+        assert!(block.contains("工具动作意图"));
+        assert!(block.contains("执行命令"));
+        assert!(block.contains("长时任务协议"));
+        assert!(block.contains("echo DONE"));
     }
 
     #[test]
