@@ -98,6 +98,86 @@ pub fn parse_rule_tool_intent(
     Ok(Vec::new())
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LongTaskPlan {
+    pub file_path: String,
+    pub done_marker: String,
+    pub interval_secs: u64,
+    pub max_polls: u32,
+}
+
+pub fn detect_long_task(call: &BrokerToolCall) -> Option<LongTaskPlan> {
+    if call.name != "Bash" {
+        return None;
+    }
+    let command = call.input.get("command")?.as_str()?;
+    let has_long_signal = command.contains("sleep ")
+        || command.contains("Start-Sleep")
+        || command.contains("run_in_background")
+        || command.contains("后台");
+    if !has_long_signal {
+        return None;
+    }
+
+    let file_path = command
+        .split('>')
+        .nth(1)
+        .and_then(|tail| tail.split_whitespace().next())
+        .map(|s| s.trim_matches('"').trim_matches('\'').to_string())?;
+    let done_marker = command
+        .split("echo")
+        .nth(1)
+        .and_then(|tail| tail.split('>').next())
+        .map(|s| s.trim().trim_matches('"').trim_matches('\'').to_string())
+        .filter(|s| !s.is_empty())?;
+
+    Some(LongTaskPlan {
+        file_path,
+        done_marker,
+        interval_secs: 5,
+        max_polls: 8,
+    })
+}
+
+pub fn build_poll_call(
+    plan: &LongTaskPlan,
+    tools: &[AnthropicTool],
+) -> Result<BrokerToolCall, String> {
+    if find_tool(tools, "Bash").is_none() {
+        return Err("长时任务轮询需要 Bash 工具".to_string());
+    }
+    let command = format!(
+        "sleep {}; if test -f '{}'; then cat '{}'; else echo PENDING; fi",
+        plan.interval_secs,
+        plan.file_path.replace('\'', "'\\''"),
+        plan.file_path.replace('\'', "'\\''")
+    );
+    Ok(BrokerToolCall {
+        id: broker_id(),
+        name: "Bash".to_string(),
+        input: serde_json::json!({
+            "command": command,
+            "description": format!("检查长时任务是否输出 {}", plan.done_marker)
+        }),
+    })
+}
+
+pub enum LongTaskResult {
+    Pending,
+    Done,
+    Failed(String),
+}
+
+pub fn classify_long_task_result(content: &str, done_marker: &str) -> LongTaskResult {
+    if content.contains(done_marker) {
+        LongTaskResult::Done
+    } else if content.contains("PENDING") || content.trim().is_empty() {
+        LongTaskResult::Pending
+    } else {
+        LongTaskResult::Pending
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -182,5 +262,43 @@ mod tests {
         assert_eq!(calls.len(), 1);
         assert_eq!(calls[0].name, "Read");
         assert_eq!(calls[0].input["file_path"], "probe.txt");
+    }
+
+    #[test]
+    fn test_detect_long_task_from_bash_command() {
+        let call = BrokerToolCall {
+            id: "call_broker_1".to_string(),
+            name: "Bash".to_string(),
+            input: serde_json::json!({
+                "command": "sleep 20 && echo DONE > longtask.txt",
+                "description": "start long task"
+            }),
+        };
+
+        let plan = detect_long_task(&call).unwrap();
+        assert_eq!(plan.file_path, "longtask.txt");
+        assert_eq!(plan.done_marker, "DONE");
+    }
+
+    #[test]
+    fn test_build_poll_call_reads_expected_file() {
+        let tools = vec![bash_tool()];
+        let plan = LongTaskPlan {
+            file_path: "longtask.txt".to_string(),
+            done_marker: "DONE".to_string(),
+            interval_secs: 5,
+            max_polls: 8,
+        };
+
+        let call = build_poll_call(&plan, &tools).unwrap();
+        assert_eq!(call.name, "Bash");
+        assert!(call.input["command"].as_str().unwrap().contains("longtask.txt"));
+    }
+
+    #[test]
+    fn test_classify_long_task_result() {
+        assert!(matches!(classify_long_task_result("PENDING", "DONE"), LongTaskResult::Pending));
+        assert!(matches!(classify_long_task_result("DONE", "DONE"), LongTaskResult::Done));
+        assert!(matches!(classify_long_task_result("some error output", "DONE"), LongTaskResult::Pending));
     }
 }

@@ -13,6 +13,15 @@ pub struct PendingToolCall {
     pub tool_use_id: String,
     pub tool_name: String,
     pub created_at: Instant,
+    pub long_task: Option<PendingLongTask>,
+}
+
+#[derive(Debug, Clone)]
+pub struct PendingLongTask {
+    pub file_path: String,
+    pub done_marker: String,
+    pub polls: u32,
+    pub max_polls: u32,
 }
 
 #[derive(Default)]
@@ -42,6 +51,7 @@ impl ToolLedger {
                 tool_use_id: tool_use_id.to_string(),
                 tool_name: tool_name.to_string(),
                 created_at: Instant::now(),
+                long_task: None,
             },
         );
         Ok(())
@@ -88,6 +98,45 @@ impl ToolLedger {
         self.pending
             .get(session_key)
             .map(|pending| pending.created_at.elapsed().as_secs())
+    }
+
+    pub fn attach_long_task(
+        &self,
+        session_key: &str,
+        file_path: String,
+        done_marker: String,
+        max_polls: u32,
+    ) -> Result<(), AppError> {
+        match self.pending.get_mut(session_key) {
+            Some(mut pending) => {
+                pending.long_task = Some(PendingLongTask {
+                    file_path,
+                    done_marker,
+                    polls: 0,
+                    max_polls,
+                });
+                Ok(())
+            }
+            None => Err(AppError::BadRequest(format!(
+                "未找到等待中的工具调用会话: {}",
+                session_key
+            ))),
+        }
+    }
+
+    pub fn long_task_for(&self, session_key: &str) -> Option<PendingLongTask> {
+        self.pending
+            .get(session_key)
+            .and_then(|pending| pending.long_task.clone())
+    }
+
+    pub fn increment_long_task_poll(&self, session_key: &str) -> Option<PendingLongTask> {
+        self.pending.get_mut(session_key).and_then(|mut pending| {
+            pending.long_task.as_mut().map(|task| {
+                task.polls += 1;
+                task.clone()
+            })
+        })
     }
 }
 
