@@ -5,7 +5,8 @@ use dashmap::DashMap;
 use crate::error::AppError;
 use crate::model::anthropic::{AnthropicContent, ContentBlock, MessagesRequest};
 
-pub mod native_anthropic;
+pub mod broker;
+pub mod openai_compiler;
 
 #[derive(Debug, Clone)]
 pub struct PendingToolCall {
@@ -46,6 +47,7 @@ impl ToolLedger {
         Ok(())
     }
 
+    #[cfg(test)]
     pub fn validate_tool_result(
         &self,
         session_key: &str,
@@ -64,6 +66,7 @@ impl ToolLedger {
         }
     }
 
+    #[cfg(test)]
     pub fn complete_tool_result(
         &self,
         session_key: &str,
@@ -74,6 +77,7 @@ impl ToolLedger {
         Ok(())
     }
 
+    #[cfg(test)]
     pub fn pending_tool_name(&self, session_key: &str) -> Option<String> {
         self.pending
             .get(session_key)
@@ -91,6 +95,7 @@ pub fn should_use_tool_runtime(req: &MessagesRequest) -> bool {
     req.tools.as_ref().is_some_and(|tools| !tools.is_empty())
 }
 
+#[cfg(test)]
 pub fn session_key_for_request(req: &MessagesRequest) -> Option<String> {
     latest_tool_result_id(req)
         .or_else(|| latest_tool_use_id(req))
@@ -110,6 +115,7 @@ pub fn latest_tool_result_id(req: &MessagesRequest) -> Option<String> {
     None
 }
 
+#[cfg(test)]
 pub fn latest_tool_use_id(req: &MessagesRequest) -> Option<String> {
     for msg in req.messages.iter().rev() {
         if let AnthropicContent::Blocks(blocks) = &msg.content {
@@ -123,19 +129,7 @@ pub fn latest_tool_use_id(req: &MessagesRequest) -> Option<String> {
     None
 }
 
-pub fn latest_tool_use_name(req: &MessagesRequest) -> Option<String> {
-    for msg in req.messages.iter().rev() {
-        if let AnthropicContent::Blocks(blocks) = &msg.content {
-            for block in blocks.iter().rev() {
-                if let ContentBlock::ToolUse { name, .. } = block {
-                    return Some(name.clone());
-                }
-            }
-        }
-    }
-    None
-}
-
+#[cfg(test)]
 pub fn has_matching_tool_use(req: &MessagesRequest, tool_use_id: &str) -> bool {
     req.messages.iter().any(|msg| {
         if let AnthropicContent::Blocks(blocks) = &msg.content {
