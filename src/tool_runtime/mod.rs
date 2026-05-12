@@ -8,25 +8,37 @@ use crate::model::anthropic::{AnthropicContent, ContentBlock, MessagesRequest};
 pub mod broker;
 pub mod openai_compiler;
 
+fn uuid_short() -> String {
+    use std::time::{SystemTime, UNIX_EPOCH};
+    let ts = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_nanos();
+    format!("{:x}", ts % 0xFFFFFF)
+}
+
 #[derive(Debug, Clone)]
 pub struct PendingToolCall {
     pub tool_use_id: String,
     pub tool_name: String,
     pub created_at: Instant,
-    pub long_task: Option<PendingLongTask>,
+    pub long_task_id: Option<String>,
 }
 
 #[derive(Debug, Clone)]
 pub struct PendingLongTask {
+    pub task_id: String,
     pub file_path: String,
     pub done_marker: String,
     pub polls: u32,
     pub max_polls: u32,
+    pub tool_call_keys: Vec<String>,
 }
 
 #[derive(Default)]
 pub struct ToolLedger {
     pending: DashMap<String, PendingToolCall>,
+    long_tasks: DashMap<String, PendingLongTask>,
 }
 
 impl ToolLedger {
@@ -51,7 +63,7 @@ impl ToolLedger {
                 tool_use_id: tool_use_id.to_string(),
                 tool_name: tool_name.to_string(),
                 created_at: Instant::now(),
-                long_task: None,
+                long_task_id: None,
             },
         );
         Ok(())
@@ -106,15 +118,37 @@ impl ToolLedger {
         file_path: String,
         done_marker: String,
         max_polls: u32,
-    ) -> Result<(), AppError> {
+    ) -> Result<String, AppError> {
+        let task_id = format!("lt_{}", uuid_short());
         match self.pending.get_mut(session_key) {
             Some(mut pending) => {
-                pending.long_task = Some(PendingLongTask {
+                let lt = PendingLongTask {
+                    task_id: task_id.clone(),
                     file_path,
                     done_marker,
                     polls: 0,
                     max_polls,
-                });
+                    tool_call_keys: vec![session_key.to_string()],
+                };
+                self.long_tasks.insert(task_id.clone(), lt);
+                pending.long_task_id = Some(task_id.clone());
+                Ok(task_id)
+            }
+            None => Err(AppError::BadRequest(format!(
+                "未找到等待中的工具调用会话: {}",
+                session_key
+            ))),
+        }
+    }
+
+    pub fn record_poll_tool_use(&self, session_key: &str) -> Result<(), AppError> {
+        match self.pending.get_mut(session_key) {
+            Some(pending) => {
+                if let Some(ref task_id) = pending.long_task_id {
+                    if let Some(mut task) = self.long_tasks.get_mut(task_id) {
+                        task.tool_call_keys.push(session_key.to_string());
+                    }
+                }
                 Ok(())
             }
             None => Err(AppError::BadRequest(format!(
@@ -124,19 +158,65 @@ impl ToolLedger {
         }
     }
 
-    pub fn long_task_for(&self, session_key: &str) -> Option<PendingLongTask> {
-        self.pending
-            .get(session_key)
-            .and_then(|pending| pending.long_task.clone())
+    pub fn link_poll_to_long_task(&self, session_key: &str, task_id: &str) -> Result<(), AppError> {
+        match self.pending.get_mut(session_key) {
+            Some(mut pending) => {
+                pending.long_task_id = Some(task_id.to_string());
+                if let Some(mut task) = self.long_tasks.get_mut(task_id) {
+                    task.tool_call_keys.push(session_key.to_string());
+                }
+                Ok(())
+            }
+            None => Err(AppError::BadRequest(format!(
+                "未找到等待中的工具调用会话: {}",
+                session_key
+            ))),
+        }
     }
 
-    pub fn increment_long_task_poll(&self, session_key: &str) -> Option<PendingLongTask> {
-        self.pending.get_mut(session_key).and_then(|mut pending| {
-            pending.long_task.as_mut().map(|task| {
-                task.polls += 1;
-                task.clone()
-            })
+    pub fn long_task_for_tool_use(
+        &self,
+        tool_use_id: &str,
+        model: &str,
+    ) -> Option<PendingLongTask> {
+        let session_key = format!("{}:{}", model, tool_use_id);
+        let task_id = self
+            .pending
+            .get(&session_key)
+            .and_then(|p| p.long_task_id.clone())?;
+        self.long_tasks.get(&task_id).map(|t| t.clone())
+    }
+
+    pub fn increment_long_task_poll_by_task_id(&self, task_id: &str) -> Option<PendingLongTask> {
+        self.long_tasks.get_mut(task_id).and_then(|mut task| {
+            task.polls += 1;
+            Some(task.clone())
         })
+    }
+
+    pub fn complete_long_task(&self, task_id: &str) {
+        if let Some(task) = self.long_tasks.get(task_id) {
+            let keys = task.tool_call_keys.clone();
+            for key in &keys {
+                self.pending.remove(key);
+            }
+        }
+        self.long_tasks.remove(task_id);
+    }
+
+    #[cfg(test)]
+    pub fn long_task_by_id(&self, task_id: &str) -> Option<PendingLongTask> {
+        self.long_tasks.get(task_id).map(|t| t.clone())
+    }
+
+    #[cfg(test)]
+    pub fn pending_count(&self) -> usize {
+        self.pending.len()
+    }
+
+    #[cfg(test)]
+    pub fn long_task_count(&self) -> usize {
+        self.long_tasks.len()
     }
 }
 
@@ -330,5 +410,69 @@ mod tests {
 
         assert!(super::has_matching_tool_use(&req, "call_7"));
         assert!(!super::has_matching_tool_use(&req, "call_8"));
+    }
+
+    #[test]
+    fn test_attach_long_task_returns_task_id_and_tracks_in_ledger() {
+        let ledger = super::ToolLedger::new();
+        ledger
+            .record_tool_use("model-a:call_0", "call_0", "Bash")
+            .unwrap();
+
+        let task_id = ledger
+            .attach_long_task(
+                "model-a:call_0",
+                "/tmp/task.txt".to_string(),
+                "DONE".to_string(),
+                8,
+            )
+            .unwrap();
+
+        assert!(task_id.starts_with("lt_"));
+        assert_eq!(ledger.pending_count(), 1);
+        assert_eq!(ledger.long_task_count(), 1);
+
+        let task = ledger.long_task_by_id(&task_id).unwrap();
+        assert_eq!(task.task_id, task_id);
+        assert_eq!(task.file_path, "/tmp/task.txt");
+        assert_eq!(task.done_marker, "DONE");
+        assert_eq!(task.tool_call_keys, vec!["model-a:call_0".to_string()]);
+
+        let found = ledger.long_task_for_tool_use("call_0", "model-a").unwrap();
+        assert_eq!(found.task_id, task_id);
+    }
+
+    #[test]
+    fn test_complete_long_task_clears_polls_and_removes_task() {
+        let ledger = super::ToolLedger::new();
+
+        let primary_key = "model-a:call_0";
+        ledger.record_tool_use(primary_key, "call_0", "Bash").unwrap();
+        let task_id = ledger
+            .attach_long_task(primary_key, "task.txt".to_string(), "DONE".to_string(), 8)
+            .unwrap();
+
+        let poll1 = "model-a:call_poll1";
+        ledger.record_tool_use(poll1, "call_poll1", "Bash").unwrap();
+        ledger.link_poll_to_long_task(poll1, &task_id).unwrap();
+
+        let poll2 = "model-a:call_poll2";
+        ledger.record_tool_use(poll2, "call_poll2", "Bash").unwrap();
+        ledger.link_poll_to_long_task(poll2, &task_id).unwrap();
+
+        assert_eq!(ledger.pending_count(), 3);
+        assert_eq!(ledger.long_task_count(), 1);
+
+        let task = ledger.long_task_by_id(&task_id).unwrap();
+        assert_eq!(task.tool_call_keys.len(), 3);
+        assert_eq!(task.polls, 0);
+
+        let updated = ledger.increment_long_task_poll_by_task_id(&task_id).unwrap();
+        assert_eq!(updated.polls, 1);
+
+        ledger.complete_long_task(&task_id);
+
+        assert_eq!(ledger.pending_count(), 0);
+        assert_eq!(ledger.long_task_count(), 0);
     }
 }

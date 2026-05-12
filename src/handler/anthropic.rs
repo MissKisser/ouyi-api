@@ -38,13 +38,12 @@ pub fn runtime_route(
         return RuntimeRoute::OriginalOuyi;
     }
 
-    // tools 非空，且未配置 tool_runtime → 配置错误
-    let config = match tool_runtime_config {
-        Some(c) => c,
-        None => return RuntimeRoute::ConfigError(
-            "请求包含 tools，但未配置 [tool_runtime]；请配置工具编译器或关闭 Claude Code tools 请求".to_string(),
-        ),
-    };
+    // tools 非空，且未配置 tool_runtime → 走 Compiler 路由，broker 负责解析
+    // broker 会在标记/规则解析都失败且无 config 时返回 ConfigError
+    if tool_runtime_config.is_none() {
+        return RuntimeRoute::Compiler;
+    }
+    let config = tool_runtime_config.unwrap();
 
     let provider_supported = matches!(
         config.provider,
@@ -272,7 +271,7 @@ fn maybe_build_long_task_poll_response(
         return Ok(None);
     };
     let session_key = format!("{}:{}", req.model, tool_use_id);
-    let Some(task) = state.tool_ledger.long_task_for(&session_key) else {
+    let Some(task) = state.tool_ledger.long_task_for_tool_use(&tool_use_id, &req.model) else {
         return Ok(None);
     };
 
@@ -283,7 +282,7 @@ fn maybe_build_long_task_poll_response(
         LongTaskResult::Pending => {
             let updated = state
                 .tool_ledger
-                .increment_long_task_poll(&session_key)
+                .increment_long_task_poll_by_task_id(&task.task_id)
                 .ok_or_else(|| AppError::BadRequest("长时任务状态不存在".to_string()))?;
             if updated.polls > updated.max_polls {
                 return Err(AppError::Upstream(format!(
@@ -2241,10 +2240,10 @@ mod tests {
     }
 
     #[test]
-    fn test_runtime_route_tools_no_config_returns_config_error() {
+    fn test_runtime_route_tools_without_config_uses_compiler() {
         let req = make_request_with_tools();
         let route = runtime_route(&req, None);
-        assert!(matches!(route, RuntimeRoute::ConfigError(_)));
+        assert!(matches!(route, RuntimeRoute::Compiler));
     }
 
     #[test]
