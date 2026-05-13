@@ -38,11 +38,19 @@ pub struct ModelMapper {
 }
 
 static FALLBACK_MODELS: &[(&str, &str, &str)] = &[
-    ("claude_chat::claude-sonnet-4-5-20250929-vip", "claude-sonnet-4-5", "claude_chat"),
+    (
+        "claude_chat::claude-sonnet-4-5-20250929-vip",
+        "claude-sonnet-4-5",
+        "claude_chat",
+    ),
     ("openai_chat::gpt-4o", "gpt-4o", "openai_chat"),
     ("openai_chat::gpt-4o-mini", "gpt-4o-mini", "openai_chat"),
     ("deepseek_chat::deepseek-r1", "deepseek-r1", "deepseek_chat"),
-    ("gemini_chat::gemini-2.0-flash", "gemini-2.0-flash", "gemini_chat"),
+    (
+        "gemini_chat::gemini-2.0-flash",
+        "gemini-2.0-flash",
+        "gemini_chat",
+    ),
 ];
 
 impl ModelMapper {
@@ -156,7 +164,8 @@ impl ModelMapper {
                 },
             };
             self.short_to_full.insert(short.to_string(), entry);
-            self.full_to_short.insert(full.to_string(), short.to_string());
+            self.full_to_short
+                .insert(full.to_string(), short.to_string());
         }
     }
 
@@ -185,7 +194,9 @@ impl ModelMapper {
             matches.sort_by(|a, b| {
                 let a_vip = a.short_name.contains("-vip");
                 let b_vip = b.short_name.contains("-vip");
-                b_vip.cmp(&a_vip).then_with(|| b.short_name.cmp(&a.short_name))
+                b_vip
+                    .cmp(&a_vip)
+                    .then_with(|| b.short_name.cmp(&a.short_name))
             });
             return matches[0].full_value.clone();
         }
@@ -225,7 +236,8 @@ impl ModelMapper {
 
         // 按 (provider_name, provider_key) 分组
         let mut groups: BTreeMap<String, Vec<ModelCategoryItem>> = BTreeMap::new();
-        let mut provider_keys: std::collections::HashMap<String, String> = std::collections::HashMap::new();
+        let mut provider_keys: std::collections::HashMap<String, String> =
+            std::collections::HashMap::new();
 
         for entry in self.all_models.iter() {
             let tmpl = entry.value();
@@ -236,14 +248,19 @@ impl ModelMapper {
             let capabilities = tmpl.attr.capabilities.clone();
 
             let group_key = format!("{}|{}", provider_name, provider_key);
-            provider_keys.entry(provider_name.clone()).or_insert_with(|| provider_key.clone());
+            provider_keys
+                .entry(provider_name.clone())
+                .or_insert_with(|| provider_key.clone());
 
-            groups.entry(group_key).or_default().push(ModelCategoryItem {
-                label,
-                value,
-                provider_key,
-                capabilities,
-            });
+            groups
+                .entry(group_key)
+                .or_default()
+                .push(ModelCategoryItem {
+                    label,
+                    value,
+                    provider_key,
+                    capabilities,
+                });
         }
 
         groups
@@ -376,10 +393,7 @@ mod tests {
         mapper.load_fallback();
 
         assert_eq!(mapper.to_ouyi("gpt-4o"), "openai_chat::gpt-4o");
-        assert_eq!(
-            mapper.to_ouyi("openai_chat::gpt-4o"),
-            "openai_chat::gpt-4o"
-        );
+        assert_eq!(mapper.to_ouyi("openai_chat::gpt-4o"), "openai_chat::gpt-4o");
     }
 
     #[test]

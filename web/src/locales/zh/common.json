@@ -30,6 +30,7 @@
   },
   "dashboard": {
     "title": "概览",
+    "toolModelBadge": "工具模型",
     "stats": {
       "totalRequests": "总请求",
       "successRate": "成功率",
@@ -75,7 +76,20 @@
       "deepseek": "DeepSeek",
       "models": "模型类型",
       "toolCallTags": "工具调用标签",
-      "proxy": "代理"
+      "proxy": "代理",
+      "toolRuntime": "工具模型"
+    },
+    "toolRuntime": {
+      "enabled": "启用",
+      "provider": "接口类型",
+      "baseUrl": "Base URL",
+      "model": "模型",
+      "apiKey": "API Key",
+      "timeout": "超时（秒）",
+      "providerAnthropic": "Anthropic 接口",
+      "providerOpenaiCompatible": "OpenAI 兼容接口",
+      "testConnection": "测试连接",
+      "testing": "测试中"
     },
     "accounts": {
       "email": "邮箱",
@@ -134,7 +148,12 @@
     "title": "日志",
     "tabs": {
       "request": "请求日志",
-      "runtime": "运行日志"
+      "runtime": "运行日志",
+      "toolRuntime": "工具日志"
+    },
+    "toolRuntimeLogs": {
+      "decision": "决策",
+      "toolNames": "工具名称"
     },
     "requestLogs": {
       "description": "最近 100 条请求（每 5 秒自动刷新）",

@@ -63,10 +63,8 @@ fn build_tool_instruction_text(req: &ChatCompletionRequest) -> String {
                         .map(|obj| {
                             obj.iter()
                                 .map(|(k, v)| {
-                                    let desc = v
-                                        .get("description")
-                                        .and_then(|d| d.as_str())
-                                        .unwrap_or("");
+                                    let desc =
+                                        v.get("description").and_then(|d| d.as_str()).unwrap_or("");
                                     format!("      - **{}**: {}", k, desc)
                                 })
                                 .collect::<Vec<_>>()
@@ -137,8 +135,9 @@ pub fn convert_request(
                     let calls: Vec<serde_json::Value> = tool_calls
                         .iter()
                         .map(|tc| {
-                            let args: serde_json::Value = serde_json::from_str(&tc.function.arguments)
-                                .unwrap_or(serde_json::Value::Object(serde_json::Map::new()));
+                            let args: serde_json::Value =
+                                serde_json::from_str(&tc.function.arguments)
+                                    .unwrap_or(serde_json::Value::Object(serde_json::Map::new()));
                             serde_json::json!({
                                 "name": tc.function.name,
                                 "arguments": args,
@@ -264,8 +263,7 @@ mod tests {
     #[test]
     fn test_thinking_detection() {
         let req = make_simple_request("user", "hello");
-        let result =
-            convert_request(&req, "deepseek_chat::deepseek-r1-thinking", false).unwrap();
+        let result = convert_request(&req, "deepseek_chat::deepseek-r1-thinking", false).unwrap();
         assert!(result.thinking);
     }
 
@@ -295,9 +293,11 @@ mod tests {
             tools: None,
         };
         let result = convert_request(&req, "test", false).unwrap();
-        assert!(result
-            .text
-            .contains(r#"<tool_result name="read_file">file content here</tool_result>"#));
+        assert!(
+            result
+                .text
+                .contains(r#"<tool_result name="read_file">file content here</tool_result>"#)
+        );
     }
 
     #[test]

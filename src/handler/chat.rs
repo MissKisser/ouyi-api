@@ -1,36 +1,37 @@
 use std::sync::Arc;
 
+use axum::Json;
 use axum::extract::State;
 use axum::response::IntoResponse;
 use axum::response::sse::{Event, Sse};
-use axum::Json;
 use futures::stream::StreamExt;
 use tokio_stream::wrappers::ReceiverStream;
 
+use crate::AppState;
 use crate::adapter::request::convert_request;
 use crate::adapter::response::{SseCollector, StreamConverter};
 use crate::client::http::OuyiHttpClient;
-use crate::client::session::{spawn_session_cleanup, GuardedStream};
-use crate::client::sse::{parse_sse_line, SseLineBuffer};
+use crate::client::session::{GuardedStream, spawn_session_cleanup};
+use crate::client::sse::{SseLineBuffer, parse_sse_line};
 use crate::error::AppError;
 use crate::model::openai::ChatCompletionRequest;
-use crate::AppState;
 
 pub async fn chat_completions(
     State(state): State<Arc<AppState>>,
     Json(req): Json<ChatCompletionRequest>,
 ) -> Result<axum::response::Response, AppError> {
+    let config = state.config.read().await.clone();
+
     // 请求大小检查
     let messages_size: usize = req
         .messages
         .iter()
         .map(|m| m.content.as_deref().unwrap_or("").len())
         .sum();
-    if messages_size > state.config.limits.max_messages_bytes {
+    if messages_size > config.limits.max_messages_bytes {
         return Err(AppError::PayloadTooLarge(format!(
             "消息总大小 {} 超过限制 {}",
-            messages_size,
-            state.config.limits.max_messages_bytes
+            messages_size, config.limits.max_messages_bytes
         )));
     }
 
@@ -42,25 +43,27 @@ pub async fn chat_completions(
     let start_time = std::time::Instant::now();
 
     // 请求转换
-    let ouyi_req = convert_request(&req, &model_full, should_thinking)
-        .map_err(AppError::Internal)?;
+    let ouyi_req =
+        convert_request(&req, &model_full, should_thinking).map_err(AppError::Internal)?;
 
     // 优先从账号池获取 token，否则使用配置的 JWT
     let jwt_token = match state.account_store.get_next_token().await {
         Some(token) => token,
-        None => state.config.ouyi.jwt_token.clone(),
+        None => config.ouyi.jwt_token.clone(),
     };
 
     if jwt_token.is_empty() {
-        return Err(AppError::BadRequest("未配置 JWT token 且无可用账号 token".to_string()));
+        return Err(AppError::BadRequest(
+            "未配置 JWT token 且无可用账号 token".to_string(),
+        ));
     }
 
     // 创建HTTP客户端
     let client = OuyiHttpClient::new(
         state.http_client.clone(),
-        state.config.ouyi.base_url.clone(),
+        config.ouyi.base_url.clone(),
         jwt_token,
-        state.config.ouyi.app_version.clone(),
+        config.ouyi.app_version.clone(),
     );
 
     // 创建会话
@@ -68,7 +71,9 @@ pub async fn chat_completions(
         Ok(s) => s,
         Err(e) => {
             let msg = format!("创建会话失败: {}", e);
-            state.stats.record_error(start_time.elapsed().as_millis() as u64, &model_full, &msg);
+            state
+                .stats
+                .record_error(start_time.elapsed().as_millis() as u64, &model_full, &msg);
             return Err(AppError::Upstream(msg));
         }
     };
@@ -97,9 +102,18 @@ pub async fn chat_completions(
 
     let elapsed = start_time.elapsed().as_millis() as u64;
     if req.stream {
-        handle_stream_response(resp, model_full, session_id, client, state.clone(), start_time).await
+        handle_stream_response(
+            resp,
+            model_full,
+            session_id,
+            client,
+            state.clone(),
+            start_time,
+        )
+        .await
     } else {
-        handle_non_stream_response(resp, model_full, session_id, client, state.clone(), elapsed).await
+        handle_non_stream_response(resp, model_full, session_id, client, state.clone(), elapsed)
+            .await
     }
 }
 
@@ -193,7 +207,9 @@ async fn handle_stream_response(
 
         let (prompt, completion) = converter.tokens();
         let stream_elapsed = start_time.elapsed().as_millis() as u64;
-        state.stats.record_success(stream_elapsed, prompt, completion, &model_for_stats);
+        state
+            .stats
+            .record_success(stream_elapsed, prompt, completion, &model_for_stats);
         state.active_sessions.remove(&session_id);
 
         // 发送 [DONE]
@@ -232,7 +248,7 @@ async fn handle_non_stream_response(
     futures::pin_mut!(guarded);
 
     let mut total_bytes: usize = 0;
-    let max_bytes = state.config.limits.max_response_bytes;
+    let max_bytes = state.config.read().await.limits.max_response_bytes;
     let mut partial = Vec::new();
 
     while let Some(chunk_result) = guarded.next().await {
@@ -284,7 +300,9 @@ async fn handle_non_stream_response(
 
     spawn_session_cleanup(client, session_id);
     state.active_sessions.remove(&session_id);
-    state.stats.record_success(elapsed, prompt, completion, &model);
+    state
+        .stats
+        .record_success(elapsed, prompt, completion, &model);
 
     Ok(Json(response).into_response())
 }

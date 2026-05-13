@@ -2,8 +2,8 @@ use axum::extract::State;
 use axum::response::IntoResponse;
 use std::sync::Arc;
 
-use crate::model::openai::{ModelInfo, ModelListResponse};
 use crate::AppState;
+use crate::model::openai::{ModelInfo, ModelListResponse};
 
 pub async fn list_models(State(state): State<Arc<AppState>>) -> impl IntoResponse {
     let short_names = state.model_mapper.get_all_short_names();

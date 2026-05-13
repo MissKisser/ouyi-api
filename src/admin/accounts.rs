@@ -62,11 +62,14 @@ impl AccountStore {
             if let Some(old) = runtime.remove(&key) {
                 new_runtime.insert(key, old);
             } else {
-                new_runtime.insert(key, AccountRuntime {
-                    state: AccountState::Idle,
-                    last_used_at: None,
-                    request_count: 0,
-                });
+                new_runtime.insert(
+                    key,
+                    AccountRuntime {
+                        state: AccountState::Idle,
+                        last_used_at: None,
+                        request_count: 0,
+                    },
+                );
             }
         }
 
@@ -79,7 +82,12 @@ impl AccountStore {
     }
 
     pub async fn get_runtime_stats(&self) -> Vec<(String, AccountRuntime)> {
-        self.runtime.read().await.iter().map(|(k, v)| (k.clone(), v.clone())).collect()
+        self.runtime
+            .read()
+            .await
+            .iter()
+            .map(|(k, v)| (k.clone(), v.clone()))
+            .collect()
     }
 
     /// 获取下一个可用 token（轮询）
@@ -174,7 +182,14 @@ impl AccountStore {
             }
         }
 
-        PoolStats { total, enabled, idle, busy, error, invalid }
+        PoolStats {
+            total,
+            enabled,
+            idle,
+            busy,
+            error,
+            invalid,
+        }
     }
 }
 

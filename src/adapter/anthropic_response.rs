@@ -1,6 +1,6 @@
-use bytes::Bytes;
 use crate::adapter::tool_call::ToolCallParser;
 use crate::model::anthropic::*;
+use bytes::Bytes;
 
 const THINK_OPEN: &str = "<think";
 const THINK_CLOSE: &str = "</thinking>";
@@ -38,7 +38,6 @@ fn unescape_html_entities(text: &str) -> String {
         .replace("&quot;", "\"")
 }
 
-
 /// 扫描字符串尾部，返回可能构成不完整 `<think` 标签前缀的起始位置。
 fn find_tag_cutoff(s: &str) -> usize {
     let bytes = s.as_bytes();
@@ -60,7 +59,6 @@ fn find_tag_cutoff(s: &str) -> usize {
     }
     len
 }
-
 
 /// 剥离文本中模型自造的 `<tool_result>` 块及其包裹标记。
 /// 上游模型在决定调用工具时，常会在文本中自行编造 tool_result 内容，
@@ -123,7 +121,6 @@ fn strip_tool_result_markers(text: &str) -> String {
     result
 }
 
-
 /// 查找 `<think>` 标签的起始位置，返回 (标签起始位置, 标签内容开始位置)。
 fn find_think_open(s: &str) -> Option<(usize, usize)> {
     let start_pos = s.find(THINK_OPEN)?;
@@ -175,7 +172,10 @@ impl AnthropicStreamConverter {
             think_buffer: String::new(),
             has_tool_use: false,
             last_tool_use_id: None,
-            usage: ResponseUsage { input_tokens: 0, output_tokens: 0 },
+            usage: ResponseUsage {
+                input_tokens: 0,
+                output_tokens: 0,
+            },
             pending_text: String::new(),
             has_content: false,
             done_processed: false,
@@ -258,24 +258,20 @@ impl AnthropicStreamConverter {
                 if let Some((close_start, close_end)) = find_think_close(remaining) {
                     let think_content = &remaining[..close_start];
                     if !think_content.is_empty() {
-                        events.push(serialize_stream_event(
-                            &StreamEvent::ContentBlockDelta {
-                                index: self.next_block_index - 1,
-                                delta: DeltaContent::ThinkingDelta {
-                                    thinking: think_content.to_string(),
-                                },
+                        events.push(serialize_stream_event(&StreamEvent::ContentBlockDelta {
+                            index: self.next_block_index - 1,
+                            delta: DeltaContent::ThinkingDelta {
+                                thinking: think_content.to_string(),
                             },
-                        ));
+                        }));
                     }
                     let idx = self.next_block_index.saturating_sub(1);
-                    events.push(serialize_stream_event(
-                        &StreamEvent::ContentBlockDelta {
-                            index: idx,
-                            delta: DeltaContent::SignatureDelta {
-                                signature: generate_signature(),
-                            },
+                    events.push(serialize_stream_event(&StreamEvent::ContentBlockDelta {
+                        index: idx,
+                        delta: DeltaContent::SignatureDelta {
+                            signature: generate_signature(),
                         },
-                    ));
+                    }));
                     events.push(serialize_stream_event(&StreamEvent::ContentBlockStop {
                         index: idx,
                     }));
@@ -287,14 +283,12 @@ impl AnthropicStreamConverter {
                     let safe_content = &remaining[..cutoff];
                     let tail = &remaining[cutoff..];
                     if !safe_content.is_empty() {
-                        events.push(serialize_stream_event(
-                            &StreamEvent::ContentBlockDelta {
-                                index: self.next_block_index - 1,
-                                delta: DeltaContent::ThinkingDelta {
-                                    thinking: safe_content.to_string(),
-                                },
+                        events.push(serialize_stream_event(&StreamEvent::ContentBlockDelta {
+                            index: self.next_block_index - 1,
+                            delta: DeltaContent::ThinkingDelta {
+                                thinking: safe_content.to_string(),
                             },
-                        ));
+                        }));
                     }
                     self.think_buffer = tail.to_string();
                     return events;
@@ -401,9 +395,9 @@ impl AnthropicStreamConverter {
 
             if self.current_block_type.is_some() {
                 let idx = self.next_block_index.saturating_sub(1);
-                events.push(serialize_stream_event(
-                    &StreamEvent::ContentBlockStop { index: idx },
-                ));
+                events.push(serialize_stream_event(&StreamEvent::ContentBlockStop {
+                    index: idx,
+                }));
                 self.current_block_type = None;
             }
 
@@ -411,15 +405,13 @@ impl AnthropicStreamConverter {
                 let idx = self.next_block_index;
                 let name = func.name.as_deref().unwrap_or("unknown");
                 let id = delta.id.as_deref().unwrap_or("call_0");
-                events.push(serialize_stream_event(
-                    &StreamEvent::ContentBlockStart {
-                        index: idx,
-                        content_block: ContentBlockStart::ToolUse {
-                            id: id.to_string(),
-                            name: name.to_string(),
-                        },
+                events.push(serialize_stream_event(&StreamEvent::ContentBlockStart {
+                    index: idx,
+                    content_block: ContentBlockStart::ToolUse {
+                        id: id.to_string(),
+                        name: name.to_string(),
                     },
-                ));
+                }));
                 self.current_block_type = Some(BlockType::ToolUse);
                 self.has_tool_use = true;
                 self.has_content = true;
@@ -434,14 +426,12 @@ impl AnthropicStreamConverter {
         let mut events = Vec::new();
         if let Some(func) = &delta.function {
             if let Some(args) = &func.arguments {
-                events.push(serialize_stream_event(
-                    &StreamEvent::ContentBlockDelta {
-                        index: self.next_block_index - 1,
-                        delta: DeltaContent::InputJsonDelta {
-                            partial_json: args.clone(),
-                        },
+                events.push(serialize_stream_event(&StreamEvent::ContentBlockDelta {
+                    index: self.next_block_index - 1,
+                    delta: DeltaContent::InputJsonDelta {
+                        partial_json: args.clone(),
                     },
-                ));
+                }));
             }
         }
         events
@@ -500,22 +490,20 @@ impl AnthropicStreamConverter {
             || matches!(self.current_block_type, Some(BlockType::Thinking))
         {
             let idx = self.next_block_index.saturating_sub(1);
-            events.push(serialize_stream_event(
-                &StreamEvent::ContentBlockStop { index: idx },
-            ));
+            events.push(serialize_stream_event(&StreamEvent::ContentBlockStop {
+                index: idx,
+            }));
             self.current_block_type = None;
         }
 
         if self.current_block_type.is_none() {
             let idx = self.next_block_index;
-            events.push(serialize_stream_event(
-                &StreamEvent::ContentBlockStart {
-                    index: idx,
-                    content_block: ContentBlockStart::Text {
-                        text: String::new(),
-                    },
+            events.push(serialize_stream_event(&StreamEvent::ContentBlockStart {
+                index: idx,
+                content_block: ContentBlockStart::Text {
+                    text: String::new(),
                 },
-            ));
+            }));
             self.current_block_type = Some(BlockType::Text);
             self.next_block_index += 1;
         }
@@ -619,9 +607,7 @@ impl AnthropicCollector {
                     if !parsed.normal_text.is_empty() {
                         let cleaned = strip_fabricated_tool_results(&parsed.normal_text);
                         if !cleaned.is_empty() {
-                            content_blocks.push(ResponseContentBlock::Text {
-                                text: cleaned,
-                            });
+                            content_blocks.push(ResponseContentBlock::Text { text: cleaned });
                         }
                     }
                     for delta in parsed.tool_deltas {
@@ -639,7 +625,9 @@ impl AnthropicCollector {
                         }
                     }
                 }
-                if let Some((close_start, close_end)) = find_think_close(&remaining[content_start..]) {
+                if let Some((close_start, close_end)) =
+                    find_think_close(&remaining[content_start..])
+                {
                     let think_content = &remaining[content_start..content_start + close_start];
                     content_blocks.push(ResponseContentBlock::Thinking {
                         thinking: think_content.to_string(),
@@ -659,9 +647,7 @@ impl AnthropicCollector {
                 if !parsed.normal_text.is_empty() {
                     let cleaned = strip_fabricated_tool_results(&parsed.normal_text);
                     if !cleaned.is_empty() {
-                        content_blocks.push(ResponseContentBlock::Text {
-                            text: cleaned,
-                        });
+                        content_blocks.push(ResponseContentBlock::Text { text: cleaned });
                     }
                 }
                 for delta in parsed.tool_deltas {
@@ -696,11 +682,7 @@ impl AnthropicCollector {
             content_blocks.retain(|b| !matches!(b, ResponseContentBlock::Text { .. }));
         }
 
-        let stop_reason = if has_tool_use {
-            "tool_use"
-        } else {
-            "end_turn"
-        };
+        let stop_reason = if has_tool_use { "tool_use" } else { "end_turn" };
 
         let usage = match &self.usage {
             Some(u) => ResponseUsage {
@@ -730,7 +712,11 @@ mod tests {
     use super::*;
 
     fn join_bytes(events: Vec<Bytes>) -> String {
-        events.iter().map(|b| String::from_utf8_lossy(b).to_string()).collect::<Vec<_>>().join("\n")
+        events
+            .iter()
+            .map(|b| String::from_utf8_lossy(b).to_string())
+            .collect::<Vec<_>>()
+            .join("\n")
     }
 
     /// 模拟上游返回 tool_use 文本 → 验证 SSE 事件包含 tool_use 块
@@ -751,9 +737,17 @@ mod tests {
             false,
         );
         let joined = join_bytes(events);
-        assert!(joined.contains("tool_use"), "应包含 tool_use 块: {}", joined);
+        assert!(
+            joined.contains("tool_use"),
+            "应包含 tool_use 块: {}",
+            joined
+        );
         assert!(joined.contains("get_weather"), "应包含工具名: {}", joined);
-        assert!(joined.contains("partial_json"), "应包含 input_json_delta: {}", joined);
+        assert!(
+            joined.contains("partial_json"),
+            "应包含 input_json_delta: {}",
+            joined
+        );
         assert!(joined.contains("Beijing"), "应包含城市参数: {}", joined);
 
         assert!(conv.has_tool_use, "has_tool_use 应为 true");
@@ -779,13 +773,20 @@ mod tests {
     fn test_stream_converter_ignores_text_after_tool_use() {
         let mut conv = AnthropicStreamConverter::new("test-model".into(), "msg_1".into());
 
-        conv.process_ouyi_event(r#"<tool_use>{"name":"test","arguments":{}}</tool_use>"#, false);
+        conv.process_ouyi_event(
+            r#"<tool_use>{"name":"test","arguments":{}}</tool_use>"#,
+            false,
+        );
         assert!(conv.has_tool_use);
 
         // 后续文本应被忽略
         let events = conv.process_ouyi_event("This should be ignored", false);
         let joined = join_bytes(events);
-        assert!(!joined.contains("text_delta"), "tool_use 后的文本应被忽略: {}", joined);
+        assert!(
+            !joined.contains("text_delta"),
+            "tool_use 后的文本应被忽略: {}",
+            joined
+        );
     }
 
     /// 验证纯文本响应正常结束（文本立即输出，不再缓冲到 done）
@@ -796,8 +797,16 @@ mod tests {
         // 文本立即输出（flush_threshold=0）
         let events = conv.process_ouyi_event("Hello world", false);
         let joined = join_bytes(events);
-        assert!(joined.contains(r#""type":"content_block_start""#), "应立即输出 content_block_start: {}", joined);
-        assert!(joined.contains("text_delta"), "应立即输出 text_delta: {}", joined);
+        assert!(
+            joined.contains(r#""type":"content_block_start""#),
+            "应立即输出 content_block_start: {}",
+            joined
+        );
+        assert!(
+            joined.contains("text_delta"),
+            "应立即输出 text_delta: {}",
+            joined
+        );
         assert!(joined.contains("Hello world"), "应包含文本内容: {}", joined);
 
         let done_events = conv.process_ouyi_event("", true);
@@ -843,10 +852,7 @@ mod tests {
         let events = conv2.process_ouyi_event(&long_text, false);
         let _joined = join_bytes(events);
 
-        assert!(
-            conv2.has_content,
-            "文本应立即输出，has_content 应为 true"
-        );
+        assert!(conv2.has_content, "文本应立即输出，has_content 应为 true");
 
         // 发送 done 获得完整事件
         let done2 = conv2.process_ouyi_event("", true);
@@ -868,8 +874,14 @@ some results
 Now I can answer."#;
 
         let cleaned = strip_fabricated_tool_results(input);
-        assert!(!cleaned.contains("<tool_result"), "应移除 <tool_result 标签");
-        assert!(!cleaned.contains("</tool_result>"), "应移除 </tool_result> 标签");
+        assert!(
+            !cleaned.contains("<tool_result"),
+            "应移除 <tool_result 标签"
+        );
+        assert!(
+            !cleaned.contains("</tool_result>"),
+            "应移除 </tool_result> 标签"
+        );
         assert!(cleaned.contains("Let me think about this"));
         assert!(cleaned.contains("Now I can answer"));
         assert!(!cleaned.contains("some results"), "应移除 tool_result 内容");

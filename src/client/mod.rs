@@ -1,3 +1,3 @@
 pub mod http;
-pub mod sse;
 pub mod session;
+pub mod sse;

@@ -1,25 +1,26 @@
 use std::sync::Arc;
 
+use axum::Json;
 use axum::extract::State;
 use axum::response::IntoResponse;
 use axum::response::sse::{Event, Sse};
-use axum::Json;
 use futures::stream::StreamExt;
 use tokio_stream::wrappers::ReceiverStream;
 
+use crate::AppState;
 use crate::adapter::request::convert_request;
 use crate::adapter::response::SseCollector;
 use crate::client::http::OuyiHttpClient;
-use crate::client::session::{spawn_session_cleanup, GuardedStream};
-use crate::client::sse::{parse_sse_line, SseLineBuffer};
+use crate::client::session::{GuardedStream, spawn_session_cleanup};
+use crate::client::sse::{SseLineBuffer, parse_sse_line};
 use crate::error::AppError;
 use crate::model::openai::*;
-use crate::AppState;
 
 pub async fn responses(
     State(state): State<Arc<AppState>>,
     Json(req): Json<ResponsesRequest>,
 ) -> Result<axum::response::Response, AppError> {
+    let config = state.config.read().await.clone();
     let chat_req = convert_responses_to_chat(&req)?;
     let is_stream = req.stream;
 
@@ -34,7 +35,7 @@ pub async fn responses(
 
     let jwt_token = match state.account_store.get_next_token().await {
         Some(token) => token,
-        None => state.config.ouyi.jwt_token.clone(),
+        None => config.ouyi.jwt_token.clone(),
     };
 
     if jwt_token.is_empty() {
@@ -45,16 +46,18 @@ pub async fn responses(
 
     let client = OuyiHttpClient::new(
         state.http_client.clone(),
-        state.config.ouyi.base_url.clone(),
+        config.ouyi.base_url.clone(),
         jwt_token,
-        state.config.ouyi.app_version.clone(),
+        config.ouyi.app_version.clone(),
     );
 
     let session_data = match client.create_session(&model_full).await {
         Ok(s) => s,
         Err(e) => {
             let msg = format!("创建会话失败: {}", e);
-            state.stats.record_error(start_time.elapsed().as_millis() as u64, &model_full, &msg);
+            state
+                .stats
+                .record_error(start_time.elapsed().as_millis() as u64, &model_full, &msg);
             return Err(AppError::Upstream(msg));
         }
     };
@@ -91,9 +94,29 @@ pub async fn responses(
         .unwrap_or_else(|| req.model.clone());
 
     if is_stream {
-        handle_responses_stream(resp, task_id, short_model, model_full, session_id, client, state, start_time).await
+        handle_responses_stream(
+            resp,
+            task_id,
+            short_model,
+            model_full,
+            session_id,
+            client,
+            state,
+            start_time,
+        )
+        .await
     } else {
-        handle_responses_non_stream(resp, task_id, short_model, model_full, session_id, client, state, elapsed).await
+        handle_responses_non_stream(
+            resp,
+            task_id,
+            short_model,
+            model_full,
+            session_id,
+            client,
+            state,
+            elapsed,
+        )
+        .await
     }
 }
 
@@ -143,7 +166,11 @@ async fn handle_responses_stream(
                 "status": "in_progress"
             }
         });
-        let _ = tx.send(Ok(Event::default().event("response.created").data(created_event.to_string()))).await;
+        let _ = tx
+            .send(Ok(Event::default()
+                .event("response.created")
+                .data(created_event.to_string())))
+            .await;
 
         let output_item_added = serde_json::json!({
             "type": "response.output_item.added",
@@ -156,7 +183,11 @@ async fn handle_responses_stream(
                 "content": []
             }
         });
-        let _ = tx.send(Ok(Event::default().event("response.output_item.added").data(output_item_added.to_string()))).await;
+        let _ = tx
+            .send(Ok(Event::default()
+                .event("response.output_item.added")
+                .data(output_item_added.to_string())))
+            .await;
 
         let content_part_added = serde_json::json!({
             "type": "response.content_part.added",
@@ -169,7 +200,11 @@ async fn handle_responses_stream(
                 "annotations": []
             }
         });
-        let _ = tx.send(Ok(Event::default().event("response.content_part.added").data(content_part_added.to_string()))).await;
+        let _ = tx
+            .send(Ok(Event::default()
+                .event("response.content_part.added")
+                .data(content_part_added.to_string())))
+            .await;
 
         futures::pin_mut!(guarded);
 
@@ -210,7 +245,13 @@ async fn handle_responses_stream(
                                         "content_index": 0,
                                         "delta": t
                                     });
-                                    if tx.send(Ok(Event::default().event("response.output_text.delta").data(delta.to_string()))).await.is_err() {
+                                    if tx
+                                        .send(Ok(Event::default()
+                                            .event("response.output_text.delta")
+                                            .data(delta.to_string())))
+                                        .await
+                                        .is_err()
+                                    {
                                         return;
                                     }
                                 }
@@ -218,8 +259,9 @@ async fn handle_responses_stream(
                         }
                         crate::client::sse::OuyiEventType::Object => {
                             if let Some(data) = &event.data {
-                                if let Ok(usage) =
-                                    serde_json::from_value::<crate::model::ouyi::OuyiUsage>(data.clone())
+                                if let Ok(usage) = serde_json::from_value::<
+                                    crate::model::ouyi::OuyiUsage,
+                                >(data.clone())
                                 {
                                     prompt_tokens = usage.prompt_tokens;
                                     completion_tokens = usage.completion_tokens;
@@ -228,8 +270,9 @@ async fn handle_responses_stream(
                         }
                         crate::client::sse::OuyiEventType::Done => {
                             if let Some(data) = &event.data {
-                                if let Ok(usage) =
-                                    serde_json::from_value::<crate::model::ouyi::OuyiUsage>(data.clone())
+                                if let Ok(usage) = serde_json::from_value::<
+                                    crate::model::ouyi::OuyiUsage,
+                                >(data.clone())
                                 {
                                     prompt_tokens = usage.prompt_tokens;
                                     completion_tokens = usage.completion_tokens;
@@ -249,7 +292,11 @@ async fn handle_responses_stream(
             "content_index": 0,
             "text": text_buffer
         });
-        let _ = tx.send(Ok(Event::default().event("response.output_text.done").data(output_text_done.to_string()))).await;
+        let _ = tx
+            .send(Ok(Event::default()
+                .event("response.output_text.done")
+                .data(output_text_done.to_string())))
+            .await;
 
         let content_part_done = serde_json::json!({
             "type": "response.content_part.done",
@@ -262,7 +309,11 @@ async fn handle_responses_stream(
                 "annotations": []
             }
         });
-        let _ = tx.send(Ok(Event::default().event("response.content_part.done").data(content_part_done.to_string()))).await;
+        let _ = tx
+            .send(Ok(Event::default()
+                .event("response.content_part.done")
+                .data(content_part_done.to_string())))
+            .await;
 
         let output_item_done = serde_json::json!({
             "type": "response.output_item.done",
@@ -279,7 +330,11 @@ async fn handle_responses_stream(
                 }]
             }
         });
-        let _ = tx.send(Ok(Event::default().event("response.output_item.done").data(output_item_done.to_string()))).await;
+        let _ = tx
+            .send(Ok(Event::default()
+                .event("response.output_item.done")
+                .data(output_item_done.to_string())))
+            .await;
 
         let completed = serde_json::json!({
             "type": "response.completed",
@@ -306,10 +361,19 @@ async fn handle_responses_stream(
                 }
             }
         });
-        let _ = tx.send(Ok(Event::default().event("response.completed").data(completed.to_string()))).await;
+        let _ = tx
+            .send(Ok(Event::default()
+                .event("response.completed")
+                .data(completed.to_string())))
+            .await;
 
         let stream_elapsed = start_time.elapsed().as_millis() as u64;
-        state.stats.record_success(stream_elapsed, prompt_tokens, completion_tokens, &model_for_stats);
+        state.stats.record_success(
+            stream_elapsed,
+            prompt_tokens,
+            completion_tokens,
+            &model_for_stats,
+        );
         state.active_sessions.remove(&session_id);
     });
 
@@ -346,7 +410,7 @@ async fn handle_responses_non_stream(
     futures::pin_mut!(guarded);
 
     let mut total_bytes: usize = 0;
-    let max_bytes = state.config.limits.max_response_bytes;
+    let max_bytes = state.config.read().await.limits.max_response_bytes;
     let mut partial = Vec::new();
 
     while let Some(chunk_result) = guarded.next().await {
@@ -396,7 +460,9 @@ async fn handle_responses_non_stream(
 
     spawn_session_cleanup(client, session_id);
     state.active_sessions.remove(&session_id);
-    state.stats.record_success(elapsed, prompt, completion, &model_full);
+    state
+        .stats
+        .record_success(elapsed, prompt, completion, &model_full);
 
     let response = build_responses_response(&model, task_id, chat_response);
     Ok(Json(response).into_response())
@@ -493,7 +559,10 @@ fn convert_responses_to_chat(req: &ResponsesRequest) -> Result<ChatCompletionReq
         stream: false,
         temperature: req.temperature,
         max_tokens: req.max_output_tokens,
-        tools: req.tools.as_ref().map(|tools| convert_responses_tools(tools)),
+        tools: req
+            .tools
+            .as_ref()
+            .map(|tools| convert_responses_tools(tools)),
     })
 }
 
@@ -525,19 +594,19 @@ fn convert_responses_tools(tools: &[serde_json::Value]) -> Vec<ToolDef> {
 fn extract_text_content(content: Option<&serde_json::Value>) -> String {
     match content {
         Some(serde_json::Value::String(s)) => s.clone(),
-        Some(serde_json::Value::Array(parts)) => {
-            parts
-                .iter()
-                .filter_map(|p| {
-                    if p.get("type").and_then(|t| t.as_str()) == Some("input_text") {
-                        p.get("text").and_then(|t| t.as_str()).map(|s| s.to_string())
-                    } else {
-                        None
-                    }
-                })
-                .collect::<Vec<_>>()
-                .join("")
-        }
+        Some(serde_json::Value::Array(parts)) => parts
+            .iter()
+            .filter_map(|p| {
+                if p.get("type").and_then(|t| t.as_str()) == Some("input_text") {
+                    p.get("text")
+                        .and_then(|t| t.as_str())
+                        .map(|s| s.to_string())
+                } else {
+                    None
+                }
+            })
+            .collect::<Vec<_>>()
+            .join(""),
         _ => String::new(),
     }
 }

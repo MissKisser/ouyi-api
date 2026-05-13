@@ -28,6 +28,26 @@ pub enum RuntimeRoute {
     ConfigError(String),
 }
 
+/// 模型路由信息，区分客户端模型、有效模型和欧亿模型
+#[derive(Debug, Clone)]
+struct ModelRouting {
+    client_model: String,
+    effective_model: String,
+    ouyi_model: String,
+}
+
+/// 根据请求模型名和模型映射器解析路由信息
+fn resolve_model_routing(req_model: &str, mapper: &crate::model::mapper::ModelMapper) -> ModelRouting {
+    let client_model = req_model.to_string();
+    let effective_model = req_model.to_string();
+    let ouyi_model = mapper.to_ouyi(&effective_model);
+    ModelRouting {
+        client_model,
+        effective_model,
+        ouyi_model,
+    }
+}
+
 /// 根据请求与配置返回工具运行时路由决策
 pub fn runtime_route(
     req: &MessagesRequest,
@@ -111,13 +131,22 @@ fn has_tool_result(req: &MessagesRequest) -> bool {
     })
 }
 
+fn tool_count(req: &MessagesRequest) -> usize {
+    req.tools.as_ref().map(|tools| tools.len()).unwrap_or(0)
+}
+
+/// 生成全局工具会话缓存 key（模型无关）
+fn global_tool_session_cache_key(tool_use_id: &str) -> String {
+    format!("tool:{}", tool_use_id)
+}
+
 /// 生成会话缓存 key：模型名 + 最后一个 tool_use_id
 fn session_cache_key(model: &str, tool_use_id: &str) -> String {
     format!("{}:{}", model, tool_use_id)
 }
 
 fn session_cache_keys(primary_model: &str, request_model: &str, tool_use_id: &str) -> Vec<String> {
-    let mut keys = Vec::new();
+    let mut keys = vec![global_tool_session_cache_key(tool_use_id)];
     for model in [primary_model, request_model] {
         let key = session_cache_key(model, tool_use_id);
         if !keys.contains(&key) {
@@ -133,12 +162,19 @@ fn take_cached_tool_session(
     request_model: &str,
     tool_use_id: &str,
 ) -> Option<(String, crate::CachedToolSession)> {
+    let keys = session_cache_keys(primary_model, request_model, tool_use_id);
     let mut found = None;
-    for key in session_cache_keys(primary_model, request_model, tool_use_id) {
-        if let Some((removed_key, cached)) = state.tool_sessions.remove(&key)
+    for key in &keys {
+        if let Some((removed_key, cached)) = state.tool_sessions.remove(key)
             && found.is_none()
         {
             found = Some((removed_key, cached));
+        }
+    }
+    // 清理所有相关 keys（跨模型复用时可能有多个残留）
+    if found.is_some() {
+        for key in &keys {
+            state.tool_sessions.remove(key);
         }
     }
     found
@@ -146,21 +182,40 @@ fn take_cached_tool_session(
 
 fn insert_cached_tool_session(
     state: &AppState,
-    primary_model: &str,
-    request_model: &str,
+    _primary_model: &str,
+    _request_model: &str,
     tool_use_id: &str,
     session_id: i64,
 ) {
-    for key in session_cache_keys(primary_model, request_model, tool_use_id) {
-        state.tool_sessions.insert(
-            key,
-            crate::CachedToolSession {
-                session_id,
-                model: primary_model.to_string(),
-                created_at: std::time::Instant::now(),
-            },
-        );
+    // 只存储全局 key，实现跨模型复用
+    let key = global_tool_session_cache_key(tool_use_id);
+    state.tool_sessions.insert(
+        key,
+        crate::CachedToolSession {
+            session_id,
+            created_at: std::time::Instant::now(),
+        },
+    );
+}
+
+fn truncate_utf8_by_byte_limit_with_notice(content: &str, max_bytes: usize) -> String {
+    if content.len() <= max_bytes {
+        return content.to_string();
     }
+    let char_count = content.chars().count();
+    let truncated: String = content
+        .chars()
+        .scan(0usize, |bytes, ch| {
+            let next = *bytes + ch.len_utf8();
+            if next > max_bytes {
+                None
+            } else {
+                *bytes = next;
+                Some(ch)
+            }
+        })
+        .collect();
+    format!("{truncated}\n\n[...内容截断，共 {char_count} 字符...]")
 }
 
 /// 从请求中提取 tool_result 内容，格式化为下游客话增量文本。
@@ -180,15 +235,7 @@ fn format_tool_results_for_reuse(req: &MessagesRequest) -> String {
                         .get(tool_use_id.as_str())
                         .map(|s| s.as_str())
                         .unwrap_or(tool_use_id.as_str());
-                    let display_content = if content.len() > 2000 {
-                        format!(
-                            "{}\n\n[...内容截断，共 {} 字符...]",
-                            &content[..2000],
-                            content.len()
-                        )
-                    } else {
-                        content.clone()
-                    };
+                    let display_content = truncate_utf8_by_byte_limit_with_notice(content, 2000);
                     parts.push(format!(
                         "工具 {} 的执行结果：\n{}",
                         tool_name, display_content
@@ -270,7 +317,6 @@ fn maybe_build_long_task_poll_response(
     let Some((tool_use_id, content)) = latest_tool_result_content(req) else {
         return Ok(None);
     };
-    let session_key = format!("{}:{}", req.model, tool_use_id);
     let Some(task) = state.tool_ledger.long_task_for_tool_use(&tool_use_id, &req.model) else {
         return Ok(None);
     };
@@ -295,11 +341,6 @@ fn maybe_build_long_task_poll_response(
                     updated.file_path
                 )));
             }
-            // 记录新的 poll 工具调用到 ledger
-            let poll_key = format!("{}:poll_{}", req.model, uuid_short());
-            state.tool_ledger.record_tool_use(&poll_key, &poll_key, "Bash")?;
-            state.tool_ledger.link_poll_to_long_task(&poll_key, &task.task_id)?;
-
             let plan = crate::tool_runtime::broker::LongTaskPlan {
                 file_path: updated.file_path,
                 done_marker: updated.done_marker,
@@ -311,6 +352,14 @@ fn maybe_build_long_task_poll_response(
                 req.tools.as_deref().unwrap_or(&[]),
             )
             .map_err(AppError::BadRequest)?;
+            let poll_key = format!("{}:{}", req.model, call.id);
+            state
+                .tool_ledger
+                .record_tool_use(&poll_key, &call.id, "Bash")?;
+            state
+                .tool_ledger
+                .link_poll_to_long_task(&poll_key, &task.task_id)?;
+
             let calls = vec![crate::tool_runtime::openai_compiler::CompiledToolCall {
                 id: call.id,
                 name: call.name,
@@ -462,12 +511,32 @@ pub async fn messages(
     State(state): State<Arc<AppState>>,
     Json(req): Json<MessagesRequest>,
 ) -> Result<axum::response::Response, AppError> {
+    let routing = resolve_model_routing(&req.model, &state.model_mapper);
+    let config = state.config.read().await.clone();
+    let route = runtime_route(&req, config.tool_runtime.as_ref());
+    let route_name = match &route {
+        RuntimeRoute::OriginalOuyi => "ouyi",
+        RuntimeRoute::Compiler => "compiler",
+        RuntimeRoute::ConfigError(_) => "config_error",
+    };
+    let tools_count = tool_count(&req);
     tracing::info!(
-        model = %req.model,
+        route = route_name,
+        ouyi_model = %routing.ouyi_model,
+        ouyi_base_url = %config.ouyi.base_url,
+        messages_count = req.messages.len(),
+        tools = tools_count,
+        "主模型请求"
+    );
+    tracing::debug!(
+        route = route_name,
+        client_model = %routing.client_model,
+        effective_model = %routing.effective_model,
+        ouyi_model = %routing.ouyi_model,
         messages_count = req.messages.len(),
         stream = ?req.stream,
-        has_tools = req.tools.is_some(),
-        "Anthropic messages 请求"
+        tools = tools_count,
+        "模型路由详情"
     );
 
     // 优先检查长时任务轮询（broker continuation 统一入口）
@@ -477,15 +546,11 @@ pub async fn messages(
         }
     }
 
-    // 使用新的路由决策
-    let config = state.config.read().await.clone();
-    let route = runtime_route(&req, config.tool_runtime.as_ref());
     match route {
         RuntimeRoute::OriginalOuyi => {
-            // 原 Ouyi 链路
-            handle_original_ouyi_message(state, req).await
+            handle_original_ouyi_message(state, req, routing).await
         }
-        RuntimeRoute::Compiler => handle_compiler_tool_runtime_message(state, req).await,
+        RuntimeRoute::Compiler => handle_compiler_tool_runtime_message(state, req, routing).await,
         RuntimeRoute::ConfigError(msg) => Err(AppError::Config(msg)),
     }
 }
@@ -494,13 +559,19 @@ pub async fn messages(
 async fn handle_original_ouyi_message(
     state: Arc<AppState>,
     req: MessagesRequest,
+    routing: ModelRouting,
 ) -> Result<axum::response::Response, AppError> {
     let config = state.config.read().await.clone();
-    let model_full = state.model_mapper.to_ouyi(&req.model);
-    tracing::info!(model = %req.model, full = %model_full, "模型映射结果");
+    tracing::debug!(
+        client_model = %routing.client_model,
+        effective_model = %routing.effective_model,
+        ouyi_model = %routing.ouyi_model,
+        "模型映射结果"
+    );
 
-    let short_model = req.model.clone();
-    let should_thinking = state.model_mapper.should_thinking(&req.model)
+    let short_model = routing.client_model.clone();
+    let model_full = routing.ouyi_model.clone();
+    let should_thinking = state.model_mapper.should_thinking(&routing.effective_model)
         || matches!(
             req.thinking,
             Some(crate::model::anthropic::ThinkingConfig::Enabled { .. })
@@ -523,7 +594,7 @@ async fn handle_original_ouyi_message(
         let tid = tool_use_id.as_ref().unwrap();
         match take_cached_tool_session(&state, &model_full, &short_model, tid) {
             Some((key, cached)) => {
-                tracing::info!(session_id = cached.session_id, tool_use_id = %tid, "复用工具会话");
+                tracing::debug!(session_id = cached.session_id, tool_use_id = %tid, "复用工具会话");
                 // 复用缓存的 session_id，但创建新的 client
                 let jwt_token = match state.account_store.get_next_token().await {
                     Some(token) => token,
@@ -543,7 +614,7 @@ async fn handle_original_ouyi_message(
                 (cached.session_id, client, Some(key))
             }
             None => {
-                tracing::warn!(tool_use_id = %tid, "工具会话缓存未命中，创建新会话");
+                tracing::debug!(tool_use_id = %tid, "工具会话缓存未命中，创建新会话");
                 let jwt_token = match state.account_store.get_next_token().await {
                     Some(token) => token,
                     None => config.ouyi.jwt_token.clone(),
@@ -639,7 +710,6 @@ async fn handle_original_ouyi_message(
         handle_anthropic_stream(
             resp,
             short_model,
-            model_full,
             session_id,
             client,
             state.clone(),
@@ -665,16 +735,16 @@ async fn handle_original_ouyi_message(
 async fn handle_compiler_tool_runtime_message(
     state: Arc<AppState>,
     req: MessagesRequest,
+    routing: ModelRouting,
 ) -> Result<axum::response::Response, AppError> {
     use crate::tool_runtime::broker::BrokerDecision;
 
     let app_config = state.config.read().await.clone();
     let tool_runtime_config = app_config.tool_runtime.as_ref();
 
-    // 转换请求为 Ouyi 格式
-    let model_full = state.model_mapper.to_ouyi(&req.model);
-    let short_model = req.model.clone();
-    let should_thinking = state.model_mapper.should_thinking(&req.model)
+    let short_model = routing.client_model.clone();
+    let model_full = routing.ouyi_model.clone();
+    let should_thinking = state.model_mapper.should_thinking(&routing.effective_model)
         || matches!(
             req.thinking,
             Some(crate::model::anthropic::ThinkingConfig::Enabled { .. })
@@ -710,7 +780,7 @@ async fn handle_compiler_tool_runtime_message(
         let tid = tool_use_id.as_ref().unwrap();
         match take_cached_tool_session(&state, &model_full, &short_model, tid) {
             Some((key, cached)) => {
-                tracing::info!(
+                tracing::debug!(
                     session_id = cached.session_id,
                     tool_use_id = %tid,
                     "Compiler 模式复用工具会话"
@@ -718,7 +788,7 @@ async fn handle_compiler_tool_runtime_message(
                 (cached.session_id, Some(key))
             }
             None => {
-                tracing::warn!(tool_use_id = %tid, "Compiler 工具会话缓存未命中，创建新会话");
+                tracing::debug!(tool_use_id = %tid, "Compiler 工具会话缓存未命中，创建新会话");
                 let session_data = match client.create_session(&model_full).await {
                     Ok(s) => s,
                     Err(e) => {
@@ -809,7 +879,8 @@ async fn handle_compiler_tool_runtime_message(
     tracing::info!(
         provider = %broker_provider,
         model = %broker_model,
-        "Broker 解析工具意图"
+        base_url = %broker_base_url,
+        "工具模型请求"
     );
     let broker_result = match tool_runtime::broker::decide_with_broker(
         state.http_client.clone(),
@@ -856,7 +927,7 @@ async fn handle_compiler_tool_runtime_message(
                     .map(|c| c.name.as_str())
                     .collect::<Vec<_>>()
                     .join(","),
-                "Broker 决策：工具调用"
+                "工具决策"
             );
 
             let compiled_calls = calls
@@ -936,13 +1007,13 @@ async fn handle_compiler_tool_runtime_message(
             }
         }
         BrokerDecision::FinalAnswer { usage } => {
-            tracing::info!("Broker 决策：最终回答");
+            tracing::info!("工具决策：最终回答");
             let latest_user_text = latest_user_plain_text(&req);
             let (response_text, final_prompt_tokens, final_completion_tokens) =
                 match normalize_ouyi_display_text(&ouyi_output, latest_user_text.as_deref()) {
                     text if !text.is_empty() => (text, prompt_tokens, completion_tokens),
                     _ => {
-                        tracing::info!("主脑展示文本为空，请求 Ouyi 补全最终回答");
+                        tracing::debug!("主脑展示文本为空，请求 Ouyi 补全最终回答");
                         let (final_output, answer_prompt_tokens, answer_completion_tokens) =
                             request_final_answer_after_suppressed_tool_intent(
                                 &client,
@@ -1302,7 +1373,6 @@ fn build_text_stream_response(
 async fn handle_anthropic_stream(
     resp: reqwest::Response,
     model: String,
-    model_full: String,
     session_id: i64,
     client: OuyiHttpClient,
     state: Arc<AppState>,
@@ -1320,14 +1390,13 @@ async fn handle_anthropic_stream(
 
     let model_for_stats = model.clone();
     let model_for_task = model.clone();
-    let model_full_for_cache = model_full.clone();
     let task_id_for_task = task_id.clone();
 
     let state_for_stream = state.clone();
 
     let (tx, rx) = tokio::sync::mpsc::channel::<Bytes>(32);
 
-    tracing::info!(session_id, "启动 Anthropic 流式响应");
+    tracing::debug!(session_id, "启动 Anthropic 流式响应");
 
     tokio::spawn(async move {
         let mut converter = AnthropicStreamConverter::new(model_for_task, task_id_for_task);
@@ -1337,7 +1406,7 @@ async fn handle_anthropic_stream(
         futures::pin_mut!(guarded);
 
         let start_evt = converter.start_event();
-        tracing::info!(event_len = start_evt.len(), "发送 message_start");
+        tracing::debug!(event_len = start_evt.len(), "发送 message_start");
         if tx.send(start_evt).await.is_err() {
             tracing::warn!("发送 message_start 失败，channel 已关闭");
             return;
@@ -1379,16 +1448,12 @@ async fn handle_anthropic_stream(
                     let content = event.data.as_ref().and_then(|d| d.as_str()).unwrap_or("");
                     let is_done = event_type == crate::client::sse::OuyiEventType::Done;
 
-                    if event_type == crate::client::sse::OuyiEventType::StringChunk {
-                        tracing::info!(content_len = content.len(), content_preview = %content.chars().take(200).collect::<String>(), "上游 string 事件");
-                    } else {
-                        tracing::info!(
-                            event_type = event.event_type,
-                            is_done,
-                            content_len = content.len(),
-                            "上游事件"
-                        );
-                    }
+                    tracing::debug!(
+                        event_type = event.event_type,
+                        is_done,
+                        content_len = content.len(),
+                        "上游事件"
+                    );
 
                     if event_type == crate::client::sse::OuyiEventType::Object {
                         if let Some(data) = &event.data {
@@ -1416,14 +1481,16 @@ async fn handle_anthropic_stream(
         }
 
         if !converter.done_processed {
-            tracing::info!("上游流结束，发送 done 事件");
+            tracing::debug!("上游流结束，发送 done 事件");
             for evt in converter.process_ouyi_event("", true) {
                 let _ = tx.send(evt).await;
             }
         }
 
         tracing::info!(
-            chunk_count,
+            session_id,
+            model = %model_for_stats,
+            chunks = chunk_count,
             has_tool_use = converter.has_tool_use,
             "流式处理完成"
         );
@@ -1447,16 +1514,15 @@ async fn handle_anthropic_stream(
             // 缓存会话 ID 供下一轮 tool_result 复用
             let last_tool_id = converter.last_tool_use_id.clone();
             if let Some(tool_id) = last_tool_id {
-                let key = session_cache_key(&model_full_for_cache, &tool_id);
+                let key = global_tool_session_cache_key(&tool_id);
                 state_for_stream.tool_sessions.insert(
                     key,
                     crate::CachedToolSession {
                         session_id,
-                        model: model.clone(),
                         created_at: std::time::Instant::now(),
                     },
                 );
-                tracing::info!(session_id, tool_use_id = %tool_id, "缓存工具会话等待 tool_result 回传");
+                tracing::debug!(session_id, tool_use_id = %tool_id, "缓存工具会话等待 tool_result 回传");
             }
         } else {
             // end_turn：清理会话和可能的旧缓存
@@ -1471,7 +1537,7 @@ async fn handle_anthropic_stream(
     // 会话的清理/缓存在 spawn 的 task 中根据 has_tool_use 决定
 
     // 确保 hs 日志能在调试时被看到
-    tracing::info!(session_id, "Anthropic SSE 流构建完成，返回响应");
+    tracing::debug!(session_id, "Anthropic SSE 流构建完成，返回响应");
 
     let stream = ReceiverStream::new(rx);
     let body = axum::body::Body::from_stream(stream.map(|b| Ok::<_, std::io::Error>(b)));
@@ -1572,12 +1638,11 @@ async fn handle_anthropic_non_stream(
             }
         });
         if let Some(tool_id) = last_tool_id {
-            let key = session_cache_key(&model, &tool_id);
+            let key = global_tool_session_cache_key(&tool_id);
             state.tool_sessions.insert(
                 key,
                 crate::CachedToolSession {
                     session_id,
-                    model: model.clone(),
                     created_at: std::time::Instant::now(),
                 },
             );
@@ -1712,6 +1777,18 @@ mod tests {
     }
 
     #[test]
+    fn test_format_tool_results_for_reuse_truncation_handles_multibyte_text() {
+        let long_content = "方".repeat(1000);
+        let tool_result = make_tool_result_msg("call_0", &long_content);
+        let req = make_messages_request(vec![tool_result]);
+
+        let result = format_tool_results_for_reuse(&req);
+
+        assert!(result.contains("截断"));
+        assert!(result.contains("1000"));
+    }
+
+    #[test]
     fn test_format_tool_results_for_reuse_empty() {
         let msg = AnthropicMessage {
             role: "assistant".to_string(),
@@ -1759,6 +1836,23 @@ mod tests {
         };
         let req = make_messages_request(vec![msg]);
         assert_eq!(extract_last_tool_use_id(&req), Some("call_1".to_string()));
+    }
+
+    #[test]
+    fn test_tool_count_treats_empty_tools_as_zero() {
+        let mut req = make_messages_request(vec![AnthropicMessage {
+            role: "user".to_string(),
+            content: AnthropicContent::Text("hello".to_string()),
+        }]);
+
+        req.tools = None;
+        assert_eq!(tool_count(&req), 0);
+
+        req.tools = Some(vec![]);
+        assert_eq!(tool_count(&req), 0);
+
+        req.tools = Some(vec![bash_tool()]);
+        assert_eq!(tool_count(&req), 1);
     }
 
     #[test]
@@ -2042,8 +2136,9 @@ mod tests {
         let mut req = make_request_with_tools();
         req.stream = Some(false);
         req.tools = Some(vec![bash_tool()]);
+        let routing = resolve_model_routing(&req.model, &state.model_mapper);
 
-        let response = handle_compiler_tool_runtime_message(state.clone(), req)
+        let response = handle_compiler_tool_runtime_message(state.clone(), req, routing)
             .await
             .unwrap();
         assert_eq!(response.status(), StatusCode::OK);
@@ -2077,8 +2172,9 @@ mod tests {
         let mut req = make_request_with_tools();
         req.stream = Some(false);
         req.tools = Some(vec![bash_tool()]);
+        let routing = resolve_model_routing(&req.model, &state.model_mapper);
 
-        let response = handle_compiler_tool_runtime_message(state.clone(), req)
+        let response = handle_compiler_tool_runtime_message(state.clone(), req, routing)
             .await
             .unwrap();
         assert_eq!(response.status(), StatusCode::OK);
@@ -2112,8 +2208,9 @@ mod tests {
         let mut req = make_request_with_tools();
         req.stream = Some(false);
         req.tools = Some(vec![bash_tool()]);
+        let routing = resolve_model_routing(&req.model, &state.model_mapper);
 
-        let response = handle_compiler_tool_runtime_message(state, req).await.unwrap();
+        let response = handle_compiler_tool_runtime_message(state, req, routing).await.unwrap();
         assert_eq!(response.status(), StatusCode::OK);
         assert_eq!(tool_requests.load(Ordering::SeqCst), 1);
 
@@ -2147,8 +2244,9 @@ mod tests {
         let mut req = make_request_with_tools();
         req.stream = Some(true);
         req.tools = Some(vec![bash_tool()]);
+        let routing = resolve_model_routing(&req.model, &state.model_mapper);
 
-        let response = handle_compiler_tool_runtime_message(state, req)
+        let response = handle_compiler_tool_runtime_message(state, req, routing)
             .await
             .unwrap();
         assert_eq!(response.status(), StatusCode::OK);
@@ -2186,8 +2284,9 @@ mod tests {
             "tool_call_from_compiler",
             "Get-Process output",
         ));
+        let routing = resolve_model_routing(&req.model, &state.model_mapper);
 
-        let response = handle_compiler_tool_runtime_message(state, req)
+        let response = handle_compiler_tool_runtime_message(state, req, routing)
             .await
             .unwrap();
         assert_eq!(response.status(), StatusCode::OK);
@@ -2218,6 +2317,161 @@ mod tests {
 
         assert_eq!(cached.1.session_id, 42);
         assert!(state.tool_sessions.is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_tool_session_cache_survives_request_model_change() {
+        let state = make_test_state(test_config(
+            "http://127.0.0.1:1".to_string(),
+            "http://127.0.0.1:2".to_string(),
+        ));
+        let full_model = "claude_chat::claude-sonnet-4-5-20250929-vip";
+        let short_model = "claude-sonnet-4-5";
+        let different_model = "claude-opus-4-7";
+
+        insert_cached_tool_session(&state, full_model, short_model, "call_9", 42);
+
+        let cached = take_cached_tool_session(&state, different_model, different_model, "call_9")
+            .expect("global key should allow cache lookup across models");
+
+        assert_eq!(cached.1.session_id, 42);
+        assert!(state.tool_sessions.is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_pending_long_task_poll_response_registers_returned_tool_use_id() {
+        let state = make_test_state(test_config(
+            "http://127.0.0.1:1".to_string(),
+            "http://127.0.0.1:2".to_string(),
+        ));
+
+        state
+            .tool_ledger
+            .record_tool_use("claude-test:call_start", "call_start", "Bash")
+            .unwrap();
+        state
+            .tool_ledger
+            .attach_long_task(
+                "claude-test:call_start",
+                "longtask.txt".to_string(),
+                "DONE_MARKER".to_string(),
+                3,
+            )
+            .unwrap();
+
+        let mut req = make_request_with_tools();
+        req.model = "claude-test".to_string();
+        req.stream = Some(false);
+        req.tools = Some(vec![bash_tool()]);
+        req.messages
+            .push(make_tool_result_msg("call_start", "PENDING"));
+
+        let response = maybe_build_long_task_poll_response(&state, &req, &req.model)
+            .unwrap()
+            .expect("pending long task should produce poll response");
+        assert_eq!(response.status(), StatusCode::OK);
+
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        let value: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        let poll_id = value["content"][0]["id"].as_str().unwrap();
+
+        assert!(
+            state
+                .tool_ledger
+                .long_task_for_tool_use(poll_id, "claude-test")
+                .is_some()
+        );
+    }
+
+    #[tokio::test]
+    async fn test_long_task_poll_closes_across_multiple_tool_results() {
+        let state = make_test_state(test_config(
+            "http://127.0.0.1:1".to_string(),
+            "http://127.0.0.1:2".to_string(),
+        ));
+
+        state
+            .tool_ledger
+            .record_tool_use("claude-test:call_start", "call_start", "Bash")
+            .unwrap();
+        let task_id = state
+            .tool_ledger
+            .attach_long_task(
+                "claude-test:call_start",
+                "longtask.txt".to_string(),
+                "DONE_MARKER".to_string(),
+                5,
+            )
+            .unwrap();
+
+        let mut req1 = make_request_with_tools();
+        req1.model = "claude-test".to_string();
+        req1.stream = Some(false);
+        req1.tools = Some(vec![bash_tool()]);
+        req1.messages
+            .push(make_tool_result_msg("call_start", "PENDING"));
+
+        let resp1 = maybe_build_long_task_poll_response(&state, &req1, &req1.model)
+            .unwrap()
+            .expect("first pending result should produce poll response");
+        let body1 = resp1.into_body().collect().await.unwrap().to_bytes();
+        let value1: serde_json::Value = serde_json::from_slice(&body1).unwrap();
+        let poll1 = value1["content"][0]["id"].as_str().unwrap().to_string();
+        assert!(
+            state
+                .tool_ledger
+                .long_task_for_tool_use(&poll1, "claude-test")
+                .is_some()
+        );
+
+        let mut req2 = make_request_with_tools();
+        req2.model = "claude-test".to_string();
+        req2.stream = Some(false);
+        req2.tools = Some(vec![bash_tool()]);
+        req2.messages
+            .push(make_tool_result_msg(&poll1, "still running"));
+
+        let resp2 = maybe_build_long_task_poll_response(&state, &req2, &req2.model)
+            .unwrap()
+            .expect("second pending result should produce poll response");
+        let body2 = resp2.into_body().collect().await.unwrap().to_bytes();
+        let value2: serde_json::Value = serde_json::from_slice(&body2).unwrap();
+        let poll2 = value2["content"][0]["id"].as_str().unwrap().to_string();
+        assert!(
+            state
+                .tool_ledger
+                .long_task_for_tool_use(&poll2, "claude-test")
+                .is_some()
+        );
+
+        let mut req3 = make_request_with_tools();
+        req3.model = "claude-test".to_string();
+        req3.stream = Some(false);
+        req3.tools = Some(vec![bash_tool()]);
+        req3.messages
+            .push(make_tool_result_msg(&poll2, "DONE_MARKER"));
+
+        let done = maybe_build_long_task_poll_response(&state, &req3, &req3.model).unwrap();
+        assert!(done.is_none());
+        assert!(
+            state
+                .tool_ledger
+                .long_task_for_tool_use("call_start", "claude-test")
+                .is_none()
+        );
+        assert!(
+            state
+                .tool_ledger
+                .long_task_for_tool_use(&poll1, "claude-test")
+                .is_none()
+        );
+        assert!(
+            state
+                .tool_ledger
+                .long_task_for_tool_use(&poll2, "claude-test")
+                .is_none()
+        );
+        assert!(state.tool_ledger.long_task_by_id(&task_id).is_none());
     }
 
     fn make_anthropic_config() -> crate::config::ToolRuntimeConfig {
@@ -2304,5 +2558,30 @@ mod tests {
         };
         let route = runtime_route(&req, Some(&config));
         assert!(matches!(route, RuntimeRoute::Compiler));
+    }
+
+    // ModelRouting 测试
+    #[test]
+    fn test_resolve_model_routing_preserves_client_model_and_maps_to_ouyi() {
+        let mapper = ModelMapper::new();
+        mapper.load_fallback();
+
+        let routing = resolve_model_routing("claude-sonnet-4-5", &mapper);
+
+        assert_eq!(routing.client_model, "claude-sonnet-4-5");
+        assert_eq!(routing.effective_model, "claude-sonnet-4-5");
+        assert_eq!(routing.ouyi_model, "claude_chat::claude-sonnet-4-5-20250929-vip");
+    }
+
+    #[test]
+    fn test_resolve_model_routing_does_not_rewrite_unknown_models_to_sonnet() {
+        let mapper = ModelMapper::new();
+        mapper.load_fallback();
+
+        let routing = resolve_model_routing("unknown-model-xyz", &mapper);
+
+        assert_eq!(routing.client_model, "unknown-model-xyz");
+        assert_eq!(routing.effective_model, "unknown-model-xyz");
+        assert_eq!(routing.ouyi_model, "unknown-model-xyz");
     }
 }

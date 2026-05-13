@@ -1241,6 +1241,7 @@ dependencies = [
  "tokio",
  "tokio-stream",
  "toml",
+ "toml_edit",
  "tower-http",
  "tracing",
  "tracing-subscriber",

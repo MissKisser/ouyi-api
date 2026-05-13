@@ -212,7 +212,7 @@ pub fn detect_long_task(call: &BrokerToolCall) -> Option<LongTaskPlan> {
             file_path,
             done_marker,
             interval_secs: 5,
-            max_polls: 3,
+            max_polls: 8,
         });
     }
 
@@ -238,10 +238,11 @@ pub fn build_poll_call(
     let escaped_path = plan.file_path.replace('\'', "'\\''");
     let marker = plan.done_marker.replace('\'', "'\\''");
     let command = format!(
-        "sleep {}; if test -f '{}' && grep -q '{}' '{}'; then echo DONE; else echo PENDING; fi",
+        "sleep {}; if test -f '{}' && grep -q '{}' '{}'; then cat '{}'; else echo PENDING; fi",
         plan.interval_secs,
         escaped_path,
         marker,
+        escaped_path,
         escaped_path
     );
     Ok(BrokerToolCall {
@@ -454,6 +455,7 @@ mod tests {
         let plan = detect_long_task(&call).unwrap();
         assert_eq!(plan.file_path, "longtask.txt");
         assert_eq!(plan.done_marker, "DONE_MARKER");
+        assert_eq!(plan.max_polls, 8);
     }
 
     #[test]
@@ -469,6 +471,7 @@ mod tests {
         let command = call.input["command"].as_str().unwrap();
         assert!(command.contains("DONE_MARKER"));
         assert!(command.contains("PENDING"));
+        assert!(command.contains("cat 'longtask.txt'"));
     }
 
     #[test]

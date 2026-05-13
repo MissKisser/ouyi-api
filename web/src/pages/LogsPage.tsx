@@ -3,8 +3,10 @@ import useSWR from 'swr';
 import {
   apiFetch,
   apiFetchRuntimeLogs,
+  apiFetchToolRuntimeLogs,
   type RequestLog,
   type RuntimeLogsResponse,
+  type ToolRuntimeLog,
 } from '@/lib/api';
 import { Card, CardContent, CardHeader, CardTitle } from '@/components/ui/card';
 import { Badge } from '@/components/ui/badge';
@@ -17,7 +19,7 @@ import {
   TableHeader,
   TableRow,
 } from '@/components/ui/table';
-import { ScrollText, Terminal, ChevronLeft, ChevronRight } from 'lucide-react';
+import { ScrollText, Terminal, Wrench, ChevronLeft, ChevronRight } from 'lucide-react';
 import { useTranslation } from 'react-i18next';
 
 const PAGE_SIZE = 50;
@@ -255,11 +257,114 @@ function RuntimeLogsTab() {
   );
 }
 
+// ── 工具日志 Tab ──────────────────────────────────────────────────────────
+
+function ToolRuntimeLogsTab() {
+  const { t } = useTranslation();
+
+  const { data: logs, isLoading, error } = useSWR<ToolRuntimeLog[]>(
+    '/admin/api/tool-runtime-logs?limit=100',
+    () => apiFetchToolRuntimeLogs(100),
+    { refreshInterval: 5000 },
+  );
+
+  if (error) {
+    return (
+      <Card>
+        <CardContent className="p-4 text-destructive">
+          {t('common.loadError')}
+        </CardContent>
+      </Card>
+    );
+  }
+
+  return (
+    <Card>
+      <CardHeader>
+        <CardTitle className="text-sm text-muted-foreground">
+          {t('logs.toolRuntimeLogs.description', { defaultValue: 'Tool model logs (auto-refresh every 5s)' })}
+        </CardTitle>
+      </CardHeader>
+      <CardContent className="p-0">
+        <Table>
+          <TableHeader>
+            <TableRow>
+              <TableHead>{t('logs.requestLogs.time')}</TableHead>
+              <TableHead>{t('logs.toolRuntimeLogs.provider', { defaultValue: 'Provider' })}</TableHead>
+              <TableHead>{t('logs.requestLogs.model')}</TableHead>
+              <TableHead>{t('logs.toolRuntimeLogs.decision')}</TableHead>
+              <TableHead>{t('logs.toolRuntimeLogs.toolNames')}</TableHead>
+              <TableHead className="text-right">{t('logs.requestLogs.promptTokens')}</TableHead>
+              <TableHead className="text-right">{t('logs.requestLogs.completionTokens')}</TableHead>
+              <TableHead className="text-right">{t('logs.requestLogs.latency')}</TableHead>
+              <TableHead>{t('logs.requestLogs.status')}</TableHead>
+            </TableRow>
+          </TableHeader>
+          <TableBody>
+            {logs?.map((log, i) => (
+              <TableRow key={i}>
+                <TableCell className="text-xs text-muted-foreground whitespace-nowrap">
+                  {log.timestamp}
+                </TableCell>
+                <TableCell className="text-xs font-mono">{log.provider}</TableCell>
+                <TableCell className="text-xs font-mono">{log.model}</TableCell>
+                <TableCell>
+                  <Badge
+                    variant="outline"
+                    className={`text-xs ${
+                      log.decision === 'tool_calls'
+                        ? 'bg-blue-500/15 text-blue-700 border-blue-200'
+                        : 'bg-emerald-500/15 text-emerald-700 border-emerald-200'
+                    }`}
+                  >
+                    {log.decision}
+                  </Badge>
+                </TableCell>
+                <TableCell className="text-xs max-w-48 break-all">
+                  {log.tool_names.length > 0 ? log.tool_names.join(', ') : '-'}
+                </TableCell>
+                <TableCell className="text-right text-xs text-blue-600">{formatTokens(log.prompt_tokens)}</TableCell>
+                <TableCell className="text-right text-xs text-emerald-600">{formatTokens(log.completion_tokens)}</TableCell>
+                <TableCell className="text-right text-xs">{formatLatency(log.latency_ms)}</TableCell>
+                <TableCell>
+                  {log.success ? (
+                    <Badge variant="outline" className="bg-green-500/15 text-green-700 border-green-200 text-xs">
+                      {t('logs.requestLogs.success')}
+                    </Badge>
+                  ) : (
+                    <Badge variant="outline" className="bg-red-500/15 text-red-700 border-red-200 text-xs">
+                      {t('logs.requestLogs.failure')}
+                    </Badge>
+                  )}
+                </TableCell>
+              </TableRow>
+            ))}
+            {isLoading && (
+              <TableRow>
+                <TableCell colSpan={9} className="text-center text-muted-foreground py-8">
+                  {t('logs.requestLogs.loading')}
+                </TableCell>
+              </TableRow>
+            )}
+            {logs && logs.length === 0 && (
+              <TableRow>
+                <TableCell colSpan={9} className="text-center text-muted-foreground py-8">
+                  {t('logs.toolRuntimeLogs.empty', { defaultValue: 'No tool runtime logs' })}
+                </TableCell>
+              </TableRow>
+            )}
+          </TableBody>
+        </Table>
+      </CardContent>
+    </Card>
+  );
+}
+
 // ── 主页面 ────────────────────────────────────────────────────────────────
 
 export function LogsPage() {
   const { t } = useTranslation();
-  const [tab, setTab] = useState<'request' | 'runtime'>('request');
+  const [tab, setTab] = useState<'request' | 'runtime' | 'toolRuntime'>('request');
 
   return (
     <div className="space-y-6">
@@ -286,9 +391,19 @@ export function LogsPage() {
           <Terminal className="h-4 w-4 mr-1" />
           {t('logs.tabs.runtime')}
         </Button>
+        <Button
+          variant={tab === 'toolRuntime' ? 'default' : 'outline'}
+          size="sm"
+          onClick={() => setTab('toolRuntime')}
+        >
+          <Wrench className="h-4 w-4 mr-1" />
+          {t('logs.tabs.toolRuntime')}
+        </Button>
       </div>
 
-      {tab === 'request' ? <RequestLogsTab /> : <RuntimeLogsTab />}
+      {tab === 'request' && <RequestLogsTab />}
+      {tab === 'runtime' && <RuntimeLogsTab />}
+      {tab === 'toolRuntime' && <ToolRuntimeLogsTab />}
     </div>
   );
 }

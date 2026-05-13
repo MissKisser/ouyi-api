@@ -105,6 +105,41 @@ export interface RuntimeLogsResponse {
   logs: RuntimeLogEntry[];
 }
 
+export interface ToolRuntimeLog {
+  timestamp: string;
+  request_id: string;
+  mode: string;
+  provider: string;
+  model: string;
+  base_url: string;
+  decision: string;
+  tool_names: string[];
+  prompt_tokens: number;
+  completion_tokens: number;
+  latency_ms: number;
+  success: boolean;
+  error?: string;
+}
+
+export interface ToolRuntimeConfig {
+  enabled: boolean;
+  provider: 'anthropic' | 'openai-compatible';
+  base_url: string;
+  api_key: string;
+  model: string;
+  timeout_secs: number;
+}
+
+export interface ToolRuntimeTestResponse {
+  success: boolean;
+  message: string;
+  latency_ms: number;
+  mode: string;
+  provider: string;
+  model: string;
+  base_url: string;
+}
+
 export interface AccountStatus {
   email: string;
   mobile: string;
@@ -223,6 +258,7 @@ export interface FullConfig {
   admin: AdminConfigResponse;
   accounts: AccountEntry[];
   api_keys: ApiKeyEntry[];
+  tool_runtime: ToolRuntimeConfig;
 }
 
 // ── Config API ────────────────────────────────────────────────────────────
@@ -238,6 +274,13 @@ export async function apiSaveConfig(config: Record<string, unknown>): Promise<{ 
   });
 }
 
+export async function apiTestToolRuntime(config: ToolRuntimeConfig): Promise<ToolRuntimeTestResponse> {
+  return apiFetch<ToolRuntimeTestResponse>('/admin/api/tool-runtime/test', {
+    method: 'POST',
+    body: JSON.stringify(config),
+  });
+}
+
 // ── Logs ──────────────────────────────────────────────────────────────────
 
 export async function apiFetchLogs(limit?: number): Promise<RequestLog[]> {
@@ -247,6 +290,10 @@ export async function apiFetchLogs(limit?: number): Promise<RequestLog[]> {
 
 export async function apiFetchRuntimeLogs(offset: number = 0, limit: number = 100): Promise<RuntimeLogsResponse> {
   return apiFetch<RuntimeLogsResponse>(`/admin/api/runtime-logs?offset=${offset}&limit=${limit}`);
+}
+
+export async function apiFetchToolRuntimeLogs(limit: number = 100): Promise<ToolRuntimeLog[]> {
+  return apiFetch<ToolRuntimeLog[]>(`/admin/api/tool-runtime-logs?limit=${limit}`);
 }
 
 // ── Status & Stats ────────────────────────────────────────────────────────

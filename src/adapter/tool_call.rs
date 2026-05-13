@@ -1,4 +1,4 @@
-use crate::model::openai::{ToolCall, ToolCallFunction, ToolCallDelta, ToolCallFunctionDelta};
+use crate::model::openai::{ToolCall, ToolCallDelta, ToolCallFunction, ToolCallFunctionDelta};
 
 const TOOL_CALL_START: &str = "<|tool\u{2581}calls\u{2581}begin|>";
 const TOOL_CALL_END: &str = "<|tool\u{2581}calls\u{2581}end|>";
@@ -55,7 +55,9 @@ fn matches_any_start_tag(buf: &str) -> bool {
 }
 
 fn could_match_any_start_tag(buf: &str) -> bool {
-    KNOWN_START_TAGS.iter().any(|tag| fuzzy_prefix_match(buf, tag))
+    KNOWN_START_TAGS
+        .iter()
+        .any(|tag| fuzzy_prefix_match(buf, tag))
 }
 
 fn matches_any_end_tag(buf: &str) -> bool {
@@ -63,7 +65,9 @@ fn matches_any_end_tag(buf: &str) -> bool {
 }
 
 fn could_match_any_end_tag(buf: &str) -> bool {
-    KNOWN_END_TAGS.iter().any(|tag| fuzzy_prefix_match(buf, tag))
+    KNOWN_END_TAGS
+        .iter()
+        .any(|tag| fuzzy_prefix_match(buf, tag))
 }
 
 fn is_tag_start_char(ch: char) -> bool {
@@ -149,9 +153,7 @@ fn repair_unquoted_keys(s: &str) -> String {
 
 fn repair_json(s: &str) -> Option<String> {
     let step0: String = s.chars().map(|c| if c == '\'' { '"' } else { c }).collect();
-    if step0 != s
-        && serde_json::from_str::<serde_json::Value>(&step0).is_ok()
-    {
+    if step0 != s && serde_json::from_str::<serde_json::Value>(&step0).is_ok() {
         return Some(step0);
     }
     let step1 = repair_invalid_backslashes(s);
@@ -448,11 +450,7 @@ impl ToolCallParser {
             }
         }
 
-        if found {
-            Some(results)
-        } else {
-            None
-        }
+        if found { Some(results) } else { None }
     }
 
     fn json_to_tool_call_delta(&mut self, v: &serde_json::Value) -> Option<ToolCallDelta> {
@@ -597,7 +595,12 @@ mod tests {
         assert!(out.normal_text.contains(" more text"));
         assert_eq!(out.tool_deltas.len(), 1);
         assert_eq!(
-            out.tool_deltas[0].function.as_ref().unwrap().name.as_deref(),
+            out.tool_deltas[0]
+                .function
+                .as_ref()
+                .unwrap()
+                .name
+                .as_deref(),
             Some("read_file")
         );
     }
@@ -614,7 +617,12 @@ mod tests {
         assert!(!out.normal_text.contains("tool"));
         assert_eq!(out.tool_deltas.len(), 1);
         assert_eq!(
-            out.tool_deltas[0].function.as_ref().unwrap().name.as_deref(),
+            out.tool_deltas[0]
+                .function
+                .as_ref()
+                .unwrap()
+                .name
+                .as_deref(),
             Some("read_file")
         );
     }
@@ -632,11 +640,21 @@ mod tests {
         assert_eq!(out.tool_deltas[0].index, 0);
         assert_eq!(out.tool_deltas[1].index, 1);
         assert_eq!(
-            out.tool_deltas[0].function.as_ref().unwrap().name.as_deref(),
+            out.tool_deltas[0]
+                .function
+                .as_ref()
+                .unwrap()
+                .name
+                .as_deref(),
             Some("tool1")
         );
         assert_eq!(
-            out.tool_deltas[1].function.as_ref().unwrap().name.as_deref(),
+            out.tool_deltas[1]
+                .function
+                .as_ref()
+                .unwrap()
+                .name
+                .as_deref(),
             Some("tool2")
         );
     }
@@ -673,7 +691,12 @@ mod tests {
         let out = parser.process_chunk(input);
         assert_eq!(out.tool_deltas.len(), 1);
         assert_eq!(
-            out.tool_deltas[0].function.as_ref().unwrap().name.as_deref(),
+            out.tool_deltas[0]
+                .function
+                .as_ref()
+                .unwrap()
+                .name
+                .as_deref(),
             Some("broken_tool")
         );
     }
@@ -694,7 +717,12 @@ mod tests {
         let out = parser.process_chunk(input);
         assert_eq!(out.tool_deltas.len(), 1);
         assert_eq!(
-            out.tool_deltas[0].function.as_ref().unwrap().name.as_deref(),
+            out.tool_deltas[0]
+                .function
+                .as_ref()
+                .unwrap()
+                .name
+                .as_deref(),
             Some("read")
         );
     }
@@ -710,7 +738,12 @@ mod tests {
         let out = parser.process_chunk(input);
         assert_eq!(out.tool_deltas.len(), 1);
         assert_eq!(
-            out.tool_deltas[0].function.as_ref().unwrap().name.as_deref(),
+            out.tool_deltas[0]
+                .function
+                .as_ref()
+                .unwrap()
+                .name
+                .as_deref(),
             Some("bash")
         );
     }
@@ -724,7 +757,12 @@ mod tests {
         let out = parser.process_chunk(input);
         assert_eq!(out.tool_deltas.len(), 1);
         assert_eq!(
-            out.tool_deltas[0].function.as_ref().unwrap().name.as_deref(),
+            out.tool_deltas[0]
+                .function
+                .as_ref()
+                .unwrap()
+                .name
+                .as_deref(),
             Some("read")
         );
     }
@@ -742,7 +780,12 @@ mod tests {
         let out = parser.process_chunk(input);
         assert_eq!(out.tool_deltas.len(), 1);
         assert_eq!(
-            out.tool_deltas[0].function.as_ref().unwrap().name.as_deref(),
+            out.tool_deltas[0]
+                .function
+                .as_ref()
+                .unwrap()
+                .name
+                .as_deref(),
             Some("read")
         );
     }
@@ -778,11 +821,21 @@ mod tests {
         let out = parser.process_chunk(input);
         assert_eq!(out.tool_deltas.len(), 2);
         assert_eq!(
-            out.tool_deltas[0].function.as_ref().unwrap().name.as_deref(),
+            out.tool_deltas[0]
+                .function
+                .as_ref()
+                .unwrap()
+                .name
+                .as_deref(),
             Some("bash")
         );
         assert_eq!(
-            out.tool_deltas[1].function.as_ref().unwrap().name.as_deref(),
+            out.tool_deltas[1]
+                .function
+                .as_ref()
+                .unwrap()
+                .name
+                .as_deref(),
             Some("read")
         );
     }

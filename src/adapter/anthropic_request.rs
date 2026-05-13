@@ -47,6 +47,26 @@ const TOOL_CALL_REMINDER: &str = concat!(
     "\n\n【工具调用提醒】如果你无法仅凭已有知识完成当前任务，请思考需要调用哪个工具，然后直接输出工具调用标记。不要犹豫，直接行动。",
 );
 
+fn truncate_utf8_by_byte_limit_with_notice(content: &str, max_bytes: usize) -> String {
+    if content.len() <= max_bytes {
+        return content.to_string();
+    }
+    let char_count = content.chars().count();
+    let truncated: String = content
+        .chars()
+        .scan(0usize, |bytes, ch| {
+            let next = *bytes + ch.len_utf8();
+            if next > max_bytes {
+                None
+            } else {
+                *bytes = next;
+                Some(ch)
+            }
+        })
+        .collect();
+    format!("{truncated}\n\n[...内容截断，共 {char_count} 字符...]")
+}
+
 fn build_tool_instruction_block(tools: &[AnthropicTool]) -> String {
     let defs = tools
         .iter()
@@ -217,15 +237,8 @@ pub fn convert_anthropic_request(
                                 .get(tool_use_id)
                                 .map(|s| s.as_str())
                                 .unwrap_or(tool_use_id);
-                            let display_content = if content.len() > 2000 {
-                                format!(
-                                    "{}\n\n[...内容截断，共 {} 字符...]",
-                                    &content[..2000],
-                                    content.len()
-                                )
-                            } else {
-                                content.clone()
-                            };
+                            let display_content =
+                                truncate_utf8_by_byte_limit_with_notice(content, 2000);
                             role_texts.push(format!(
                                 "[Tool Result for {}]:\n<tool_result name=\"{}\">\n{}\n</tool_result>\n[End of tool result for {}. Continue.]",
                                 tool_name, tool_name, display_content, tool_name
@@ -344,6 +357,18 @@ mod tests {
         let result = convert_anthropic_request(&req, "test", false).unwrap();
         assert!(result.text.contains("tool\u{2581}calls\u{2581}begin"));
         assert!(result.text.contains("read_file"));
+    }
+
+    #[test]
+    fn test_tool_result_truncation_handles_multibyte_text() {
+        let req = make_req(AnthropicContent::Blocks(vec![ContentBlock::ToolResult {
+            tool_use_id: "tool_1".to_string(),
+            content: "方".repeat(1000),
+        }]));
+
+        let result = convert_anthropic_request(&req, "test", false).unwrap();
+
+        assert!(result.text.contains("[...内容截断，共 1000 字符...]"));
     }
 
     #[test]

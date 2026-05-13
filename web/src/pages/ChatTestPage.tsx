@@ -51,8 +51,11 @@ export function ChatTestPage() {
   const messagesEndRef = useRef<HTMLDivElement>(null);
   const abortRef = useRef<AbortController | null>(null);
   const messagesRef = useRef(messages);
-  messagesRef.current = messages;
   const rafRef = useRef<number | null>(null);
+
+  useEffect(() => {
+    messagesRef.current = messages;
+  }, [messages]);
 
   // 加载模型列表
   useEffect(() => {

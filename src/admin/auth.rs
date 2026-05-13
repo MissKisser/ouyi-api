@@ -1,10 +1,8 @@
 use std::time::Instant;
 
-use bcrypt::{hash, verify, DEFAULT_COST};
+use bcrypt::{DEFAULT_COST, hash, verify};
 use dashmap::DashMap;
-use jsonwebtoken::{
-    DecodingKey, EncodingKey, Header, Validation, decode, encode,
-};
+use jsonwebtoken::{DecodingKey, EncodingKey, Header, Validation, decode, encode};
 use serde::{Deserialize, Serialize};
 
 /// 内存存储 admin 鉴权凭据与登录限流状态
@@ -65,12 +63,13 @@ impl AdminStore {
         const WINDOW_SECS: u64 = 300;
 
         let now = Instant::now();
-        let mut entry = self.login_attempts.entry(ip.to_string()).or_insert_with(|| {
-            LoginAttempt {
+        let mut entry = self
+            .login_attempts
+            .entry(ip.to_string())
+            .or_insert_with(|| LoginAttempt {
                 count: 0,
                 first_seen: now,
-            }
-        });
+            });
 
         if now.duration_since(entry.first_seen).as_secs() > WINDOW_SECS {
             entry.count = 0;

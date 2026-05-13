@@ -39,6 +39,7 @@ pub struct PendingLongTask {
 pub struct ToolLedger {
     pending: DashMap<String, PendingToolCall>,
     long_tasks: DashMap<String, PendingLongTask>,
+    tool_use_index: DashMap<String, String>,
 }
 
 impl ToolLedger {
@@ -57,6 +58,8 @@ impl ToolLedger {
                 "工具会话账本记录缺少必要字段".to_string(),
             ));
         }
+        self.tool_use_index
+            .insert(tool_use_id.to_string(), session_key.to_string());
         self.pending.insert(
             session_key.to_string(),
             PendingToolCall {
@@ -179,7 +182,12 @@ impl ToolLedger {
         tool_use_id: &str,
         model: &str,
     ) -> Option<PendingLongTask> {
-        let session_key = format!("{}:{}", model, tool_use_id);
+        let model_key = format!("{}:{}", model, tool_use_id);
+        let session_key = if self.pending.contains_key(&model_key) {
+            model_key
+        } else {
+            self.tool_use_index.get(tool_use_id)?.value().clone()
+        };
         let task_id = self
             .pending
             .get(&session_key)
@@ -198,7 +206,9 @@ impl ToolLedger {
         if let Some(task) = self.long_tasks.get(task_id) {
             let keys = task.tool_call_keys.clone();
             for key in &keys {
-                self.pending.remove(key);
+                if let Some((_, pending)) = self.pending.remove(key) {
+                    self.tool_use_index.remove(&pending.tool_use_id);
+                }
             }
         }
         self.long_tasks.remove(task_id);
@@ -474,5 +484,28 @@ mod tests {
 
         assert_eq!(ledger.pending_count(), 0);
         assert_eq!(ledger.long_task_count(), 0);
+    }
+
+    #[test]
+    fn test_long_task_lookup_survives_request_model_change() {
+        let ledger = super::ToolLedger::new();
+
+        ledger
+            .record_tool_use("glm-5:call_0", "call_0", "Bash")
+            .unwrap();
+        let task_id = ledger
+            .attach_long_task(
+                "glm-5:call_0",
+                "/tmp/task.txt".to_string(),
+                "DONE".to_string(),
+                8,
+            )
+            .unwrap();
+
+        let found = ledger.long_task_for_tool_use("call_0", "claude-sonnet-4-6").unwrap();
+        assert_eq!(found.task_id, task_id);
+
+        let found_same_model = ledger.long_task_for_tool_use("call_0", "glm-5").unwrap();
+        assert_eq!(found_same_model.task_id, task_id);
     }
 }

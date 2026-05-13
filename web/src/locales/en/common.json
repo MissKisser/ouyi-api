@@ -30,6 +30,7 @@
   },
   "dashboard": {
     "title": "Dashboard",
+    "toolModelBadge": "Tool Model",
     "stats": {
       "totalRequests": "Total Requests",
       "successRate": "Success Rate",
@@ -75,7 +76,20 @@
       "deepseek": "DeepSeek",
       "models": "Model Types",
       "toolCallTags": "Tool Call Tags",
-      "proxy": "Proxy"
+      "proxy": "Proxy",
+      "toolRuntime": "Tool Model"
+    },
+    "toolRuntime": {
+      "enabled": "Enabled",
+      "provider": "API Type",
+      "baseUrl": "Base URL",
+      "model": "Model",
+      "apiKey": "API Key",
+      "timeout": "Timeout (s)",
+      "providerAnthropic": "Anthropic API",
+      "providerOpenaiCompatible": "OpenAI-compatible API",
+      "testConnection": "Test Connection",
+      "testing": "Testing"
     },
     "accounts": {
       "email": "Email",
@@ -134,7 +148,12 @@
     "title": "Logs",
     "tabs": {
       "request": "Request Logs",
-      "runtime": "Runtime Logs"
+      "runtime": "Runtime Logs",
+      "toolRuntime": "Tool Logs"
+    },
+    "toolRuntimeLogs": {
+      "decision": "Decision",
+      "toolNames": "Tool Names"
     },
     "requestLogs": {
       "description": "Last 100 requests (auto-refresh every 5s)",

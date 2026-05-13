@@ -189,7 +189,14 @@ export function DashboardPage() {
               <TableBody>
                 {Object.entries(stats.models).map(([model, ms]) => (
                   <TableRow key={model}>
-                    <TableCell className="font-mono text-sm">{model}</TableCell>
+                    <TableCell className="font-mono text-sm">
+                      {model}
+                      {model.startsWith('tool-runtime::') && (
+                        <Badge variant="outline" className="ml-2 bg-purple-500/15 text-purple-700 border-purple-200 text-xs">
+                          {t('dashboard.toolModelBadge')}
+                        </Badge>
+                      )}
+                    </TableCell>
                     <TableCell className="text-right">{ms.requests}</TableCell>
                     <TableCell className="text-right text-blue-600">{formatTokens(ms.prompt_tokens)}</TableCell>
                     <TableCell className="text-right text-emerald-600">{formatTokens(ms.completion_tokens)}</TableCell>

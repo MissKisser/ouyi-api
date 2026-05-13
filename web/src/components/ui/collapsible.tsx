@@ -9,7 +9,7 @@ const Collapsible = React.forwardRef<
     open?: boolean
     onOpenChange?: (open: boolean) => void
   }
->(({ className, open = false, onOpenChange, children, ...props }, ref) => {
+>(({ className, children, ...props }, ref) => {
   return (
     <div ref={ref} data-slot="collapsible" className={cn("", className)} {...props}>
       {children}

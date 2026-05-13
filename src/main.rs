@@ -8,7 +8,9 @@ mod model;
 mod router;
 mod tool_runtime;
 
+use std::io::{self, BufRead, IsTerminal};
 use std::net::SocketAddr;
+use std::path::PathBuf;
 use std::sync::Arc;
 use tokio::sync::RwLock;
 
@@ -22,7 +24,7 @@ use admin::AccountStore;
 use admin::auth::AdminStore;
 use admin::stats::StatsCollector;
 use client::http::OuyiHttpClient;
-use config::AppConfig;
+use config::{AppConfig, update_ouyi_jwt_token};
 use error::AppError;
 use model::mapper::ModelMapper;
 use tool_runtime::ToolLedger;
@@ -30,12 +32,11 @@ use tool_runtime::ToolLedger;
 /// 工具调用会话缓存：tool_use 响应后暂存会话 ID，等待 tool_result 回传时复用
 pub struct CachedToolSession {
     pub session_id: i64,
-    pub model: String,
     pub created_at: std::time::Instant,
 }
 
 pub struct AppState {
-    pub config: AppConfig,
+    pub config: RwLock<AppConfig>,
     pub http_client: reqwest::Client,
     pub ouyi_client: RwLock<OuyiHttpClient>,
     pub active_sessions: DashMap<i64, ()>,
@@ -75,26 +76,57 @@ async fn main() -> Result<(), AppError> {
         config.ouyi.app_version.clone(),
     );
 
-    // 加载模型列表
+    // 加载模型列表并检测是否需要 JWT 自修复
     let model_mapper = ModelMapper::new();
-    match ouyi_client.fetch_tmpl().await {
+    let (tmpl_result, token_valid) = {
+        let tmpl = ouyi_client.fetch_tmpl().await;
+        let valid = ouyi_client.verify_token().await.ok().unwrap_or(false);
+        (tmpl, valid)
+    };
+
+    let needs_jwt_fix = match &tmpl_result {
         Ok(tmpl_resp) => {
-            model_mapper.load_from_tmpl(&tmpl_resp);
-            tracing::info!("模型列表加载成功: {} 个模型", model_mapper.model_count());
-            tracing::debug!(models = ?tmpl_resp.data.as_ref().map(|d| d.models.len()), "tmpl 数据详情");
+            let model_count = tmpl_resp.data.as_ref().map(|d| d.models.len()).unwrap_or(0);
+            model_count == 0
         }
         Err(e) => {
-            tracing::warn!("模型列表加载失败: {}, 使用静态fallback", e);
-            model_mapper.load_fallback();
+            let err_str = e.to_string().to_lowercase();
+            err_str.contains("鉴权")
+                || err_str.contains("auth")
+                || err_str.contains("token")
+                || err_str.contains("401")
+                || err_str.contains("403")
+                || err_str.contains("空")
         }
-    }
+    } || !token_valid;
 
-    // 验证JWT token
-    match ouyi_client.verify_token().await {
-        Ok(true) => tracing::info!("JWT token 验证通过"),
-        Ok(false) => tracing::warn!("JWT token 验证失败，请检查配置"),
-        Err(e) => tracing::warn!("JWT token 验证请求失败: {}", e),
-    }
+    let (config, ouyi_client, model_mapper) = if needs_jwt_fix {
+        tracing::warn!("检测到 Ouyi JWT 无效或模型列表为空");
+        let config_path = PathBuf::from(AppConfig::config_path());
+
+        if let Some((_new_token, new_config, new_client, new_mapper)) =
+            tokio::task::block_in_place(|| interactive_jwt_fix(&http_client, &config, &config_path))
+        {
+            (new_config, new_client, new_mapper)
+        } else {
+            // 用户跳过交互，使用 fallback
+            model_mapper.load_fallback();
+            tracing::warn!("使用静态 fallback 模型列表启动");
+            (config, ouyi_client, model_mapper)
+        }
+    } else {
+        match tmpl_result {
+            Ok(tmpl_resp) => {
+                model_mapper.load_from_tmpl(&tmpl_resp);
+                tracing::info!("模型列表加载成功: {} 个模型", model_mapper.model_count());
+            }
+            Err(e) => {
+                tracing::warn!("模型列表加载失败: {}, 使用静态 fallback", e);
+                model_mapper.load_fallback();
+            }
+        }
+        (config, ouyi_client, model_mapper)
+    };
 
     let addr = format!("{}:{}", config.server.host, config.server.port);
     let addr: SocketAddr = addr
@@ -121,7 +153,7 @@ async fn main() -> Result<(), AppError> {
     let stats = StatsCollector::new();
 
     let state = Arc::new(AppState {
-        config: config.clone(),
+        config: RwLock::new(config.clone()),
         http_client,
         ouyi_client: RwLock::new(ouyi_client),
         active_sessions: DashMap::new(),
@@ -206,5 +238,96 @@ async fn shutdown_signal() {
     tokio::select! {
         _ = ctrl_c => tracing::info!("收到 Ctrl+C 信号"),
         _ = terminate => tracing::info!("收到终止信号"),
+    }
+}
+
+fn interactive_jwt_fix(
+    http_client: &reqwest::Client,
+    config: &AppConfig,
+    config_path: &std::path::Path,
+) -> Option<(String, AppConfig, OuyiHttpClient, ModelMapper)> {
+    if !io::stdin().is_terminal() {
+        tracing::warn!("当前运行环境不支持交互输入，跳过 JWT 自修复");
+        return None;
+    }
+
+    println!("请输入新的 Ouyi JWT Token 后按回车（直接回车跳过）：");
+
+    let stdin = io::stdin();
+    let mut lines = stdin.lock().lines();
+
+    loop {
+        println!("> ");
+        let line = lines.next()?.ok()?;
+        let token = line.trim();
+
+        if token.is_empty() {
+            tracing::info!("跳过 JWT 自修复，使用原配置启动");
+            return None;
+        }
+
+        // 构造临时客户端验证新 Token
+        let temp_client = OuyiHttpClient::new(
+            http_client.clone(),
+            config.ouyi.base_url.clone(),
+            token.to_string(),
+            config.ouyi.app_version.clone(),
+        );
+
+        // 验证 Token（同步执行异步操作）
+        let rt = tokio::runtime::Handle::current();
+        let verify_result = rt.block_on(temp_client.verify_token());
+        let token_valid = verify_result.ok().unwrap_or(false);
+
+        if !token_valid {
+            println!("Token 验证失败，请检查输入是否正确");
+            continue;
+        }
+
+        // 获取模型列表
+        let tmpl_result = rt.block_on(temp_client.fetch_tmpl());
+        match tmpl_result {
+            Ok(ref resp) => {
+                let model_count = resp.data.as_ref().map(|d| d.models.len()).unwrap_or(0);
+                if model_count == 0 {
+                    println!("Token 验证通过但模型列表为空，请检查 Token 权限");
+                    continue;
+                }
+            }
+            Err(e) => {
+                println!("获取模型列表失败: {}", e);
+                continue;
+            }
+        }
+
+        // 写回配置文件
+        if let Err(e) = update_ouyi_jwt_token(config_path, token) {
+            tracing::error!("配置写回失败: {}", e);
+            println!("配置写回失败，请手动更新 config.toml");
+            return None;
+        }
+
+        // 重新加载配置
+        let new_config = AppConfig::load()
+            .map_err(|e| {
+                tracing::error!("重新加载配置失败: {}", e);
+            })
+            .ok()?;
+
+        // 初始化新客户端和模型映射
+        let new_client = OuyiHttpClient::new(
+            http_client.clone(),
+            new_config.ouyi.base_url.clone(),
+            new_config.ouyi.jwt_token.clone(),
+            new_config.ouyi.app_version.clone(),
+        );
+
+        let new_mapper = ModelMapper::new();
+        new_mapper.load_from_tmpl(&tmpl_result.unwrap());
+
+        tracing::info!("JWT 自修复成功，模型列表: {} 个", new_mapper.model_count());
+        println!("JWT Token 已更新并验证通过，服务将继续启动...");
+
+        return Some((token.to_string(), new_config, new_client, new_mapper));
     }
 }

@@ -1,4 +1,4 @@
-use crate::adapter::tool_call::{tool_delta_to_full_call, ToolCallParser};
+use crate::adapter::tool_call::{ToolCallParser, tool_delta_to_full_call};
 use crate::client::sse::OuyiEventType;
 use crate::model::openai::*;
 use crate::model::ouyi::OuyiSseEvent;
@@ -48,7 +48,11 @@ impl StreamConverter {
                 {
                     self.prompt_tokens = usage.prompt_tokens;
                     self.completion_tokens = usage.completion_tokens;
-                    tracing::debug!(prompt = usage.prompt_tokens, completion = usage.completion_tokens, "StreamConverter 从 object 事件捕获 token 用量");
+                    tracing::debug!(
+                        prompt = usage.prompt_tokens,
+                        completion = usage.completion_tokens,
+                        "StreamConverter 从 object 事件捕获 token 用量"
+                    );
                 }
                 None
             }
@@ -59,7 +63,11 @@ impl StreamConverter {
                     {
                         self.prompt_tokens = usage.prompt_tokens;
                         self.completion_tokens = usage.completion_tokens;
-                        tracing::debug!(prompt = usage.prompt_tokens, completion = usage.completion_tokens, "StreamConverter 从 done 事件捕获 token 用量");
+                        tracing::debug!(
+                            prompt = usage.prompt_tokens,
+                            completion = usage.completion_tokens,
+                            "StreamConverter 从 done 事件捕获 token 用量"
+                        );
                     }
                 }
                 let finish_reason = if self.tool_parser.is_in_tool_call() {
@@ -84,7 +92,10 @@ impl StreamConverter {
         (self.prompt_tokens, self.completion_tokens)
     }
 
-    fn build_chunks_from_parsed(&mut self, parsed: crate::adapter::tool_call::ParsedOutput) -> Option<Vec<ChatCompletionChunk>> {
+    fn build_chunks_from_parsed(
+        &mut self,
+        parsed: crate::adapter::tool_call::ParsedOutput,
+    ) -> Option<Vec<ChatCompletionChunk>> {
         let mut chunks = Vec::new();
 
         if !parsed.normal_text.is_empty() {
@@ -293,7 +304,10 @@ mod tests {
         collector.push_event(&make_done_event());
 
         let resp = collector.build_response();
-        assert_eq!(resp.choices[0].message.content.as_deref(), Some("Hello world"));
+        assert_eq!(
+            resp.choices[0].message.content.as_deref(),
+            Some("Hello world")
+        );
         assert_eq!(resp.choices[0].finish_reason, "stop");
     }
 
