@@ -31,12 +31,12 @@ port = 3000
 
 [ouyi]
 base_url = "https://ai8.rcouyi.com"
-jwt_token = "你的欧亿JWT"
+jwt_token = "YOUR_OUYI_JWT_TOKEN_HERE"
 app_version = "3.0.3"
 
 [admin]
-jwt_secret = "管理面板JWT密钥"
-password_hash = "bcrypt哈希，首次启动自动生成"
+jwt_secret = "your-admin-jwt-secret-change-this"
+password_hash = "bcrypt-hash-generate-with-python-or-h-tools"
 ```
 
 也可以通过环境变量 `OUYI_CONFIG` 指定配置文件路径。
@@ -51,6 +51,7 @@ mode = "native"
 provider = "anthropic"
 base_url = "https://api.anthropic.com"
 api_key_env = "ANTHROPIC_API_KEY"
+# 环境变量 ANTHROPIC_API_KEY=YOUR_ANTHROPIC_API_KEY_HERE
 model = "claude-sonnet-4-7"
 timeout_secs = 120
 ```

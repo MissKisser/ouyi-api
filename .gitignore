@@ -1,3 +1,33 @@
 /target
 web/node_modules/
 .worktrees/
+
+# 敏感配置文件 - 包含 API Token
+config.toml
+
+# Claude Code 本地配置和缓存
+.claude/
+
+# oh-my-claudecode 开发工具目录
+.omc/
+
+# Playwright MCP 测试产物
+.playwright-mcp/
+
+# IDE 配置
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# 系统文件
+.DS_Store
+Thumbs.db
+
+# 日志文件
+*.log
+logs/
+
+# 临时文件
+*.tmp
+*.temp

@@ -1,0 +1,33 @@
+# ouyi-api 配置模板
+# 请复制此文件为 config.toml 并填入真实配置
+
+[server]
+host = "127.0.0.1"
+port = 3000
+
+[ouyi]
+# 上游 API 地址
+base_url = "https://ai8.rcouyi.com"
+# 上游平台 JWT Token（从欧亿平台获取）
+jwt_token = "YOUR_OUYI_JWT_TOKEN_HERE"
+# 上游 App 版本
+app_version = "3.0.3"
+# 模型列表刷新间隔（秒）
+model_refresh_interval_secs = 1800
+
+[limits]
+# 请求超时时间（秒）
+request_timeout_secs = 180
+# 无数据超时时间（秒）
+no_data_timeout_secs = 30
+# 最大响应体大小（字节）
+max_response_bytes = 2097152
+# 最大消息体大小（字节）
+max_messages_bytes = 2097152
+
+[admin]
+# JWT 密钥（用于管理面板认证）
+jwt_secret = "your-admin-jwt-secret-change-this"
+# 管理员密码 bcrypt 哈希（使用 bcrypt 生成）
+# 示例：密码 "admin123" 的哈希
+password_hash = "$2b$12$xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"
