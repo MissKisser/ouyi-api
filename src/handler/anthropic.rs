@@ -252,7 +252,7 @@ fn format_tool_results_for_reuse(req: &MessagesRequest) -> String {
         return String::new();
     }
     parts.push(
-        "请根据以上工具执行结果继续。如果需要再次调用工具，请直接输出工具调用标记。".to_string(),
+        "请根据以上工具执行结果继续。如果需要再次调用工具，请表达工具意图；长文本继续使用 ouyi_payload。".to_string(),
     );
     parts.join("\n\n")
 }
@@ -1677,6 +1677,7 @@ fn build_tool_use_stream_response(
             content_block: ContentBlockStart::ToolUse {
                 id: call.id,
                 name: call.name,
+                input: serde_json::json!({}),
             },
         }));
         events.push(serialize_stream_event(&StreamEvent::ContentBlockDelta {
@@ -2236,6 +2237,7 @@ mod tests {
         assert!(result.contains("file1.rs"));
         assert!(result.contains("file2.rs"));
         assert!(result.contains("请根据以上工具执行结果继续"));
+        assert!(!result.contains("直接输出工具调用标记"));
         // 不应包含工具指令
         assert!(!result.contains("You have access to the following tools"));
         assert!(!result.contains("[System]"));

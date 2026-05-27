@@ -15,7 +15,7 @@ fn parse_arguments_json(arguments: &str, tool_name: &str) -> Option<serde_json::
     let repaired = repair_json(arguments)?;
     match serde_json::from_str(&repaired) {
         Ok(v) => {
-            tracing::info!(%tool_name, "工具参数 JSON 已自动修复");
+            tracing::info!(%tool_name, "工具参数 JSON 已自动整理");
             Some(v)
         }
         Err(e) => {

@@ -9,12 +9,22 @@ const REF_FIELDS: &[(&str, &str)] = &[
     ("command_ref", "command"),
 ];
 
+const LONG_TEXT_FIELDS: &[&str] = &["content", "old_string", "new_string", "command"];
+
 pub fn materialize_payload_refs(
     value: &mut serde_json::Value,
     payloads: &[ToolPayload],
 ) -> Result<(), String> {
     match value {
         serde_json::Value::Object(obj) => {
+            for key in LONG_TEXT_FIELDS {
+                if let Some(text) = obj.get(*key).and_then(|v| v.as_str())
+                    && text.len() > LONG_TEXT_LIMIT
+                {
+                    return Err("长文本字段需要使用 payload 引用".to_string());
+                }
+            }
+
             for (ref_key, target_key) in REF_FIELDS {
                 if let Some(ref_value) = obj.remove(*ref_key) {
                     if obj.contains_key(*target_key) {
@@ -31,14 +41,6 @@ pub fn materialize_payload_refs(
                         (*target_key).to_string(),
                         serde_json::Value::String(payload.body.clone()),
                     );
-                }
-            }
-
-            for key in ["content", "old_string", "new_string", "command"] {
-                if let Some(text) = obj.get(key).and_then(|v| v.as_str()) {
-                    if text.len() > LONG_TEXT_LIMIT {
-                        return Err("长文本字段需要使用 payload 引用".to_string());
-                    }
                 }
             }
 
@@ -91,6 +93,25 @@ mod tests {
         materialize_payload_refs(&mut input, &payloads()).unwrap();
 
         assert_eq!(input["content"], "# 报告\n\"quote\"");
+        assert!(input.get("content_ref").is_none());
+    }
+
+    #[test]
+    fn materializes_long_payload_ref_without_length_rejection() {
+        let body = "x".repeat(1500);
+        let payloads = vec![ToolPayload {
+            id: "long".to_string(),
+            body: body.clone(),
+            byte_len: body.len(),
+        }];
+        let mut input = serde_json::json!({
+            "file_path": "docs/report.md",
+            "content_ref": "long"
+        });
+
+        materialize_payload_refs(&mut input, &payloads).unwrap();
+
+        assert_eq!(input["content"], body);
         assert!(input.get("content_ref").is_none());
     }
 

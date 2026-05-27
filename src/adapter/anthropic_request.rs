@@ -26,9 +26,7 @@ const TOOL_CALL_FORMAT: &str = concat!(
     "工具模型只会编译工具调用协议，不会生成或改写 payload 正文。长文本字段会以 content_ref、old_string_ref、new_string_ref 引用 payload id。\n"
 );
 
-const TOOL_CALL_REMINDER: &str = concat!(
-    "\n\n【工具调用提醒】如果你无法仅凭已有知识完成当前任务，请思考需要调用哪个工具，然后直接输出工具调用标记。不要犹豫，直接行动。",
-);
+const TOOL_CALL_REMINDER: &str = "\n\n【工具调用提醒】如果需要使用工具，请表达工具意图；长文本放入 ouyi_payload，服务端会转换为 Claude Code 工具调用。";
 
 fn truncate_utf8_by_byte_limit_with_notice(content: &str, max_bytes: usize) -> String {
     if content.len() <= max_bytes {
@@ -423,6 +421,7 @@ mod tests {
         let block = build_tool_instruction_block(&tools);
         assert!(block.contains("<ouyi_payload id=\"p1\">"));
         assert!(block.contains("content_ref"));
+        assert!(!block.contains("直接输出工具调用标记"));
         assert!(!block.contains("<|tool\u{2581}calls\u{2581}begin|>[{\"name\": \"Write\""));
     }
 

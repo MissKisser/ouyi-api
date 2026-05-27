@@ -564,6 +564,7 @@ async fn compile_for_openai_endpoint(
                     config,
                     &openai_request,
                     &valid_tool_names,
+                    &context.payloads,
                 )
                 .await
             }
@@ -902,6 +903,7 @@ async fn compile_tool_decision_openai(
                     config,
                     &openai_request,
                     &valid_tool_names,
+                    &[],
                 )
                 .await
             }
@@ -1015,25 +1017,9 @@ async fn retry_with_structured_prompt(
     config: &ToolRuntimeConfig,
     original_request: &OpenAiChatRequest,
     valid_tool_names: &[String],
+    payloads: &[crate::tool_runtime::payload::ToolPayload],
 ) -> Result<CompilerResult, AppError> {
-    let retry_request = OpenAiChatRequest {
-        model: original_request.model.clone(),
-        messages: vec![
-            OpenAiMessage {
-                role: "system".to_string(),
-                content: "你是 Claude Code 工具协议编译器。你的任务是把欧亿主脑已经表达出的工具意图转换为结构化 tool_calls。报告正文、代码正文、文件正文必须来自欧亿 payload 引用；长文本字段使用 content_ref、old_string_ref、new_string_ref，不生成或改写正文。没有明确工具意图时不返回 tool_calls。不要添加解释。".to_string(),
-            },
-            OpenAiMessage {
-                role: "user".to_string(),
-                content: format!(
-                    "请重新解析并返回 tool_calls。可用工具：{}。必须确保 arguments 是合法 JSON object。",
-                    valid_tool_names.join(", ")
-                ),
-            },
-        ],
-        tools: original_request.tools.clone(),
-        tool_choice: OpenAiToolChoice::String("auto".to_string()),
-    };
+    let retry_request = build_retry_request(original_request, valid_tool_names);
 
     let base_url = config
         .base_url
@@ -1097,6 +1083,7 @@ async fn retry_with_structured_prompt(
                 usage,
             })
         } else {
+            let compiled_calls = materialize_compiled_calls(compiled_calls, payloads)?;
             Ok(CompilerResult {
                 decision: CompilerDecision::ToolCalls(compiled_calls),
                 usage,
@@ -1107,6 +1094,27 @@ async fn retry_with_structured_prompt(
             decision: CompilerDecision::FinalAnswer,
             usage,
         })
+    }
+}
+
+fn build_retry_request(
+    original_request: &OpenAiChatRequest,
+    valid_tool_names: &[String],
+) -> OpenAiChatRequest {
+    let mut messages = original_request.messages.clone();
+    messages.push(OpenAiMessage {
+        role: "user".to_string(),
+        content: format!(
+            "上一次 tool_calls 参数无法解析。请基于前面的 Ouyi 主脑输出重新返回 tool_calls。可用工具：{}。arguments 必须是合法 JSON object；长文本字段继续使用已有 payload 引用。",
+            valid_tool_names.join(", ")
+        ),
+    });
+
+    OpenAiChatRequest {
+        model: original_request.model.clone(),
+        messages,
+        tools: original_request.tools.clone(),
+        tool_choice: original_request.tool_choice.clone(),
     }
 }
 
@@ -1340,5 +1348,145 @@ mod tests {
         assert!(message.contains("p1"));
         assert!(message.contains("bytes"));
         assert!(!message.contains("# 私有报告正文"));
+    }
+
+    #[test]
+    fn test_retry_request_preserves_original_compiler_context() {
+        let original = OpenAiChatRequest {
+            model: "tool-model".to_string(),
+            messages: vec![
+                OpenAiMessage {
+                    role: "system".to_string(),
+                    content: "协议编译器".to_string(),
+                },
+                OpenAiMessage {
+                    role: "user".to_string(),
+                    content: concat!(
+                        "Ouyi 主脑输出：<ouyi_payload_ref id=\"p1\" bytes=\"20\" />\n",
+                        "payload 可用列表：\n",
+                        "- id: p1, bytes: 20\n"
+                    )
+                    .to_string(),
+                },
+            ],
+            tools: vec![
+                convert_tool_specs_to_openai(&[ToolSpec {
+                    name: "Write".to_string(),
+                    description: "Write file".to_string(),
+                    input_schema: serde_json::json!({
+                        "type": "object",
+                        "properties": {
+                            "file_path": {"type": "string"},
+                            "content_ref": {"type": "string"}
+                        },
+                        "required": ["file_path", "content_ref"]
+                    }),
+                }])
+                .remove(0),
+            ],
+            tool_choice: OpenAiToolChoice::String("auto".to_string()),
+        };
+
+        let retry = build_retry_request(&original, &["Write".to_string()]);
+        let joined_messages = retry
+            .messages
+            .iter()
+            .map(|message| message.content.as_str())
+            .collect::<Vec<_>>()
+            .join("\n");
+
+        assert!(joined_messages.contains("Ouyi 主脑输出"));
+        assert!(joined_messages.contains("payload 可用列表"));
+        assert!(joined_messages.contains("p1"));
+        assert!(joined_messages.contains("Write"));
+    }
+
+    #[tokio::test]
+    async fn test_retry_materializes_payload_refs() {
+        use axum::{Json, Router, routing::post};
+        use tokio::net::TcpListener;
+
+        async fn handler() -> Json<serde_json::Value> {
+            Json(serde_json::json!({
+                "choices": [{
+                    "message": {
+                        "tool_calls": [{
+                            "id": "call_retry",
+                            "function": {
+                                "name": "Write",
+                                "arguments": "{\"file_path\":\"docs/report.md\",\"content_ref\":\"p1\"}"
+                            }
+                        }]
+                    }
+                }],
+                "usage": {"prompt_tokens": 1, "completion_tokens": 1}
+            }))
+        }
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            axum::serve(
+                listener,
+                Router::new().route("/chat/completions", post(handler)),
+            )
+            .await
+            .unwrap();
+        });
+
+        let original = OpenAiChatRequest {
+            model: "tool-model".to_string(),
+            messages: vec![OpenAiMessage {
+                role: "user".to_string(),
+                content: "Ouyi 主脑输出：<ouyi_payload_ref id=\"p1\" bytes=\"1500\" />".to_string(),
+            }],
+            tools: convert_tool_specs_to_openai(&[ToolSpec {
+                name: "Write".to_string(),
+                description: "Write file".to_string(),
+                input_schema: serde_json::json!({
+                    "type": "object",
+                    "properties": {
+                        "file_path": {"type": "string"},
+                        "content_ref": {"type": "string"}
+                    },
+                    "required": ["file_path", "content_ref"]
+                }),
+            }]),
+            tool_choice: OpenAiToolChoice::String("auto".to_string()),
+        };
+        let body = "x".repeat(1500);
+        let payloads = vec![crate::tool_runtime::payload::ToolPayload {
+            id: "p1".to_string(),
+            body: body.clone(),
+            byte_len: body.len(),
+        }];
+        let config = ToolRuntimeConfig {
+            enabled: true,
+            mode: crate::config::ToolRuntimeMode::Compiler,
+            provider: ToolRuntimeProvider::OpenaiCompatible,
+            base_url: Some(format!("http://{}", addr)),
+            api_key: Some("test-key".to_string()),
+            api_key_env: None,
+            model: Some("tool-model".to_string()),
+            timeout_secs: 5,
+        };
+
+        let result = retry_with_structured_prompt(
+            reqwest::Client::new(),
+            &config,
+            &original,
+            &["Write".to_string()],
+            &payloads,
+        )
+        .await
+        .unwrap();
+
+        match result.decision {
+            CompilerDecision::ToolCalls(calls) => {
+                assert_eq!(calls[0].input["content"], body);
+                assert!(calls[0].input.get("content_ref").is_none());
+            }
+            CompilerDecision::FinalAnswer => panic!("expected retry tool call"),
+        }
     }
 }
