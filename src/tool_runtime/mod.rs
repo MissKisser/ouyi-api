@@ -7,6 +7,7 @@ use crate::model::anthropic::{AnthropicContent, ContentBlock, MessagesRequest};
 
 pub mod broker;
 pub mod decision;
+pub mod materialize;
 pub mod openai_compiler;
 pub mod payload;
 pub mod protocol;
