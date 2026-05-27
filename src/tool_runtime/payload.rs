@@ -102,7 +102,7 @@ mod tests {
         assert_eq!(extracted.payloads.len(), 1);
         assert_eq!(extracted.payloads[0].id, "p1");
         assert_eq!(extracted.payloads[0].body, "# 标题\n\"quote\"");
-        assert!(extracted.sanitized_text.contains("<ouyi_payload_ref id=\"p1\" bytes=\"18\" />"));
+        assert!(extracted.sanitized_text.contains("<ouyi_payload_ref id=\"p1\" bytes=\"16\" />"));
         assert!(!extracted.sanitized_text.contains("# 标题"));
     }
 
