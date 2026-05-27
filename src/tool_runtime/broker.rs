@@ -1,4 +1,4 @@
-use crate::adapter::tool_call::{repair_json, ToolCallParser};
+use crate::adapter::tool_call::{ToolCallParser, repair_json};
 use crate::config::ToolRuntimeConfig;
 use crate::error::AppError;
 use crate::model::anthropic::MessagesRequest;
@@ -321,7 +321,8 @@ pub async fn decide_with_broker(
     let payload_extraction = crate::tool_runtime::payload::extract_payloads(ouyi_output);
     let decision_text = payload_extraction.sanitized_text.as_str();
 
-    let marked = parse_marked_tool_calls(decision_text, &tool_specs).map_err(AppError::BadRequest)?;
+    let marked =
+        parse_marked_tool_calls(decision_text, &tool_specs).map_err(AppError::BadRequest)?;
     if !marked.is_empty() {
         return Ok(BrokerDecision::ToolCalls(marked));
     }
@@ -336,21 +337,22 @@ pub async fn decide_with_broker(
         return Ok(BrokerDecision::FinalAnswer { usage: None });
     };
 
-    let compiled = match crate::tool_runtime::openai_compiler::compile_tool_decision_with_usage_and_payloads(
-        http_client,
-        config,
-        req,
-        decision_text,
-        payload_extraction.payloads,
-    )
-    .await
-    {
-        Ok(compiled) => compiled,
-        Err(e) => {
-            tracing::warn!(error = %e, "工具协议编译失败，降级为主脑文本");
-            return Ok(BrokerDecision::FinalAnswer { usage: None });
-        }
-    };
+    let compiled =
+        match crate::tool_runtime::openai_compiler::compile_tool_decision_with_usage_and_payloads(
+            http_client,
+            config,
+            req,
+            decision_text,
+            payload_extraction.payloads,
+        )
+        .await
+        {
+            Ok(compiled) => compiled,
+            Err(e) => {
+                tracing::warn!(error = %e, "工具协议编译失败，降级为主脑文本");
+                return Ok(BrokerDecision::FinalAnswer { usage: None });
+            }
+        };
 
     match compiled.decision {
         crate::tool_runtime::openai_compiler::CompilerDecision::ToolCalls(calls) => {

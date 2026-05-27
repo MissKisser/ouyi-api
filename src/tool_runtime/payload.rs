@@ -24,14 +24,20 @@ pub fn extract_payloads(input: &str) -> PayloadExtraction {
         let after_open_start = &rest[open_pos..];
         let Some(open_end) = after_open_start.find('>') else {
             sanitized.push_str(after_open_start);
-            return PayloadExtraction { sanitized_text: sanitized, payloads };
+            return PayloadExtraction {
+                sanitized_text: sanitized,
+                payloads,
+            };
         };
         let open_tag = &after_open_start[..=open_end];
         let body_start = open_pos + open_end + 1;
         let after_body_start = &rest[body_start..];
         let Some(close_pos) = after_body_start.find(CLOSE_TAG) else {
             sanitized.push_str(after_open_start);
-            return PayloadExtraction { sanitized_text: sanitized, payloads };
+            return PayloadExtraction {
+                sanitized_text: sanitized,
+                payloads,
+            };
         };
 
         let raw_body = &after_body_start[..close_pos];
@@ -61,7 +67,10 @@ pub fn extract_payloads(input: &str) -> PayloadExtraction {
 }
 
 fn trim_wrapper_newline(raw: &str) -> &str {
-    let without_start = raw.strip_prefix("\r\n").or_else(|| raw.strip_prefix('\n')).unwrap_or(raw);
+    let without_start = raw
+        .strip_prefix("\r\n")
+        .or_else(|| raw.strip_prefix('\n'))
+        .unwrap_or(raw);
     without_start
         .strip_suffix("\r\n")
         .or_else(|| without_start.strip_suffix('\n'))
@@ -95,14 +104,19 @@ mod tests {
 
     #[test]
     fn extracts_payload_and_replaces_body_with_ref() {
-        let input = "准备写入：\n<ouyi_payload id=\"p1\">\n# 标题\n\"quote\"\n</ouyi_payload>\n完成。";
+        let input =
+            "准备写入：\n<ouyi_payload id=\"p1\">\n# 标题\n\"quote\"\n</ouyi_payload>\n完成。";
 
         let extracted = extract_payloads(input);
 
         assert_eq!(extracted.payloads.len(), 1);
         assert_eq!(extracted.payloads[0].id, "p1");
         assert_eq!(extracted.payloads[0].body, "# 标题\n\"quote\"");
-        assert!(extracted.sanitized_text.contains("<ouyi_payload_ref id=\"p1\" bytes=\"16\" />"));
+        assert!(
+            extracted
+                .sanitized_text
+                .contains("<ouyi_payload_ref id=\"p1\" bytes=\"16\" />")
+        );
         assert!(!extracted.sanitized_text.contains("# 标题"));
     }
 

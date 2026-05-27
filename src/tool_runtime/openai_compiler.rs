@@ -348,7 +348,8 @@ pub async fn compile_tool_decision_with_usage(
     req: &MessagesRequest,
     ouyi_output: &str,
 ) -> Result<CompilerResult, AppError> {
-    compile_tool_decision_with_usage_and_payloads(http_client, config, req, ouyi_output, Vec::new()).await
+    compile_tool_decision_with_usage_and_payloads(http_client, config, req, ouyi_output, Vec::new())
+        .await
 }
 
 /// 带 payload 的工具决策编译（旧函数委托至此）
@@ -383,30 +384,29 @@ pub async fn compile_tool_decision_with_usage_and_payloads(
             }
         });
 
-    let latest_tool_result = crate::tool_runtime::latest_tool_result_id(req)
-        .and_then(|id| {
-            req.messages.iter().rev().find_map(|m| {
-                if let crate::model::anthropic::AnthropicContent::Blocks(blocks) = &m.content {
-                    blocks.iter().rev().find_map(|b| {
-                        if let crate::model::anthropic::ContentBlock::ToolResult {
-                            tool_use_id,
-                            content,
-                        } = b
-                        {
-                            if tool_use_id == &id {
-                                Some(content.clone())
-                            } else {
-                                None
-                            }
+    let latest_tool_result = crate::tool_runtime::latest_tool_result_id(req).and_then(|id| {
+        req.messages.iter().rev().find_map(|m| {
+            if let crate::model::anthropic::AnthropicContent::Blocks(blocks) = &m.content {
+                blocks.iter().rev().find_map(|b| {
+                    if let crate::model::anthropic::ContentBlock::ToolResult {
+                        tool_use_id,
+                        content,
+                    } = b
+                    {
+                        if tool_use_id == &id {
+                            Some(content.clone())
                         } else {
                             None
                         }
-                    })
-                } else {
-                    None
-                }
-            })
-        });
+                    } else {
+                        None
+                    }
+                })
+            } else {
+                None
+            }
+        })
+    });
 
     let context = ToolRuntimeRequestContext {
         endpoint: ToolEndpointKind::Anthropic,
@@ -765,9 +765,14 @@ fn build_compiler_user_message_from_context(
     if !context.payloads.is_empty() {
         content.push_str("\npayload 可用列表：\n");
         for payload in &context.payloads {
-            content.push_str(&format!("- id: {}, bytes: {}\n", payload.id, payload.byte_len));
+            content.push_str(&format!(
+                "- id: {}, bytes: {}\n",
+                payload.id, payload.byte_len
+            ));
         }
-        content.push_str("长文本字段必须引用 payload id，例如 content_ref、old_string_ref、new_string_ref。\n");
+        content.push_str(
+            "长文本字段必须引用 payload id，例如 content_ref、old_string_ref、new_string_ref。\n",
+        );
     }
 
     content

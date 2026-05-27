@@ -5,7 +5,10 @@ pub fn compiler_tool_spec(spec: &ToolSpec) -> ToolSpec {
         "Write" => rewrite_object_fields(spec, &[("content", "content_ref")]),
         "Edit" => rewrite_object_fields(
             spec,
-            &[("old_string", "old_string_ref"), ("new_string", "new_string_ref")],
+            &[
+                ("old_string", "old_string_ref"),
+                ("new_string", "new_string_ref"),
+            ],
         ),
         "MultiEdit" => rewrite_multiedit(spec),
         _ => spec.clone(),
@@ -117,12 +120,19 @@ mod tests {
     fn rewrites_write_content_to_content_ref() {
         let rewritten = compiler_tool_spec(&write_spec());
 
-        assert!(rewritten.input_schema["properties"].get("content").is_none());
+        assert!(
+            rewritten.input_schema["properties"]
+                .get("content")
+                .is_none()
+        );
         assert_eq!(
             rewritten.input_schema["properties"]["content_ref"]["description"],
             "引用欧亿主脑输出中的 ouyi_payload id"
         );
-        assert_eq!(rewritten.input_schema["required"], serde_json::json!(["file_path", "content_ref"]));
+        assert_eq!(
+            rewritten.input_schema["required"],
+            serde_json::json!(["file_path", "content_ref"])
+        );
     }
 
     #[test]
