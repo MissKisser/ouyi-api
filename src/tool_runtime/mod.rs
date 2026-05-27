@@ -11,6 +11,7 @@ pub mod materialize;
 pub mod openai_compiler;
 pub mod payload;
 pub mod protocol;
+pub mod schema;
 
 fn uuid_short() -> String {
     use std::time::{SystemTime, UNIX_EPOCH};
