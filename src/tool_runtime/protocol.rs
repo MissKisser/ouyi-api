@@ -35,6 +35,7 @@ pub struct ToolRuntimeRequestContext {
     pub latest_tool_result: Option<String>,
     pub tools: Vec<ToolSpec>,
     pub tool_choice: Option<ToolChoiceSpec>,
+    pub payloads: Vec<crate::tool_runtime::payload::ToolPayload>,
 }
 
 /// 将 OpenAI 工具定义转换为协议无关规格
@@ -114,6 +115,7 @@ pub fn openai_request_to_context(
         latest_tool_result,
         tools,
         tool_choice,
+        payloads: Vec::new(),
     }
 }
 
@@ -347,5 +349,26 @@ mod tests {
             ctx.tool_choice,
             Some(ToolChoiceSpec::Tool("Read".to_string()))
         );
+    }
+
+    #[test]
+    fn test_context_accepts_payload_metadata() {
+        let mut ctx = ToolRuntimeRequestContext {
+            endpoint: ToolEndpointKind::OpenAi,
+            model: "claude-test".to_string(),
+            latest_user_text: Some("write report".to_string()),
+            latest_tool_result: None,
+            tool_choice: None,
+            tools: vec![],
+            payloads: vec![crate::tool_runtime::payload::ToolPayload {
+                id: "p1".to_string(),
+                body: "report".to_string(),
+                byte_len: 6,
+            }],
+        };
+
+        assert_eq!(ctx.payloads[0].id, "p1");
+        ctx.payloads.clear();
+        assert!(ctx.payloads.is_empty());
     }
 }
