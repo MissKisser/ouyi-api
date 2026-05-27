@@ -348,14 +348,77 @@ pub async fn compile_tool_decision_with_usage(
     req: &MessagesRequest,
     ouyi_output: &str,
 ) -> Result<CompilerResult, AppError> {
-    match config.provider {
-        ToolRuntimeProvider::OpenaiCompatible => {
-            compile_tool_decision_openai(http_client, config, req, ouyi_output).await
-        }
-        ToolRuntimeProvider::Anthropic => {
-            compile_tool_decision_anthropic(http_client, config, req, ouyi_output).await
-        }
-    }
+    compile_tool_decision_with_usage_and_payloads(http_client, config, req, ouyi_output, Vec::new()).await
+}
+
+/// 带 payload 的工具决策编译（旧函数委托至此）
+pub async fn compile_tool_decision_with_usage_and_payloads(
+    http_client: reqwest::Client,
+    config: &ToolRuntimeConfig,
+    req: &MessagesRequest,
+    ouyi_output: &str,
+    payloads: Vec<crate::tool_runtime::payload::ToolPayload>,
+) -> Result<CompilerResult, AppError> {
+    let tool_specs: Vec<ToolSpec> = req
+        .tools
+        .as_ref()
+        .map(|tools| crate::tool_runtime::protocol::anthropic_tools_to_specs(tools.as_slice()))
+        .unwrap_or_default();
+
+    let latest_user_text = req
+        .messages
+        .iter()
+        .rev()
+        .find(|m| m.role == "user")
+        .and_then(|m| match &m.content {
+            crate::model::anthropic::AnthropicContent::Text(t) => Some(t.clone()),
+            crate::model::anthropic::AnthropicContent::Blocks(blocks) => {
+                blocks.iter().rev().find_map(|b| {
+                    if let crate::model::anthropic::ContentBlock::Text { text } = b {
+                        Some(text.clone())
+                    } else {
+                        None
+                    }
+                })
+            }
+        });
+
+    let latest_tool_result = crate::tool_runtime::latest_tool_result_id(req)
+        .and_then(|id| {
+            req.messages.iter().rev().find_map(|m| {
+                if let crate::model::anthropic::AnthropicContent::Blocks(blocks) = &m.content {
+                    blocks.iter().rev().find_map(|b| {
+                        if let crate::model::anthropic::ContentBlock::ToolResult {
+                            tool_use_id,
+                            content,
+                        } = b
+                        {
+                            if tool_use_id == &id {
+                                Some(content.clone())
+                            } else {
+                                None
+                            }
+                        } else {
+                            None
+                        }
+                    })
+                } else {
+                    None
+                }
+            })
+        });
+
+    let context = ToolRuntimeRequestContext {
+        endpoint: ToolEndpointKind::Anthropic,
+        model: req.model.clone(),
+        latest_user_text,
+        latest_tool_result,
+        tools: tool_specs,
+        tool_choice: None,
+        payloads,
+    };
+
+    compile_tool_decision_for_context(http_client, config, &context, ouyi_output).await
 }
 
 /// 基于协议无关上下文编译工具决策

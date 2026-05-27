@@ -86,11 +86,14 @@ pub async fn decide_openai_tools_from_text(
         .map(|tools| openai_tools_to_specs(tools.as_slice()))
         .unwrap_or_default();
 
+    let payload_extraction = crate::tool_runtime::payload::extract_payloads(main_model_output);
+    let decision_text = payload_extraction.sanitized_text.as_str();
+
     let marked_calls =
-        crate::tool_runtime::broker::parse_marked_tool_calls(main_model_output, &tool_specs)
+        crate::tool_runtime::broker::parse_marked_tool_calls(decision_text, &tool_specs)
             .map_err(AppError::BadRequest)?;
     let rule_calls = if marked_calls.is_empty() {
-        crate::tool_runtime::broker::parse_rule_tool_intent(main_model_output, &tool_specs)
+        crate::tool_runtime::broker::parse_rule_tool_intent(decision_text, &tool_specs)
             .map_err(AppError::BadRequest)?
     } else {
         Vec::new()
@@ -133,12 +136,13 @@ pub async fn decide_openai_tools_from_text(
         });
     };
 
-    let context = openai_request_to_context(req, tool_specs);
+    let mut context = openai_request_to_context(req, tool_specs);
+    context.payloads = payload_extraction.payloads;
     let compiled = crate::tool_runtime::openai_compiler::compile_tool_decision_for_context(
         http_client,
         config,
         &context,
-        main_model_output,
+        decision_text,
     )
     .await?;
 

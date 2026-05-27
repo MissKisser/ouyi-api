@@ -70,7 +70,8 @@ pub fn parse_marked_tool_calls(
             .filter(|name| !name.is_empty())
             .ok_or_else(|| "工具调用缺少 name".to_string())?;
         if find_tool(tools, &name).is_none() {
-            return Err(format!("未知工具: {}", name));
+            tracing::warn!(%name, "主模型输出未知工具，已跳过");
+            continue;
         }
         let arguments = func.arguments.unwrap_or_else(|| "{}".to_string());
         let input = match parse_arguments_json(&arguments, &name) {
@@ -317,13 +318,16 @@ pub async fn decide_with_broker(
         .map(|tools| crate::tool_runtime::protocol::anthropic_tools_to_specs(tools.as_slice()))
         .unwrap_or_default();
 
-    let marked = parse_marked_tool_calls(ouyi_output, &tool_specs).map_err(AppError::BadRequest)?;
+    let payload_extraction = crate::tool_runtime::payload::extract_payloads(ouyi_output);
+    let decision_text = payload_extraction.sanitized_text.as_str();
+
+    let marked = parse_marked_tool_calls(decision_text, &tool_specs).map_err(AppError::BadRequest)?;
     if !marked.is_empty() {
         return Ok(BrokerDecision::ToolCalls(marked));
     }
 
     let rule_calls =
-        parse_rule_tool_intent(ouyi_output, &tool_specs).map_err(AppError::BadRequest)?;
+        parse_rule_tool_intent(decision_text, &tool_specs).map_err(AppError::BadRequest)?;
     if !rule_calls.is_empty() {
         return Ok(BrokerDecision::ToolCalls(rule_calls));
     }
@@ -332,13 +336,21 @@ pub async fn decide_with_broker(
         return Ok(BrokerDecision::FinalAnswer { usage: None });
     };
 
-    let compiled = crate::tool_runtime::openai_compiler::compile_tool_decision_with_usage(
+    let compiled = match crate::tool_runtime::openai_compiler::compile_tool_decision_with_usage_and_payloads(
         http_client,
         config,
         req,
-        ouyi_output,
+        decision_text,
+        payload_extraction.payloads,
     )
-    .await?;
+    .await
+    {
+        Ok(compiled) => compiled,
+        Err(e) => {
+            tracing::warn!(error = %e, "工具协议编译失败，降级为主脑文本");
+            return Ok(BrokerDecision::FinalAnswer { usage: None });
+        }
+    };
 
     match compiled.decision {
         crate::tool_runtime::openai_compiler::CompilerDecision::ToolCalls(calls) => {
@@ -408,7 +420,7 @@ mod tests {
     }
 
     #[test]
-    fn test_parse_marked_tool_call_rejects_unknown_tool() {
+    fn test_parse_marked_tool_call_skips_unknown_tool() {
         let tools = vec![bash_spec()];
         let output = concat!(
             "<|tool▁calls▁begin|>",
@@ -416,8 +428,9 @@ mod tests {
             "<|tool▁calls▁end|>"
         );
 
-        let err = parse_marked_tool_calls(output, &tools).unwrap_err();
-        assert!(err.contains("未知工具"));
+        let calls = parse_marked_tool_calls(output, &tools).unwrap();
+
+        assert!(calls.is_empty());
     }
 
     #[test]
