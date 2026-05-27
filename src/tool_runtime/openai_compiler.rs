@@ -395,7 +395,8 @@ async fn compile_for_openai_endpoint(
     ouyi_output: &str,
 ) -> Result<CompilerResult, AppError> {
     let valid_tool_names: Vec<String> = context.tools.iter().map(|t| t.name.clone()).collect();
-    let openai_tools = convert_tool_specs_to_openai(&context.tools);
+    let compiler_specs = crate::tool_runtime::schema::compiler_tool_specs(&context.tools);
+    let openai_tools = convert_tool_specs_to_openai(&compiler_specs);
 
     let tool_choice = context
         .tool_choice
@@ -482,10 +483,13 @@ async fn compile_for_openai_endpoint(
         }
 
         match parse_openai_tool_calls(tool_calls, &valid_tool_names) {
-            Ok(calls) if !calls.is_empty() => Ok(CompilerResult {
-                decision: CompilerDecision::ToolCalls(calls),
-                usage,
-            }),
+            Ok(calls) if !calls.is_empty() => {
+                let calls = materialize_compiled_calls(calls, &context.payloads)?;
+                Ok(CompilerResult {
+                    decision: CompilerDecision::ToolCalls(calls),
+                    usage,
+                })
+            }
             Ok(_) => Ok(CompilerResult {
                 decision: CompilerDecision::FinalAnswer,
                 usage,
@@ -546,12 +550,13 @@ async fn compile_for_anthropic_provider(
     let base_url = base_url.strip_suffix("/v1").unwrap_or(base_url);
     let api_key = config.get_api_key()?;
 
-    let tools = convert_tool_specs_to_anthropic(&context.tools);
+    let compiler_specs = crate::tool_runtime::schema::compiler_tool_specs(&context.tools);
+    let tools = convert_tool_specs_to_anthropic(&compiler_specs);
     let tool_choice = convert_tool_choice_spec_to_anthropic(context.tool_choice.as_ref());
 
     let request = AnthropicCompilerRequest {
         model: model.clone(),
-        system: "你是工具调用编译器。你的唯一任务是将 Ouyi 主脑输出中的工具意图转换为结构化的 tool_use。如果 Ouyi 输出明确表示需要调用工具，你必须调用对应工具；如果 Ouyi 输出是最终回答或不需要工具，则不要调用工具。不要添加任何额外解释。".to_string(),
+        system: "你是 Claude Code 工具协议编译器。你的任务是把欧亿主脑已经表达出的工具意图转换为结构化 tool_use。报告正文、代码正文、文件正文必须来自欧亿 payload 引用；长文本字段使用 content_ref、old_string_ref、new_string_ref，不生成或改写正文。没有明确工具意图时不调用工具。不要添加解释。".to_string(),
         messages: vec![AnthropicCompilerMessage {
             role: "user".to_string(),
             content: build_compiler_user_message_from_context(context, ouyi_output),
@@ -603,6 +608,7 @@ async fn compile_for_anthropic_provider(
             usage,
         })
     } else {
+        let calls = materialize_compiled_calls(calls, &context.payloads)?;
         Ok(CompilerResult {
             decision: CompilerDecision::ToolCalls(calls),
             usage,
@@ -692,6 +698,14 @@ fn build_compiler_user_message_from_context(
         "如果上述内容表达了工具意图，请选择最匹配的可用工具并生成合法参数。",
         "如果没有可执行工具意图，请不要调用任何工具。"
     ));
+
+    if !context.payloads.is_empty() {
+        content.push_str("\npayload 可用列表：\n");
+        for payload in &context.payloads {
+            content.push_str(&format!("- id: {}, bytes: {}\n", payload.id, payload.byte_len));
+        }
+        content.push_str("长文本字段必须引用 payload id，例如 content_ref、old_string_ref、new_string_ref。\n");
+    }
 
     content
 }
@@ -939,7 +953,7 @@ async fn retry_with_structured_prompt(
         messages: vec![
             OpenAiMessage {
                 role: "system".to_string(),
-                content: "你是工具调用编译器。你必须严格按照以下格式返回 tool_calls。每个 tool_calls 的 arguments 必须是有效的 JSON object。不要返回任何文本内容。".to_string(),
+                content: "你是 Claude Code 工具协议编译器。你的任务是把欧亿主脑已经表达出的工具意图转换为结构化 tool_calls。报告正文、代码正文、文件正文必须来自欧亿 payload 引用；长文本字段使用 content_ref、old_string_ref、new_string_ref，不生成或改写正文。没有明确工具意图时不返回 tool_calls。不要添加解释。".to_string(),
             },
             OpenAiMessage {
                 role: "user".to_string(),
@@ -1026,6 +1040,17 @@ async fn retry_with_structured_prompt(
             usage,
         })
     }
+}
+
+fn materialize_compiled_calls(
+    mut calls: Vec<CompiledToolCall>,
+    payloads: &[crate::tool_runtime::payload::ToolPayload],
+) -> Result<Vec<CompiledToolCall>, AppError> {
+    for call in &mut calls {
+        crate::tool_runtime::materialize::materialize_payload_refs(&mut call.input, payloads)
+            .map_err(|e| AppError::Upstream(format!("工具参数 payload 物化失败: {e}")))?;
+    }
+    Ok(calls)
 }
 
 #[cfg(test)]
@@ -1220,5 +1245,32 @@ mod tests {
         assert!(message.contains("只输出工具调用"));
         assert!(message.contains("不要输出最终回答"));
         assert!(!message.contains("工具详细信息列表"));
+    }
+
+    #[test]
+    fn test_compiler_user_message_lists_payload_refs_without_body() {
+        let context = crate::tool_runtime::protocol::ToolRuntimeRequestContext {
+            endpoint: crate::tool_runtime::protocol::ToolEndpointKind::Anthropic,
+            model: "claude-test".to_string(),
+            latest_user_text: Some("写报告".to_string()),
+            latest_tool_result: None,
+            tool_choice: None,
+            tools: vec![],
+            payloads: vec![crate::tool_runtime::payload::ToolPayload {
+                id: "p1".to_string(),
+                body: "# 私有报告正文".to_string(),
+                byte_len: "# 私有报告正文".len(),
+            }],
+        };
+
+        let message = build_compiler_user_message_from_context(
+            &context,
+            "Ouyi 输出：<ouyi_payload_ref id=\"p1\" bytes=\"20\" />",
+        );
+
+        assert!(message.contains("payload 可用列表"));
+        assert!(message.contains("p1"));
+        assert!(message.contains("bytes"));
+        assert!(!message.contains("# 私有报告正文"));
     }
 }
