@@ -46,7 +46,10 @@
       "completion": "输出 Token",
       "days": "天",
       "hours": "小时",
-      "minutes": "分钟"
+      "minutes": "分钟",
+      "platform": "平台",
+      "tokenValid": "Token 有效",
+      "tokenInvalid": "Token 无效"
     },
     "accountPool": {
       "title": "账号池",
@@ -73,11 +76,14 @@
       "admin": "Admin",
       "server": "服务器",
       "ouyi": "欧亿 API",
+      "ouyi7": "欧亿 7.0 API",
+      "platform": "启动平台",
       "deepseek": "DeepSeek",
       "models": "模型类型",
       "toolCallTags": "工具调用标签",
       "proxy": "代理",
-      "toolRuntime": "工具模型"
+      "toolRuntime": "Anthropic 工具模型（Claude Code）",
+      "openaiToolRuntime": "OpenAI 工具模型（Codex）"
     },
     "toolRuntime": {
       "enabled": "启用",
@@ -97,6 +103,7 @@
       "areaCode": "区号",
       "password": "密码",
       "token": "Token",
+      "tokenPlaceholder": "粘贴 JWT Token",
       "enabled": "启用",
       "add": "添加账号"
     },
@@ -125,7 +132,24 @@
       "userAgent": "User-Agent",
       "clientVersion": "Client Version",
       "clientPlatform": "Client Platform",
-      "clientLocale": "Client Locale"
+      "clientLocale": "Client Locale",
+      "jwtToken": "JWT Token",
+      "modelRefreshInterval": "模型刷新间隔（秒）"
+    },
+    "ouyi7": {
+      "baseUrl": "Base URL",
+      "chatapiPrefix": "Chat API 前缀",
+      "jwtToken": "JWT Token",
+      "defaultModel": "默认模型",
+      "modelRefreshInterval": "模型刷新间隔（秒）",
+      "maxHistoryMessages": "最大历史消息数",
+      "streamChunkChars": "模拟流分块字符数"
+    },
+    "platform": {
+      "default": "默认平台",
+      "promptOnStart": "启动时询问",
+      "ouyi7": "欧亿 7.0",
+      "ouyi8": "欧亿 8.0"
     },
     "modelsSection": {
       "typeName": "类型名",
@@ -188,7 +212,9 @@
     "available": "个可用",
     "loading": "加载中...",
     "empty": "暂无模型",
-    "clickToCopy": "点击复制模型ID"
+    "clickToCopy": "点击复制模型ID",
+    "searchPlaceholder": "搜索模型名称或ID...",
+    "allCategories": "全部"
   },
   "chat": {
     "selectModel": "选择模型",

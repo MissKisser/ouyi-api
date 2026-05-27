@@ -44,6 +44,13 @@ function formatTokens(n: number): string {
   return `${n}`;
 }
 
+function formatDateTime(value?: string): string {
+  if (!value) return '-';
+  const date = new Date(value);
+  if (Number.isNaN(date.getTime())) return value;
+  return date.toLocaleString();
+}
+
 export function DashboardPage() {
   const { t } = useTranslation();
   const { data: status, error: statusError } = useSWR<AdminStatusResponse>(
@@ -123,6 +130,30 @@ export function DashboardPage() {
           <CardContent>
             <div className="text-2xl font-bold">
               {stats ? formatUptime(stats.uptime_secs, t) : '-'}
+            </div>
+          </CardContent>
+        </Card>
+
+        {/* Platform status card */}
+        <Card>
+          <CardHeader className="flex flex-row items-center justify-between pb-2">
+            <CardTitle className="text-sm font-medium text-muted-foreground">{t('dashboard.stats.platform')}</CardTitle>
+            <Box className="h-4 w-4 text-muted-foreground" />
+          </CardHeader>
+          <CardContent>
+            <div className="text-2xl font-bold">{status?.platform?.label ?? '-'}</div>
+            <div className="flex gap-2 mt-1">
+              <span className="text-xs text-muted-foreground">
+                {status?.platform?.model_count ?? 0} {t('dashboard.stats.models')}
+              </span>
+              {status?.platform?.token_valid ? (
+                <Badge variant="outline" className="text-xs text-green-600">{t('dashboard.stats.tokenValid')}</Badge>
+              ) : (
+                <Badge variant="outline" className="text-xs text-red-500">{t('dashboard.stats.tokenInvalid')}</Badge>
+              )}
+            </div>
+            <div className="mt-2 text-xs text-muted-foreground">
+              {formatDateTime(status?.platform?.last_selected_at)}
             </div>
           </CardContent>
         </Card>

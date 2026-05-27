@@ -376,7 +376,6 @@ pub fn serialize_stream_event(event: &StreamEvent) -> bytes::Bytes {
         StreamEvent::MessageStop => {
             "event: message_stop\ndata: {\"type\":\"message_stop\"}\n\n".to_string()
         }
-        StreamEvent::Ping => "event: ping\ndata: {\"type\":\"ping\"}\n\n".to_string(),
     };
     bytes::Bytes::from(s)
 }
@@ -402,7 +401,6 @@ pub enum StreamEvent {
         usage: ResponseUsage,
     },
     MessageStop,
-    Ping,
 }
 
 #[derive(Debug, Clone, Serialize)]

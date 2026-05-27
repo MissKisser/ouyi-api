@@ -12,10 +12,13 @@ use crate::AppState;
 use crate::admin::accounts::AccountEntry;
 use crate::client::http::OuyiHttpClient;
 use crate::config::{
-    AppConfig, ToolRuntimeConfig, ToolRuntimeMode, ToolRuntimeProvider, remove_tool_runtime_config,
-    write_tool_runtime_config,
+    AppConfig, Ouyi7Config, PlatformConfig, ToolRuntimeConfig, ToolRuntimeMode,
+    ToolRuntimeProvider, remove_openai_tool_runtime_config, remove_tool_runtime_config,
+    write_admin_config, write_openai_tool_runtime_config, write_ouyi_config, write_ouyi_v7_config,
+    write_platform_config, write_server_config, write_tool_runtime_config,
 };
 use crate::handler::models::list_models as list_openai_models;
+use crate::model::mapper::ModelCategory;
 use bcrypt::{DEFAULT_COST, hash};
 
 // ── Setup / Login ─────────────────────────────────────────────────────────
@@ -43,7 +46,27 @@ pub async fn admin_setup(
             })),
         ));
     }
-    store.setup(&req.password);
+    let password_hash = match crate::admin::auth::AdminStore::hash_password(&req.password) {
+        Ok(hash) => hash,
+        Err(_) => {
+            return Err((
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(serde_json::json!({
+                    "error": "Password hashing failed"
+                })),
+            ));
+        }
+    };
+    let config_path = std::path::PathBuf::from(AppConfig::config_path());
+    if let Err(e) = write_admin_config(&config_path, &store.jwt_secret, &password_hash) {
+        return Err((
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({
+                "error": e.to_string()
+            })),
+        ));
+    }
+    store.set_password_hash(password_hash);
     let token = match store.generate_token("admin") {
         Ok(t) => t,
         Err(_) => {
@@ -64,6 +87,15 @@ pub async fn admin_login(
     Json(req): Json<LoginRequest>,
 ) -> impl IntoResponse {
     let store = state.admin_store.read().await;
+
+    if !store.setup_completed {
+        return Err((
+            StatusCode::FORBIDDEN,
+            Json(serde_json::json!({
+                "error": "Setup required"
+            })),
+        ));
+    }
 
     let client_ip = extract.0.ip().to_string();
     if !store.check_rate_limit(&client_ip) {
@@ -108,6 +140,17 @@ pub struct AdminStatusResponse {
     busy: usize,
     error: usize,
     invalid: usize,
+    platform: PlatformStatusView,
+}
+
+#[derive(Serialize)]
+pub struct PlatformStatusView {
+    platform: String,
+    label: String,
+    base_url: String,
+    model_count: usize,
+    token_valid: bool,
+    last_selected_at: Option<String>,
 }
 
 pub async fn admin_status(State(state): State<Arc<AppState>>) -> impl IntoResponse {
@@ -136,6 +179,19 @@ pub async fn admin_status(State(state): State<Arc<AppState>>) -> impl IntoRespon
         })
         .collect();
 
+    let platform_status = state.platform_status.read().await;
+    let platform_view = PlatformStatusView {
+        platform: serde_json::to_string(&platform_status.platform)
+            .unwrap_or_default()
+            .trim_matches('"')
+            .to_string(),
+        label: platform_status.label.clone(),
+        base_url: platform_status.base_url.clone(),
+        model_count: platform_status.model_count,
+        token_valid: platform_status.token_valid,
+        last_selected_at: Some(platform_status.last_selected_at.to_rfc3339()),
+    };
+
     Json(AdminStatusResponse {
         accounts: account_values,
         total: stats.total,
@@ -143,6 +199,7 @@ pub async fn admin_status(State(state): State<Arc<AppState>>) -> impl IntoRespon
         busy: stats.busy,
         error: stats.error,
         invalid: stats.invalid,
+        platform: platform_view,
     })
 }
 
@@ -291,6 +348,23 @@ pub struct ToolRuntimeConfigView {
 }
 
 #[derive(Serialize)]
+pub struct PlatformConfigView {
+    default: String,
+    prompt_on_start: bool,
+}
+
+#[derive(Serialize)]
+pub struct Ouyi7ConfigView {
+    base_url: String,
+    chatapi_prefix: String,
+    jwt_token: String,
+    default_model: String,
+    model_refresh_interval_secs: u64,
+    max_history_messages: usize,
+    simulated_stream_chunk_chars: usize,
+}
+
+#[derive(Serialize)]
 pub struct FullConfigResponse {
     server: ServerConfigView,
     deepseek: DeepSeekConfigView,
@@ -299,6 +373,9 @@ pub struct FullConfigResponse {
     accounts: Vec<serde_json::Value>,
     api_keys: Vec<serde_json::Value>,
     tool_runtime: ToolRuntimeConfigView,
+    openai_tool_runtime: ToolRuntimeConfigView,
+    platform: Option<PlatformConfigView>,
+    ouyi_v7: Option<Ouyi7ConfigView>,
 }
 
 pub async fn admin_config(State(state): State<Arc<AppState>>) -> impl IntoResponse {
@@ -314,7 +391,7 @@ pub async fn admin_config(State(state): State<Arc<AppState>>) -> impl IntoRespon
                 "mobile": a.mobile,
                 "area_code": a.area_code,
                 "password": "",
-                "token": a.token.as_deref().unwrap_or(""),
+                "token": a.token.as_ref().map(|t| mask_account_token(t)).unwrap_or_default(),
                 "enabled": a.enabled,
             })
         })
@@ -329,6 +406,26 @@ pub async fn admin_config(State(state): State<Arc<AppState>>) -> impl IntoRespon
                     "openai-compatible".to_string()
                 }
             }),
+            base_url: tr.base_url.clone(),
+            api_key: tr.api_key.as_ref().map(|k| mask_api_key(k)),
+            model: tr.model.clone(),
+            timeout_secs: tr.timeout_secs,
+        }
+    } else {
+        ToolRuntimeConfigView {
+            enabled: false,
+            provider: None,
+            base_url: None,
+            api_key: None,
+            model: None,
+            timeout_secs: 120,
+        }
+    };
+
+    let openai_tool_runtime_view = if let Some(tr) = &config.openai_tool_runtime {
+        ToolRuntimeConfigView {
+            enabled: tr.enabled,
+            provider: Some("openai-compatible".to_string()),
             base_url: tr.base_url.clone(),
             api_key: tr.api_key.as_ref().map(|k| mask_api_key(k)),
             model: tr.model.clone(),
@@ -384,6 +481,34 @@ pub async fn admin_config(State(state): State<Arc<AppState>>) -> impl IntoRespon
         accounts: account_values,
         api_keys: vec![],
         tool_runtime: tool_runtime_view,
+        openai_tool_runtime: openai_tool_runtime_view,
+        platform: config.platform.as_ref().map(|p| PlatformConfigView {
+            default: serde_json::to_string(&p.default)
+                .unwrap_or_default()
+                .trim_matches('"')
+                .to_string(),
+            prompt_on_start: p.prompt_on_start,
+        }),
+        ouyi_v7: config.ouyi_v7.as_ref().map(|v7| {
+            let jwt_masked = if v7.jwt_token.len() > 20 {
+                format!(
+                    "{}...{}",
+                    &v7.jwt_token[..8],
+                    &v7.jwt_token[v7.jwt_token.len() - 12..]
+                )
+            } else {
+                v7.jwt_token.clone()
+            };
+            Ouyi7ConfigView {
+                base_url: v7.base_url.clone(),
+                chatapi_prefix: v7.chatapi_prefix.clone(),
+                jwt_token: jwt_masked,
+                default_model: v7.default_model.clone(),
+                model_refresh_interval_secs: v7.model_refresh_interval_secs,
+                max_history_messages: v7.max_history_messages,
+                simulated_stream_chunk_chars: v7.simulated_stream_chunk_chars,
+            }
+        }),
     })
 }
 
@@ -399,6 +524,16 @@ fn mask_api_key(key: &str) -> String {
 
 fn is_masked_secret(value: &str) -> bool {
     value.contains("...") || value.contains("***")
+}
+
+fn mask_account_token(token: &str) -> String {
+    if token.len() > 16 {
+        format!("{}...{}", &token[..8], &token[token.len() - 8..])
+    } else if token.is_empty() {
+        String::new()
+    } else {
+        "***".to_string()
+    }
 }
 
 fn parse_tool_runtime_provider(
@@ -421,6 +556,7 @@ fn build_tool_runtime_config(
     }
 
     let mut next = current.cloned().unwrap_or(ToolRuntimeConfig {
+        enabled: true,
         mode: ToolRuntimeMode::Compiler,
         provider: ToolRuntimeProvider::OpenaiCompatible,
         base_url: None,
@@ -432,6 +568,54 @@ fn build_tool_runtime_config(
 
     next.mode = ToolRuntimeMode::Compiler;
     next.provider = parse_tool_runtime_provider(update.provider, next.provider);
+    if let Some(base_url) = update.base_url {
+        next.base_url = if base_url.trim().is_empty() {
+            None
+        } else {
+            Some(base_url)
+        };
+    }
+    if let Some(api_key) = update.api_key
+        && !api_key.trim().is_empty()
+        && !is_masked_secret(&api_key)
+    {
+        next.api_key = Some(api_key);
+    }
+    if let Some(model) = update.model {
+        next.model = if model.trim().is_empty() {
+            None
+        } else {
+            Some(model)
+        };
+    }
+    if let Some(timeout_secs) = update.timeout_secs {
+        next.timeout_secs = timeout_secs;
+    }
+
+    Some(next)
+}
+
+fn build_openai_tool_runtime_config(
+    current: Option<&ToolRuntimeConfig>,
+    update: ToolRuntimeConfigUpdate,
+) -> Option<ToolRuntimeConfig> {
+    if update.enabled == Some(false) {
+        return None;
+    }
+
+    let mut next = current.cloned().unwrap_or(ToolRuntimeConfig {
+        enabled: true,
+        mode: ToolRuntimeMode::Compiler,
+        provider: ToolRuntimeProvider::OpenaiCompatible,
+        base_url: None,
+        api_key: None,
+        api_key_env: None,
+        model: None,
+        timeout_secs: 30,
+    });
+
+    next.mode = ToolRuntimeMode::Compiler;
+    next.provider = ToolRuntimeProvider::OpenaiCompatible;
     if let Some(base_url) = update.base_url {
         next.base_url = if base_url.trim().is_empty() {
             None
@@ -641,6 +825,9 @@ pub struct ConfigUpdate {
     pub admin: Option<AdminUpdate>,
     pub accounts: Option<Vec<AccountEntryRaw>>,
     pub tool_runtime: Option<ToolRuntimeConfigUpdate>,
+    pub openai_tool_runtime: Option<ToolRuntimeConfigUpdate>,
+    pub platform: Option<PlatformConfigUpdate>,
+    pub ouyi_v7: Option<Ouyi7ConfigUpdate>,
 }
 
 #[derive(Deserialize)]
@@ -687,6 +874,24 @@ pub struct OuyiConfigUpdate {
     pub client_version: Option<String>,
     /// 前端传来的 jwt_token 字段（对应后端 ouyi.jwt_token）
     pub jwt_token: Option<String>,
+    pub model_refresh_interval_secs: Option<u64>,
+}
+
+#[derive(Deserialize)]
+pub struct PlatformConfigUpdate {
+    pub default: Option<String>,
+    pub prompt_on_start: Option<bool>,
+}
+
+#[derive(Deserialize)]
+pub struct Ouyi7ConfigUpdate {
+    pub base_url: Option<String>,
+    pub chatapi_prefix: Option<String>,
+    pub jwt_token: Option<String>,
+    pub default_model: Option<String>,
+    pub model_refresh_interval_secs: Option<u64>,
+    pub max_history_messages: Option<usize>,
+    pub simulated_stream_chunk_chars: Option<usize>,
 }
 
 #[derive(Deserialize)]
@@ -712,6 +917,35 @@ pub struct AccountEntryRaw {
     pub token: Option<String>,
     #[serde(default)]
     pub enabled: bool,
+}
+
+fn build_account_entry_from_raw(
+    raw: AccountEntryRaw,
+    existing: Option<&AccountEntry>,
+) -> AccountEntry {
+    let password = if raw.password.is_empty() {
+        existing
+            .map(|entry| entry.password.clone())
+            .unwrap_or_default()
+    } else {
+        hash(&raw.password, DEFAULT_COST).unwrap_or_default()
+    };
+
+    let token = match raw.token {
+        Some(token) if token.trim().is_empty() => None,
+        Some(token) if is_masked_secret(&token) => existing.and_then(|entry| entry.token.clone()),
+        Some(token) => Some(token),
+        None => existing.and_then(|entry| entry.token.clone()),
+    };
+
+    AccountEntry {
+        email: raw.email,
+        mobile: raw.mobile,
+        area_code: raw.area_code,
+        password,
+        token,
+        enabled: raw.enabled,
+    }
 }
 
 pub async fn admin_put_config(
@@ -755,13 +989,36 @@ pub async fn admin_put_config(
             )
                 .into_response();
         }
-        store.setup(&new_pw);
+        let password_hash = match crate::admin::auth::AdminStore::hash_password(&new_pw) {
+            Ok(hash) => hash,
+            Err(_) => {
+                return (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    Json(serde_json::json!({
+                        "ok": false, "error": "Password hashing failed"
+                    })),
+                )
+                    .into_response();
+            }
+        };
+        let config_path = std::path::PathBuf::from(AppConfig::config_path());
+        if let Err(e) = write_admin_config(&config_path, &store.jwt_secret, &password_hash) {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(serde_json::json!({
+                    "ok": false, "error": e.to_string()
+                })),
+            )
+                .into_response();
+        }
+        store.set_password_hash(password_hash);
     }
 
     // Handle server config change (host/port)
     let mut server_changed = false;
     if let Some(server) = update.server {
         let mut config = state.config.read().await.clone();
+        let config_path = std::path::PathBuf::from(AppConfig::config_path());
         if let Some(host) = server.host {
             config.server.host = host;
             server_changed = true;
@@ -770,7 +1027,24 @@ pub async fn admin_put_config(
             config.server.port = port;
             server_changed = true;
         }
+        if let Some(cors_origins) = server.cors_origins {
+            tracing::info!(
+                count = cors_origins.len(),
+                "CORS origins received via admin UI"
+            );
+        }
         if server_changed {
+            if let Err(e) = write_server_config(&config_path, &config.server) {
+                return (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    Json(serde_json::json!({
+                        "ok": false, "error": e.to_string()
+                    })),
+                )
+                    .into_response();
+            }
+            let mut current_config = state.config.write().await;
+            *current_config = config;
             tracing::info!("Server config updated via admin UI (requires restart to take effect)");
         }
     }
@@ -778,29 +1052,166 @@ pub async fn admin_put_config(
     // Handle ouyi config change (api_base/jwt_token/client_version)
     if let Some(ouyi_update) = update.deepseek {
         let mut config = state.config.read().await.clone();
+        let config_path = std::path::PathBuf::from(AppConfig::config_path());
         if let Some(api_base) = ouyi_update.api_base {
             config.ouyi.base_url = api_base;
         }
-        if let Some(jwt_token) = ouyi_update.jwt_token {
+        if let Some(jwt_token) = ouyi_update.jwt_token
+            && !jwt_token.trim().is_empty()
+            && !is_masked_secret(&jwt_token)
+        {
             config.ouyi.jwt_token = jwt_token;
         }
         if let Some(client_version) = ouyi_update.client_version {
             config.ouyi.app_version = client_version;
         }
-        // Rebuild the ouyi client with new config
-        let new_client = OuyiHttpClient::new(
-            state.http_client.clone(),
-            config.ouyi.base_url.clone(),
-            config.ouyi.jwt_token.clone(),
-            config.ouyi.app_version.clone(),
-        );
+        if let Some(interval) = ouyi_update.model_refresh_interval_secs {
+            config.ouyi.model_refresh_interval_secs = interval;
+        }
+        if let Err(e) = write_ouyi_config(&config_path, &config.ouyi) {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(serde_json::json!({
+                    "ok": false, "error": e.to_string()
+                })),
+            )
+                .into_response();
+        }
+        let current_platform = *state.platform.read().await;
+        {
+            let mut current_config = state.config.write().await;
+            *current_config = config.clone();
+        }
+        if current_platform == crate::platform::OuyiPlatform::Ouyi8 {
+            let new_client = OuyiHttpClient::new(
+                state.http_client.clone(),
+                config.ouyi.base_url.clone(),
+                config.ouyi.jwt_token.clone(),
+                config.ouyi.app_version.clone(),
+            );
+            let mut ouyi_client = state.ouyi_client.write().await;
+            *ouyi_client = crate::client::OuyiClient::V8(new_client);
+            let mut platform_status = state.platform_status.write().await;
+            platform_status.base_url = config.ouyi.base_url;
+        }
+        tracing::info!("Ouyi client config updated via admin UI");
+    }
+
+    // Handle Ouyi 7.0 config change
+    if let Some(v7_update) = update.ouyi_v7 {
+        let mut config = state.config.read().await.clone();
+        let mut v7 = config.ouyi_v7.clone().unwrap_or(Ouyi7Config {
+            base_url: "https://api-8.rcouyi.com".to_string(),
+            chatapi_prefix: "/chatapi".to_string(),
+            jwt_token: String::new(),
+            default_model: "ouyi-chat".to_string(),
+            model_refresh_interval_secs: 1800,
+            max_history_messages: 20,
+            simulated_stream_chunk_chars: 80,
+        });
+        if let Some(base_url) = v7_update.base_url {
+            v7.base_url = base_url;
+        }
+        if let Some(prefix) = v7_update.chatapi_prefix {
+            v7.chatapi_prefix = prefix;
+        }
+        if let Some(jwt_token) = v7_update.jwt_token
+            && !jwt_token.trim().is_empty()
+            && !is_masked_secret(&jwt_token)
+        {
+            v7.jwt_token = jwt_token;
+        }
+        if let Some(default_model) = v7_update.default_model {
+            v7.default_model = default_model;
+        }
+        if let Some(interval) = v7_update.model_refresh_interval_secs {
+            v7.model_refresh_interval_secs = interval;
+        }
+        if let Some(max_history) = v7_update.max_history_messages {
+            v7.max_history_messages = max_history;
+        }
+        if let Some(chunk_chars) = v7_update.simulated_stream_chunk_chars {
+            v7.simulated_stream_chunk_chars = chunk_chars;
+        }
+
+        let config_path = std::path::PathBuf::from(AppConfig::config_path());
+        if let Err(e) = write_ouyi_v7_config(&config_path, &v7) {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(serde_json::json!({
+                    "ok": false, "error": e.to_string()
+                })),
+            )
+                .into_response();
+        }
+
+        config.ouyi_v7 = Some(v7.clone());
+        let current_platform = *state.platform.read().await;
         {
             let mut current_config = state.config.write().await;
             *current_config = config;
         }
-        let mut ouyi_client = state.ouyi_client.write().await;
-        *ouyi_client = new_client;
-        tracing::info!("Ouyi client config updated via admin UI");
+        if current_platform == crate::platform::OuyiPlatform::Ouyi7 {
+            let new_client = crate::client::ouyi_v7::Ouyi7HttpClient::new(
+                state.http_client.clone(),
+                v7.base_url.clone(),
+                v7.chatapi_prefix.clone(),
+                v7.jwt_token.clone(),
+            );
+            let mut ouyi_client = state.ouyi_client.write().await;
+            *ouyi_client = crate::client::OuyiClient::V7(new_client);
+            let mut platform_status = state.platform_status.write().await;
+            platform_status.base_url = v7.base_url;
+        }
+        tracing::info!("Ouyi V7 client config updated via admin UI");
+    }
+
+    // Handle platform startup selection
+    if let Some(platform_update) = update.platform {
+        let mut config = state.config.read().await.clone();
+        let mut platform_config = config.platform.clone().unwrap_or(PlatformConfig {
+            default: crate::platform::OuyiPlatform::Ouyi8,
+            prompt_on_start: true,
+        });
+        if let Some(default) = platform_update.default {
+            let Some(parsed) = crate::platform::OuyiPlatform::from_env_value(&default) else {
+                return (
+                    StatusCode::BAD_REQUEST,
+                    Json(serde_json::json!({
+                        "ok": false, "error": "Invalid platform default"
+                    })),
+                )
+                    .into_response();
+            };
+            platform_config.default = parsed;
+        }
+        if let Some(prompt_on_start) = platform_update.prompt_on_start {
+            platform_config.prompt_on_start = prompt_on_start;
+        }
+
+        let config_path = std::path::PathBuf::from(AppConfig::config_path());
+        if let Err(e) = write_platform_config(&config_path, &platform_config) {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(serde_json::json!({
+                    "ok": false, "error": e.to_string()
+                })),
+            )
+                .into_response();
+        }
+        config.platform = Some(platform_config);
+        let mut current_config = state.config.write().await;
+        *current_config = config;
+        tracing::info!("Platform startup config updated via admin UI");
+    }
+
+    if let Some(proxy) = update.proxy
+        && let Some(url) = proxy.url
+    {
+        tracing::info!(
+            configured = !url.trim().is_empty(),
+            "Proxy config received via admin UI"
+        );
     }
 
     // Handle tool_runtime config change
@@ -840,24 +1251,53 @@ pub async fn admin_put_config(
         tracing::info!("Tool runtime config updated via admin UI");
     }
 
+    // Handle openai_tool_runtime config change
+    if let Some(openai_tool_runtime_update) = update.openai_tool_runtime {
+        let mut config = state.config.read().await.clone();
+        let next_openai_tool_runtime = build_openai_tool_runtime_config(
+            config.openai_tool_runtime.as_ref(),
+            openai_tool_runtime_update,
+        );
+        let config_path = std::path::PathBuf::from(AppConfig::config_path());
+        match &next_openai_tool_runtime {
+            Some(runtime) => {
+                if let Err(e) = write_openai_tool_runtime_config(&config_path, runtime) {
+                    return (
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                        Json(serde_json::json!({
+                            "ok": false, "error": e.to_string()
+                        })),
+                    )
+                        .into_response();
+                }
+            }
+            None => {
+                if let Err(e) = remove_openai_tool_runtime_config(&config_path) {
+                    return (
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                        Json(serde_json::json!({
+                            "ok": false, "error": e.to_string()
+                        })),
+                    )
+                        .into_response();
+                }
+            }
+        }
+
+        config.openai_tool_runtime = next_openai_tool_runtime;
+        let mut current_config = state.config.write().await;
+        *current_config = config;
+        tracing::info!("OpenAI tool runtime config updated via admin UI");
+    }
+
     // Handle accounts
     if let Some(raw_accounts) = update.accounts {
+        let existing_accounts = state.account_store.get_accounts().await;
         let accounts: Vec<AccountEntry> = raw_accounts
             .into_iter()
             .map(|r| {
-                let password = if r.password.is_empty() {
-                    String::new()
-                } else {
-                    hash(&r.password, DEFAULT_COST).unwrap_or_default()
-                };
-                AccountEntry {
-                    email: r.email,
-                    mobile: r.mobile,
-                    area_code: r.area_code,
-                    password,
-                    token: r.token.filter(|t| !t.is_empty()),
-                    enabled: r.enabled,
-                }
+                let existing = existing_accounts.iter().find(|a| a.email == r.email);
+                build_account_entry_from_raw(r, existing)
             })
             .collect();
         state.account_store.set_accounts(accounts).await;
@@ -884,6 +1324,7 @@ pub struct RequestLogResponse {
     completion_tokens: u64,
     latency_ms: u64,
     success: bool,
+    platform: String,
 }
 
 #[derive(Deserialize)]
@@ -911,6 +1352,7 @@ pub async fn admin_logs(
             completion_tokens: log.completion_tokens,
             latency_ms: log.latency_ms,
             success: log.error.is_none(),
+            platform: log.platform,
         })
         .collect();
 
@@ -970,9 +1412,23 @@ pub async fn admin_runtime_logs(
     })
 }
 
+#[derive(Serialize)]
+pub struct CategorizedModelsResponse {
+    platform: String,
+    categories: Vec<ModelCategory>,
+}
+
 pub async fn admin_categorized_models(State(state): State<Arc<AppState>>) -> impl IntoResponse {
     let categories = state.model_mapper.get_categorized_models();
-    Json(categories)
+    let platform_status = state.platform_status.read().await;
+    let platform_str = serde_json::to_string(&platform_status.platform)
+        .unwrap_or_default()
+        .trim_matches('"')
+        .to_string();
+    Json(CategorizedModelsResponse {
+        platform: platform_str,
+        categories,
+    })
 }
 
 // ── Tool Runtime Logs ────────────────────────────────────────────────────
@@ -981,6 +1437,7 @@ pub async fn admin_categorized_models(State(state): State<Arc<AppState>>) -> imp
 pub struct ToolRuntimeLogResponse {
     timestamp: String,
     request_id: String,
+    endpoint: String,
     mode: String,
     provider: String,
     model: String,
@@ -1012,6 +1469,7 @@ pub async fn admin_tool_runtime_logs(
         .map(|log| ToolRuntimeLogResponse {
             timestamp: log.timestamp.format("%Y-%m-%dT%H:%M:%S%.3fZ").to_string(),
             request_id: log.request_id,
+            endpoint: log.endpoint,
             mode: log.mode,
             provider: log.provider,
             model: log.model,
@@ -1149,6 +1607,129 @@ pub async fn admin_tool_runtime_test(
     }
 }
 
+pub async fn admin_openai_tool_runtime_test(
+    State(state): State<Arc<AppState>>,
+    Json(body): Json<ToolRuntimeTestRequest>,
+) -> impl IntoResponse {
+    let current_config = state.config.read().await.clone();
+    let config = match build_openai_tool_runtime_config(
+        current_config.openai_tool_runtime.as_ref(),
+        ToolRuntimeConfigUpdate {
+            enabled: body.enabled,
+            provider: body.provider,
+            base_url: body.base_url,
+            api_key: body.api_key,
+            model: body.model,
+            timeout_secs: body.timeout_secs,
+        },
+    ) {
+        Some(config) => config,
+        None => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(ToolRuntimeTestResponse {
+                    success: false,
+                    message: "OpenAI 工具模型未启用".to_string(),
+                    latency_ms: 0,
+                    mode: "disabled".to_string(),
+                    provider: "openai-compatible".to_string(),
+                    model: String::new(),
+                    base_url: String::new(),
+                }),
+            )
+                .into_response();
+        }
+    };
+
+    let mode = "compiler".to_string();
+    let provider = "openai-compatible".to_string();
+    let model = config.model.clone().unwrap_or_default();
+    let base_url = resolved_tool_runtime_base_url(&config).unwrap_or_default();
+
+    if let Err(e) = validate_tool_runtime_test_config(&config) {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(ToolRuntimeTestResponse {
+                success: false,
+                message: e,
+                latency_ms: 0,
+                mode,
+                provider,
+                model,
+                base_url,
+            }),
+        )
+            .into_response();
+    }
+
+    let url = match tool_runtime_test_url(&config) {
+        Ok(url) => url,
+        Err(e) => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(ToolRuntimeTestResponse {
+                    success: false,
+                    message: e,
+                    latency_ms: 0,
+                    mode,
+                    provider,
+                    model,
+                    base_url,
+                }),
+            )
+                .into_response();
+        }
+    };
+    let api_key = match config.get_api_key() {
+        Ok(api_key) => api_key,
+        Err(_) => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(ToolRuntimeTestResponse {
+                    success: false,
+                    message: "openai_tool_runtime.api_key 未配置".to_string(),
+                    latency_ms: 0,
+                    mode,
+                    provider,
+                    model,
+                    base_url,
+                }),
+            )
+                .into_response();
+        }
+    };
+
+    let started = Instant::now();
+    let result = send_openai_tool_runtime_test(&state, &config, &url, &api_key).await;
+    let latency_ms = started.elapsed().as_millis() as u64;
+
+    match result {
+        Ok(()) => Json(ToolRuntimeTestResponse {
+            success: true,
+            message: "OpenAI 工具模型连接测试通过".to_string(),
+            latency_ms,
+            mode,
+            provider,
+            model,
+            base_url,
+        })
+        .into_response(),
+        Err(e) => (
+            StatusCode::BAD_GATEWAY,
+            Json(ToolRuntimeTestResponse {
+                success: false,
+                message: e,
+                latency_ms,
+                mode,
+                provider,
+                model,
+                base_url,
+            }),
+        )
+            .into_response(),
+    }
+}
+
 // ── Accounts ──────────────────────────────────────────────────────────────
 
 #[derive(Serialize)]
@@ -1186,13 +1767,7 @@ pub async fn admin_list_accounts(State(state): State<Arc<AppState>>) -> impl Int
                 email: a.email.clone(),
                 mobile: a.mobile.clone(),
                 area_code: a.area_code.clone(),
-                token: a.token.as_ref().map(|t| {
-                    if t.len() > 16 {
-                        format!("{}...{}", &t[..8], &t[t.len() - 8..])
-                    } else {
-                        t.clone()
-                    }
-                }),
+                token: a.token.as_ref().map(|t| mask_account_token(t)),
                 enabled: a.enabled,
                 state: state_str,
                 request_count: req_count,
@@ -1212,6 +1787,7 @@ mod tests {
         provider: ToolRuntimeProvider,
     ) -> ToolRuntimeConfig {
         ToolRuntimeConfig {
+            enabled: true,
             mode,
             provider,
             base_url: Some("https://tool.example.com/v1/".to_string()),
@@ -1301,6 +1877,40 @@ mod tests {
 
         assert!(next.is_none());
     }
+
+    #[test]
+    fn account_token_view_is_masked() {
+        assert_eq!(
+            mask_account_token("jwt-token-1234567890"),
+            "jwt-toke...34567890"
+        );
+    }
+
+    #[test]
+    fn masked_account_update_preserves_existing_token() {
+        let existing = AccountEntry {
+            email: "a@example.com".to_string(),
+            mobile: "13800000000".to_string(),
+            area_code: "86".to_string(),
+            password: String::new(),
+            token: Some("jwt-token-1234567890".to_string()),
+            enabled: true,
+        };
+        let raw = AccountEntryRaw {
+            email: "a@example.com".to_string(),
+            mobile: "13800000001".to_string(),
+            area_code: "86".to_string(),
+            password: String::new(),
+            token: Some("jwt-toke...34567890".to_string()),
+            enabled: false,
+        };
+
+        let merged = build_account_entry_from_raw(raw, Some(&existing));
+
+        assert_eq!(merged.token, existing.token);
+        assert_eq!(merged.mobile, "13800000001");
+        assert!(!merged.enabled);
+    }
 }
 
 use crate::admin::accounts::AccountState;
@@ -1377,7 +1987,10 @@ pub async fn admin_remove_account(
 
 pub async fn admin_refresh_token(State(state): State<Arc<AppState>>) -> impl IntoResponse {
     let accounts = state.account_store.get_accounts().await;
-    let tokens: Vec<String> = accounts.into_iter().filter_map(|a| a.token).collect();
+    let tokens: Vec<String> = accounts
+        .into_iter()
+        .filter_map(|a| a.token.map(|t| mask_account_token(&t)))
+        .collect();
 
     Json(serde_json::json!({
         "tokens": tokens,

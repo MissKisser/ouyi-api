@@ -14,6 +14,11 @@ pub struct ChatCompletionRequest {
     pub max_tokens: Option<u64>,
     #[serde(default)]
     pub tools: Option<Vec<ToolDef>>,
+    #[serde(default)]
+    pub tool_choice: Option<serde_json::Value>,
+    #[serde(default)]
+    #[allow(dead_code)]
+    pub parallel_tool_calls: Option<bool>,
 }
 
 #[derive(Debug, Clone, Deserialize)]

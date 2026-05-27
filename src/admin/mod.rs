@@ -42,6 +42,10 @@ pub(crate) fn admin_routes(state: Arc<AppState>) -> Router<Arc<AppState>> {
             "/admin/api/tool-runtime/test",
             post(handlers::admin_tool_runtime_test),
         )
+        .route(
+            "/admin/api/openai-tool-runtime/test",
+            post(handlers::admin_openai_tool_runtime_test),
+        )
         .route("/admin/api/accounts", get(handlers::admin_list_accounts))
         .route("/admin/api/accounts", post(handlers::admin_add_account))
         .route(

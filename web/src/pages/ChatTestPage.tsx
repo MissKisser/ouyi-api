@@ -62,10 +62,11 @@ export function ChatTestPage() {
     const fetchModels = async () => {
       try {
         const categorized = await apiFetchCategorizedModels();
-        if (categorized.length > 0) {
-          setCategorizedGroups(categorized);
+        const groups = categorized.categories ?? [];
+        if (groups.length > 0) {
+          setCategorizedGroups(groups);
           setUseCategorized(true);
-          const allModels = categorized.flatMap(g => g.models);
+          const allModels = groups.flatMap(g => g.models);
           if (allModels.length > 0) setSelectedModel(allModels[0].value);
         } else {
           const openaiModels = await apiFetchModelsOpenAI();

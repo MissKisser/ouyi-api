@@ -15,20 +15,41 @@ use crate::client::session::{GuardedStream, spawn_session_cleanup};
 use crate::client::sse::{SseLineBuffer, parse_sse_line};
 use crate::error::AppError;
 use crate::model::openai::*;
+use crate::platform::OuyiPlatform;
 
 pub async fn responses(
     State(state): State<Arc<AppState>>,
     Json(req): Json<ResponsesRequest>,
 ) -> Result<axum::response::Response, AppError> {
-    let config = state.config.read().await.clone();
     let chat_req = convert_responses_to_chat(&req)?;
     let is_stream = req.stream;
 
     let model_full = state.model_mapper.to_ouyi(&chat_req.model);
-    let should_thinking = state.model_mapper.should_thinking(&chat_req.model);
 
     state.stats.record_start();
     let start_time = std::time::Instant::now();
+
+    // 按平台分派
+    let platform = *state.platform.read().await;
+    match platform {
+        OuyiPlatform::Ouyi7 => responses_v7(state, req, chat_req, model_full, start_time).await,
+        OuyiPlatform::Ouyi8 => {
+            responses_v8(state, req, chat_req, model_full, start_time, is_stream).await
+        }
+    }
+}
+
+/// 8.0 平台 Responses 处理
+async fn responses_v8(
+    state: Arc<AppState>,
+    req: ResponsesRequest,
+    chat_req: ChatCompletionRequest,
+    model_full: String,
+    start_time: std::time::Instant,
+    is_stream: bool,
+) -> Result<axum::response::Response, AppError> {
+    let config = state.config.read().await.clone();
+    let should_thinking = state.model_mapper.should_thinking(&chat_req.model);
 
     let ouyi_req =
         convert_request(&chat_req, &model_full, should_thinking).map_err(AppError::Internal)?;
@@ -55,9 +76,12 @@ pub async fn responses(
         Ok(s) => s,
         Err(e) => {
             let msg = format!("创建会话失败: {}", e);
-            state
-                .stats
-                .record_error(start_time.elapsed().as_millis() as u64, &model_full, &msg);
+            state.stats.record_error(
+                start_time.elapsed().as_millis() as u64,
+                &model_full,
+                &msg,
+                "ouyi8",
+            );
             return Err(AppError::Upstream(msg));
         }
     };
@@ -77,8 +101,16 @@ pub async fn responses(
     {
         Ok(r) => r,
         Err(e) => {
+            let msg = format!("聊天请求失败: {}", e);
+            state.stats.record_error(
+                start_time.elapsed().as_millis() as u64,
+                &model_full,
+                &msg,
+                "ouyi8",
+            );
             state.active_sessions.remove(&session_id);
-            return Err(AppError::Upstream(format!("聊天请求失败: {}", e)));
+            spawn_session_cleanup(client, session_id);
+            return Err(AppError::Upstream(msg));
         }
     };
 
@@ -118,6 +150,137 @@ pub async fn responses(
         )
         .await
     }
+}
+
+/// 7.0 平台 Responses 处理
+async fn responses_v7(
+    state: Arc<AppState>,
+    req: ResponsesRequest,
+    chat_req: ChatCompletionRequest,
+    model_full: String,
+    start_time: std::time::Instant,
+) -> Result<axum::response::Response, AppError> {
+    let config = state.config.read().await.clone();
+    let platform_key = state.platform.read().await.config_key();
+
+    let v7_config = config
+        .ouyi_v7
+        .as_ref()
+        .ok_or_else(|| AppError::Config("未配置 7.0 平台".to_string()))?;
+
+    let max_history = v7_config.max_history_messages;
+
+    // 7.0 不支持工具
+    if req.tools.is_some() {
+        return Err(AppError::BadRequest("7.0 平台暂不支持工具调用".to_string()));
+    }
+
+    let ouyi_input = crate::adapter::ouyi_v7_request::from_openai_chat(
+        &chat_req,
+        model_full.clone(),
+        max_history,
+    )?;
+
+    let client = {
+        let ouyi_client = state.ouyi_client.read().await;
+        match &*ouyi_client {
+            crate::client::OuyiClient::V7(client) => client.clone(),
+            crate::client::OuyiClient::V8(_) => {
+                return Err(AppError::Internal("当前运行客户端不是 7.0".to_string()));
+            }
+        }
+    };
+
+    let text = match client.chat_once(&ouyi_input).await {
+        Ok(text) => text,
+        Err(e) => {
+            let msg = format!("7.0 聊天请求失败: {}", e);
+            state.stats.record_error(
+                start_time.elapsed().as_millis() as u64,
+                &model_full,
+                &msg,
+                platform_key,
+            );
+            return Err(AppError::Upstream(msg));
+        }
+    };
+
+    let elapsed = start_time.elapsed().as_millis() as u64;
+    let short_model = state
+        .model_mapper
+        .get_all_short_names()
+        .iter()
+        .find(|s| state.model_mapper.to_ouyi(s) == model_full)
+        .cloned()
+        .unwrap_or_else(|| req.model.clone());
+
+    if req.stream {
+        handle_v7_responses_stream(&text, &short_model, model_full, state, start_time).await
+    } else {
+        handle_v7_responses_non_stream(
+            &text,
+            &short_model,
+            model_full,
+            state,
+            elapsed,
+            platform_key,
+        )
+        .await
+    }
+}
+
+async fn handle_v7_responses_stream(
+    text: &str,
+    model: &str,
+    model_full: String,
+    state: Arc<AppState>,
+    start_time: std::time::Instant,
+) -> Result<axum::response::Response, AppError> {
+    use crate::adapter::ouyi_v7_response::build_responses_stream_from_plain;
+
+    let config = state.config.read().await;
+    let chunk_chars = config
+        .ouyi_v7
+        .as_ref()
+        .map(|v| v.simulated_stream_chunk_chars)
+        .unwrap_or(80);
+
+    let task_id = format!("resp_{}", uuid_short());
+    let response = build_responses_stream_from_plain(model, &task_id, text, chunk_chars)?;
+
+    let stream_elapsed = start_time.elapsed().as_millis() as u64;
+    let platform_key = state.platform.read().await.config_key();
+    state
+        .stats
+        .record_success(stream_elapsed, 0, 0, &model_full, platform_key);
+
+    Ok(response)
+}
+
+async fn handle_v7_responses_non_stream(
+    text: &str,
+    model: &str,
+    model_full: String,
+    state: Arc<AppState>,
+    elapsed: u64,
+    platform_key: &str,
+) -> Result<axum::response::Response, AppError> {
+    use crate::adapter::ouyi_v7_response::build_responses_response_from_plain;
+
+    let task_id = format!("resp_{}", uuid_short());
+    let mut response = build_responses_response_from_plain(model, &task_id, text);
+    // 7.0 平台无法获取准确的 usage
+    response.usage = ResponseUsage {
+        input_tokens: 0,
+        output_tokens: 0,
+        total_tokens: 0,
+    };
+
+    state
+        .stats
+        .record_success(elapsed, 0, 0, &model_full, platform_key);
+
+    Ok(Json(response).into_response())
 }
 
 async fn handle_responses_stream(
@@ -207,11 +370,18 @@ async fn handle_responses_stream(
             .await;
 
         futures::pin_mut!(guarded);
+        let mut stream_error: Option<String> = None;
+        let mut downstream_closed = false;
 
-        while let Some(chunk_result) = guarded.next().await {
+        'read_loop: while let Some(chunk_result) = guarded.next().await {
             let chunk = match chunk_result {
                 Ok(bytes) => bytes,
-                Err(_) => break,
+                Err(e) => {
+                    let msg = format!("SSE字节流读取错误: {}", e);
+                    tracing::error!(error = %e, "SSE字节流读取错误");
+                    stream_error = Some(msg);
+                    break;
+                }
             };
 
             let mut bytes = chunk.to_vec();
@@ -252,7 +422,8 @@ async fn handle_responses_stream(
                                         .await
                                         .is_err()
                                     {
-                                        return;
+                                        downstream_closed = true;
+                                        break 'read_loop;
                                     }
                                 }
                             }
@@ -283,6 +454,41 @@ async fn handle_responses_stream(
                     }
                 }
             }
+        }
+
+        if downstream_closed {
+            state.active_sessions.remove(&session_id);
+            return;
+        }
+
+        if let Some(msg) = stream_error {
+            state.stats.record_error(
+                start_time.elapsed().as_millis() as u64,
+                &model_for_stats,
+                &msg,
+                "ouyi8",
+            );
+            state.active_sessions.remove(&session_id);
+            let failed = serde_json::json!({
+                "type": "response.failed",
+                "response": {
+                    "id": &task_id_for_init,
+                    "object": "response",
+                    "created_at": created,
+                    "model": &model_for_stream,
+                    "status": "failed",
+                    "error": {
+                        "message": msg,
+                        "type": "stream_error"
+                    }
+                }
+            });
+            let _ = tx
+                .send(Ok(Event::default()
+                    .event("response.failed")
+                    .data(failed.to_string())))
+                .await;
+            return;
         }
 
         let output_text_done = serde_json::json!({
@@ -373,6 +579,7 @@ async fn handle_responses_stream(
             prompt_tokens,
             completion_tokens,
             &model_for_stats,
+            "ouyi8",
         );
         state.active_sessions.remove(&session_id);
     });
@@ -412,18 +619,22 @@ async fn handle_responses_non_stream(
     let mut total_bytes: usize = 0;
     let max_bytes = state.config.read().await.limits.max_response_bytes;
     let mut partial = Vec::new();
+    let mut stream_error: Option<String> = None;
 
     while let Some(chunk_result) = guarded.next().await {
         let chunk = match chunk_result {
             Ok(bytes) => bytes,
             Err(e) => {
+                let msg = format!("SSE字节流读取错误: {}", e);
                 tracing::error!(error = %e, "SSE字节流读取错误");
+                stream_error = Some(msg);
                 break;
             }
         };
 
         total_bytes += chunk.len();
         if total_bytes > max_bytes {
+            stream_error = Some(format!("响应超过大小限制: {} > {}", total_bytes, max_bytes));
             break;
         }
 
@@ -455,14 +666,25 @@ async fn handle_responses_non_stream(
         collector.push_event(&event);
     }
 
+    if let Some(msg) = stream_error {
+        guarded.as_mut().skip_cleanup();
+        spawn_session_cleanup(client, session_id);
+        state.active_sessions.remove(&session_id);
+        state
+            .stats
+            .record_error(elapsed, &model_full, &msg, "ouyi8");
+        return Err(AppError::SseStream(msg));
+    }
+
     let (prompt, completion) = collector.tokens();
     let chat_response = collector.build_response();
 
+    guarded.as_mut().skip_cleanup();
     spawn_session_cleanup(client, session_id);
     state.active_sessions.remove(&session_id);
     state
         .stats
-        .record_success(elapsed, prompt, completion, &model_full);
+        .record_success(elapsed, prompt, completion, &model_full, "ouyi8");
 
     let response = build_responses_response(&model, task_id, chat_response);
     Ok(Json(response).into_response())
@@ -563,6 +785,8 @@ fn convert_responses_to_chat(req: &ResponsesRequest) -> Result<ChatCompletionReq
             .tools
             .as_ref()
             .map(|tools| convert_responses_tools(tools)),
+        tool_choice: None,
+        parallel_tool_calls: None,
     })
 }
 

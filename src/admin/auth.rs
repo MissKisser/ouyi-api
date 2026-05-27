@@ -31,11 +31,9 @@ impl AdminStore {
         verify(raw, &self.password_hash).unwrap_or(false)
     }
 
-    pub(crate) fn setup(&mut self, password: &str) {
-        if let Ok(hashed) = Self::hash_password(password) {
-            self.password_hash = hashed;
-            self.setup_completed = true;
-        }
+    pub(crate) fn set_password_hash(&mut self, password_hash: String) {
+        self.password_hash = password_hash;
+        self.setup_completed = true;
     }
 
     pub(crate) fn generate_token(&self, sub: &str) -> Result<String, jsonwebtoken::errors::Error> {

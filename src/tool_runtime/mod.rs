@@ -6,7 +6,10 @@ use crate::error::AppError;
 use crate::model::anthropic::{AnthropicContent, ContentBlock, MessagesRequest};
 
 pub mod broker;
+pub mod decision;
 pub mod openai_compiler;
+pub mod payload;
+pub mod protocol;
 
 fn uuid_short() -> String {
     use std::time::{SystemTime, UNIX_EPOCH};
@@ -20,6 +23,7 @@ fn uuid_short() -> String {
 #[derive(Debug, Clone)]
 pub struct PendingToolCall {
     pub tool_use_id: String,
+    #[allow(dead_code)]
     pub tool_name: String,
     pub created_at: Instant,
     pub long_task_id: Option<String>,
@@ -254,6 +258,22 @@ pub fn latest_tool_result_id(req: &MessagesRequest) -> Option<String> {
     None
 }
 
+/// 从 OpenAI ChatCompletionRequest 中提取最新的工具结果。
+/// 返回 (tool_call_id, content) 元组。
+pub fn latest_openai_tool_result(
+    req: &crate::model::openai::ChatCompletionRequest,
+) -> Option<(String, String)> {
+    req.messages.iter().rev().find_map(|msg| {
+        if msg.role == "tool" {
+            let id = msg.tool_call_id.clone()?;
+            let content = msg.content.clone().unwrap_or_default();
+            Some((id, content))
+        } else {
+            None
+        }
+    })
+}
+
 #[cfg(test)]
 pub fn latest_tool_use_id(req: &MessagesRequest) -> Option<String> {
     for msg in req.messages.iter().rev() {
@@ -457,7 +477,9 @@ mod tests {
         let ledger = super::ToolLedger::new();
 
         let primary_key = "model-a:call_0";
-        ledger.record_tool_use(primary_key, "call_0", "Bash").unwrap();
+        ledger
+            .record_tool_use(primary_key, "call_0", "Bash")
+            .unwrap();
         let task_id = ledger
             .attach_long_task(primary_key, "task.txt".to_string(), "DONE".to_string(), 8)
             .unwrap();
@@ -477,7 +499,9 @@ mod tests {
         assert_eq!(task.tool_call_keys.len(), 3);
         assert_eq!(task.polls, 0);
 
-        let updated = ledger.increment_long_task_poll_by_task_id(&task_id).unwrap();
+        let updated = ledger
+            .increment_long_task_poll_by_task_id(&task_id)
+            .unwrap();
         assert_eq!(updated.polls, 1);
 
         ledger.complete_long_task(&task_id);
@@ -502,10 +526,93 @@ mod tests {
             )
             .unwrap();
 
-        let found = ledger.long_task_for_tool_use("call_0", "claude-sonnet-4-6").unwrap();
+        let found = ledger
+            .long_task_for_tool_use("call_0", "claude-sonnet-4-6")
+            .unwrap();
         assert_eq!(found.task_id, task_id);
 
         let found_same_model = ledger.long_task_for_tool_use("call_0", "glm-5").unwrap();
         assert_eq!(found_same_model.task_id, task_id);
+    }
+
+    #[test]
+    fn test_latest_openai_tool_result_id() {
+        let req = crate::model::openai::ChatCompletionRequest {
+            model: "gpt-test".to_string(),
+            messages: vec![crate::model::openai::ChatMessage {
+                role: "tool".to_string(),
+                content: Some("PENDING".to_string()),
+                tool_calls: None,
+                tool_call_id: Some("call_1".to_string()),
+                name: Some("Bash".to_string()),
+            }],
+            stream: false,
+            temperature: None,
+            max_tokens: None,
+            tools: None,
+            tool_choice: None,
+            parallel_tool_calls: None,
+        };
+
+        assert_eq!(
+            super::latest_openai_tool_result(&req),
+            Some(("call_1".to_string(), "PENDING".to_string()))
+        );
+    }
+
+    #[test]
+    fn test_latest_openai_tool_result_returns_last_tool_message() {
+        let req = crate::model::openai::ChatCompletionRequest {
+            model: "gpt-test".to_string(),
+            messages: vec![
+                crate::model::openai::ChatMessage {
+                    role: "tool".to_string(),
+                    content: Some("first".to_string()),
+                    tool_calls: None,
+                    tool_call_id: Some("call_1".to_string()),
+                    name: Some("Bash".to_string()),
+                },
+                crate::model::openai::ChatMessage {
+                    role: "tool".to_string(),
+                    content: Some("second".to_string()),
+                    tool_calls: None,
+                    tool_call_id: Some("call_2".to_string()),
+                    name: Some("Bash".to_string()),
+                },
+            ],
+            stream: false,
+            temperature: None,
+            max_tokens: None,
+            tools: None,
+            tool_choice: None,
+            parallel_tool_calls: None,
+        };
+
+        assert_eq!(
+            super::latest_openai_tool_result(&req),
+            Some(("call_2".to_string(), "second".to_string()))
+        );
+    }
+
+    #[test]
+    fn test_latest_openai_tool_result_returns_none_when_no_tool_messages() {
+        let req = crate::model::openai::ChatCompletionRequest {
+            model: "gpt-test".to_string(),
+            messages: vec![crate::model::openai::ChatMessage {
+                role: "user".to_string(),
+                content: Some("hello".to_string()),
+                tool_calls: None,
+                tool_call_id: None,
+                name: None,
+            }],
+            stream: false,
+            temperature: None,
+            max_tokens: None,
+            tools: None,
+            tool_choice: None,
+            parallel_tool_calls: None,
+        };
+
+        assert!(super::latest_openai_tool_result(&req).is_none());
     }
 }

@@ -3,6 +3,7 @@ import {
   apiFetchConfig,
   apiSaveConfig,
   apiTestToolRuntime,
+  apiTestOpenAiToolRuntime,
   type FullConfig,
   type AccountEntry,
   type ToolRuntimeTestResponse,
@@ -27,6 +28,7 @@ import {
   Wrench,
   User,
   Shield,
+  Globe,
 } from 'lucide-react';
 import { useTranslation } from 'react-i18next';
 
@@ -67,8 +69,25 @@ export function ConfigPage() {
   const [oldPassword, setOldPassword] = useState('');
   const [newPassword, setNewPassword] = useState('');
   const [showToolApiKey, setShowToolApiKey] = useState(false);
+  const [showOpenAiToolApiKey, setShowOpenAiToolApiKey] = useState(false);
   const [testingToolRuntime, setTestingToolRuntime] = useState(false);
+  const [testingOpenAiToolRuntime, setTestingOpenAiToolRuntime] = useState(false);
   const [toolRuntimeTest, setToolRuntimeTest] = useState<ToolRuntimeTestResponse | null>(null);
+  const [openAiToolRuntimeTest, setOpenAiToolRuntimeTest] = useState<ToolRuntimeTestResponse | null>(null);
+
+  const defaultPlatform = config?.platform ?? {
+    default: 'ouyi8' as const,
+    prompt_on_start: true,
+  };
+  const defaultOuyi7 = config?.ouyi_v7 ?? {
+    base_url: 'https://api-8.rcouyi.com',
+    chatapi_prefix: '/chatapi',
+    jwt_token: '',
+    default_model: 'ouyi-chat',
+    model_refresh_interval_secs: 1800,
+    max_history_messages: 20,
+    simulated_stream_chunk_chars: 80,
+  };
 
   const loadConfig = () => {
     apiFetchConfig()
@@ -104,6 +123,9 @@ export function ConfigPage() {
           host: config.server.host,
           port: config.server.port,
         },
+        deepseek: config.deepseek,
+        platform: config.platform,
+        ouyi_v7: config.ouyi_v7,
         admin: {
           old_password: oldPassword || undefined,
           new_password: newPassword || undefined,
@@ -117,6 +139,7 @@ export function ConfigPage() {
           enabled: a.enabled,
         })),
         tool_runtime: config.tool_runtime,
+        openai_tool_runtime: config.openai_tool_runtime,
       };
       await apiSaveConfig(body);
       setMessage({ type: 'ok', text: t('config.saveSuccess') });
@@ -159,6 +182,28 @@ export function ConfigPage() {
       });
     } finally {
       setTestingToolRuntime(false);
+    }
+  };
+
+  const handleOpenAiToolRuntimeTest = async () => {
+    if (!config.openai_tool_runtime) return;
+    setTestingOpenAiToolRuntime(true);
+    setOpenAiToolRuntimeTest(null);
+    try {
+      const result = await apiTestOpenAiToolRuntime(config.openai_tool_runtime);
+      setOpenAiToolRuntimeTest(result);
+    } catch (e: unknown) {
+      setOpenAiToolRuntimeTest({
+        success: false,
+        message: e instanceof Error ? e.message : String(e),
+        latency_ms: 0,
+        mode: 'compiler',
+        provider: config.openai_tool_runtime.provider,
+        model: config.openai_tool_runtime.model,
+        base_url: config.openai_tool_runtime.base_url,
+      });
+    } finally {
+      setTestingOpenAiToolRuntime(false);
     }
   };
 
@@ -235,7 +280,17 @@ export function ConfigPage() {
               <div className="flex-1 min-w-[120px]">
                 <label className="text-xs text-muted-foreground">{t('config.accounts.token')}</label>
                 <div className="flex items-center gap-1">
-                  <Input type="password" value={a.token || ''} readOnly className="bg-muted/50" />
+                  <Input
+                    type="password"
+                    value={a.token || ''}
+                    onChange={(e) => {
+                      const next = [...config.accounts];
+                      next[i] = { ...next[i], token: e.target.value };
+                      update(['accounts'], next);
+                    }}
+                    placeholder={t('config.accounts.tokenPlaceholder')}
+                    className="font-mono text-xs"
+                  />
                   <Button
                     variant="ghost"
                     size="icon"
@@ -289,6 +344,130 @@ export function ConfigPage() {
           </Button>
         </CardContent>
       </Card>
+
+      {/* Ouyi API */}
+      <Section title={t('config.sections.ouyi')} icon={Globe} defaultOpen>
+        <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
+          <div>
+            <label className="text-sm text-muted-foreground block mb-1">{t('config.deepseek.apiBase')}</label>
+            <Input value={config.deepseek.api_base} onChange={(e) => update(['deepseek', 'api_base'], e.target.value)} />
+          </div>
+          <div>
+            <label className="text-sm text-muted-foreground block mb-1">{t('config.deepseek.clientVersion')}</label>
+            <Input
+              value={config.deepseek.client_version}
+              onChange={(e) => update(['deepseek', 'client_version'], e.target.value)}
+            />
+          </div>
+          <div className="md:col-span-2">
+            <label className="text-sm text-muted-foreground block mb-1">{t('config.deepseek.jwtToken')}</label>
+            <Input
+              type="password"
+              value={config.deepseek.jwt_token}
+              onChange={(e) => update(['deepseek', 'jwt_token'], e.target.value)}
+              className="font-mono text-xs"
+            />
+          </div>
+          <div>
+            <label className="text-sm text-muted-foreground block mb-1">
+              {t('config.deepseek.modelRefreshInterval')}
+            </label>
+            <Input
+              type="number"
+              value={config.deepseek.model_refresh_interval_secs}
+              onChange={(e) => update(['deepseek', 'model_refresh_interval_secs'], Number(e.target.value))}
+            />
+          </div>
+        </div>
+      </Section>
+
+      {/* Ouyi 7 */}
+      <Section title={t('config.sections.ouyi7')} icon={Globe}>
+        <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
+          <div>
+            <label className="text-sm text-muted-foreground block mb-1">{t('config.ouyi7.baseUrl')}</label>
+            <Input
+              value={defaultOuyi7.base_url}
+              onChange={(e) => update(['ouyi_v7'], { ...defaultOuyi7, base_url: e.target.value })}
+            />
+          </div>
+          <div>
+            <label className="text-sm text-muted-foreground block mb-1">{t('config.ouyi7.chatapiPrefix')}</label>
+            <Input
+              value={defaultOuyi7.chatapi_prefix}
+              onChange={(e) => update(['ouyi_v7'], { ...defaultOuyi7, chatapi_prefix: e.target.value })}
+            />
+          </div>
+          <div className="md:col-span-2">
+            <label className="text-sm text-muted-foreground block mb-1">{t('config.ouyi7.jwtToken')}</label>
+            <Input
+              type="password"
+              value={defaultOuyi7.jwt_token}
+              onChange={(e) => update(['ouyi_v7'], { ...defaultOuyi7, jwt_token: e.target.value })}
+              className="font-mono text-xs"
+            />
+          </div>
+          <div>
+            <label className="text-sm text-muted-foreground block mb-1">{t('config.ouyi7.defaultModel')}</label>
+            <Input
+              value={defaultOuyi7.default_model}
+              onChange={(e) => update(['ouyi_v7'], { ...defaultOuyi7, default_model: e.target.value })}
+            />
+          </div>
+          <div>
+            <label className="text-sm text-muted-foreground block mb-1">{t('config.ouyi7.modelRefreshInterval')}</label>
+            <Input
+              type="number"
+              value={defaultOuyi7.model_refresh_interval_secs}
+              onChange={(e) =>
+                update(['ouyi_v7'], { ...defaultOuyi7, model_refresh_interval_secs: Number(e.target.value) })
+              }
+            />
+          </div>
+          <div>
+            <label className="text-sm text-muted-foreground block mb-1">{t('config.ouyi7.maxHistoryMessages')}</label>
+            <Input
+              type="number"
+              value={defaultOuyi7.max_history_messages}
+              onChange={(e) => update(['ouyi_v7'], { ...defaultOuyi7, max_history_messages: Number(e.target.value) })}
+            />
+          </div>
+          <div>
+            <label className="text-sm text-muted-foreground block mb-1">{t('config.ouyi7.streamChunkChars')}</label>
+            <Input
+              type="number"
+              value={defaultOuyi7.simulated_stream_chunk_chars}
+              onChange={(e) =>
+                update(['ouyi_v7'], { ...defaultOuyi7, simulated_stream_chunk_chars: Number(e.target.value) })
+              }
+            />
+          </div>
+        </div>
+      </Section>
+
+      {/* Platform */}
+      <Section title={t('config.sections.platform')} icon={Globe}>
+        <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
+          <div>
+            <label className="text-sm text-muted-foreground block mb-1">{t('config.platform.default')}</label>
+            <select
+              className="w-full border rounded-md p-2"
+              value={defaultPlatform.default}
+              onChange={(e) => update(['platform'], { ...defaultPlatform, default: e.target.value })}
+            >
+              <option value="ouyi8">{t('config.platform.ouyi8')}</option>
+              <option value="ouyi7">{t('config.platform.ouyi7')}</option>
+            </select>
+          </div>
+          <div className="flex items-center gap-2 pt-6">
+            <label className="text-sm text-muted-foreground">{t('config.platform.promptOnStart')}</label>
+            <Switch
+              checked={defaultPlatform.prompt_on_start}
+              onCheckedChange={(checked) => update(['platform'], { ...defaultPlatform, prompt_on_start: checked })}
+            />
+          </div>
+        </div>
+      </Section>
 
       {/* Tool Runtime */}
       <Section title={t('config.sections.toolRuntime')} icon={Wrench}>
@@ -417,6 +596,125 @@ export function ConfigPage() {
                   <div className="font-medium">{toolRuntimeTest.message}</div>
                   <div className="mt-1 text-xs opacity-80">
                     {toolRuntimeTest.provider} · {toolRuntimeTest.model || '-'} · {toolRuntimeTest.latency_ms}ms
+                  </div>
+                </div>
+              )}
+            </>
+          )}
+        </div>
+      </Section>
+
+      {/* OpenAI Tool Runtime */}
+      <Section title={t('config.sections.openaiToolRuntime')} icon={Wrench}>
+        <div className="space-y-4">
+          <div className="flex flex-wrap items-center justify-between gap-3">
+            <div className="flex items-center gap-2">
+              <label className="text-sm text-muted-foreground">{t('config.toolRuntime.enabled')}</label>
+              <Switch
+                checked={config.openai_tool_runtime?.enabled ?? false}
+                onCheckedChange={(checked) => {
+                  const current = config.openai_tool_runtime ?? {
+                    enabled: false,
+                    provider: 'openai-compatible',
+                    base_url: '',
+                    api_key: '',
+                    model: '',
+                    timeout_secs: 30,
+                  };
+                  update(['openai_tool_runtime'], { ...current, enabled: checked, provider: 'openai-compatible' });
+                  setOpenAiToolRuntimeTest(null);
+                }}
+              />
+            </div>
+            <Button
+              variant="outline"
+              size="sm"
+              onClick={handleOpenAiToolRuntimeTest}
+              disabled={testingOpenAiToolRuntime || !(config.openai_tool_runtime?.enabled ?? false)}
+            >
+              <PlugZap className="h-4 w-4 mr-1" />
+              {testingOpenAiToolRuntime ? t('config.toolRuntime.testing') : t('config.toolRuntime.testConnection')}
+            </Button>
+          </div>
+          {(config.openai_tool_runtime?.enabled ?? false) && (
+            <>
+              <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
+                <div>
+                  <label className="text-sm text-muted-foreground block mb-1">
+                    {t('config.toolRuntime.baseUrl')}
+                  </label>
+                  <Input
+                    value={config.openai_tool_runtime?.base_url ?? ''}
+                    onChange={(e) => {
+                      update(['openai_tool_runtime', 'base_url'], e.target.value);
+                      setOpenAiToolRuntimeTest(null);
+                    }}
+                    placeholder="https://api.example.com/v1"
+                  />
+                </div>
+                <div>
+                  <label className="text-sm text-muted-foreground block mb-1">{t('config.toolRuntime.model')}</label>
+                  <Input
+                    value={config.openai_tool_runtime?.model ?? ''}
+                    onChange={(e) => {
+                      update(['openai_tool_runtime', 'model'], e.target.value);
+                      setOpenAiToolRuntimeTest(null);
+                    }}
+                    placeholder="tool-model"
+                  />
+                </div>
+                <div className="md:col-span-2">
+                  <label className="text-sm text-muted-foreground block mb-1">{t('config.toolRuntime.apiKey')}</label>
+                  <div className="flex items-center gap-1">
+                    <Input
+                      type={showOpenAiToolApiKey ? 'text' : 'password'}
+                      value={config.openai_tool_runtime?.api_key ?? ''}
+                      onChange={(e) => {
+                        update(['openai_tool_runtime', 'api_key'], e.target.value);
+                        setOpenAiToolRuntimeTest(null);
+                      }}
+                      className="font-mono text-xs"
+                    />
+                    <Button
+                      variant="ghost"
+                      size="icon"
+                      className="shrink-0"
+                      onClick={() => setShowOpenAiToolApiKey(!showOpenAiToolApiKey)}
+                    >
+                      {showOpenAiToolApiKey ? <EyeOff className="h-4 w-4" /> : <Eye className="h-4 w-4" />}
+                    </Button>
+                    <Button
+                      variant="ghost"
+                      size="icon"
+                      className="shrink-0"
+                      onClick={() => config.openai_tool_runtime?.api_key && copyToClipboard(config.openai_tool_runtime.api_key)}
+                      disabled={!config.openai_tool_runtime?.api_key}
+                    >
+                      <Copy className="h-4 w-4" />
+                    </Button>
+                  </div>
+                </div>
+                <div>
+                  <label className="text-sm text-muted-foreground block mb-1">{t('config.toolRuntime.timeout')}</label>
+                  <Input
+                    type="number"
+                    value={config.openai_tool_runtime?.timeout_secs ?? 30}
+                    onChange={(e) => {
+                      update(['openai_tool_runtime', 'timeout_secs'], Number(e.target.value));
+                      setOpenAiToolRuntimeTest(null);
+                    }}
+                  />
+                </div>
+              </div>
+              {openAiToolRuntimeTest && (
+                <div
+                  className={`p-3 rounded-md text-sm ${
+                    openAiToolRuntimeTest.success ? 'bg-green-50 text-green-700' : 'bg-red-50 text-red-700'
+                  }`}
+                >
+                  <div className="font-medium">{openAiToolRuntimeTest.message}</div>
+                  <div className="mt-1 text-xs opacity-80">
+                    {openAiToolRuntimeTest.provider} · {openAiToolRuntimeTest.model || '-'} · {openAiToolRuntimeTest.latency_ms}ms
                   </div>
                 </div>
               )}

@@ -46,7 +46,10 @@
       "completion": "Completion Tokens",
       "days": "d",
       "hours": "h",
-      "minutes": "m"
+      "minutes": "m",
+      "platform": "Platform",
+      "tokenValid": "Token Valid",
+      "tokenInvalid": "Token Invalid"
     },
     "accountPool": {
       "title": "Account Pool",
@@ -73,11 +76,14 @@
       "admin": "Admin",
       "server": "Server",
       "ouyi": "Ouyi API",
+      "ouyi7": "Ouyi 7.0 API",
+      "platform": "Startup Platform",
       "deepseek": "DeepSeek",
       "models": "Model Types",
       "toolCallTags": "Tool Call Tags",
       "proxy": "Proxy",
-      "toolRuntime": "Tool Model"
+      "toolRuntime": "Anthropic Tool Model (Claude Code)",
+      "openaiToolRuntime": "OpenAI Tool Model (Codex)"
     },
     "toolRuntime": {
       "enabled": "Enabled",
@@ -97,6 +103,7 @@
       "areaCode": "Area Code",
       "password": "Password",
       "token": "Token",
+      "tokenPlaceholder": "Paste JWT Token",
       "enabled": "Enabled",
       "add": "Add Account"
     },
@@ -125,7 +132,24 @@
       "userAgent": "User-Agent",
       "clientVersion": "Client Version",
       "clientPlatform": "Client Platform",
-      "clientLocale": "Client Locale"
+      "clientLocale": "Client Locale",
+      "jwtToken": "JWT Token",
+      "modelRefreshInterval": "Model refresh interval (s)"
+    },
+    "ouyi7": {
+      "baseUrl": "Base URL",
+      "chatapiPrefix": "Chat API Prefix",
+      "jwtToken": "JWT Token",
+      "defaultModel": "Default Model",
+      "modelRefreshInterval": "Model refresh interval (s)",
+      "maxHistoryMessages": "Max history messages",
+      "streamChunkChars": "Simulated stream chunk chars"
+    },
+    "platform": {
+      "default": "Default Platform",
+      "promptOnStart": "Prompt on startup",
+      "ouyi7": "Ouyi 7.0",
+      "ouyi8": "Ouyi 8.0"
     },
     "modelsSection": {
       "typeName": "Type Name",
@@ -188,7 +212,9 @@
     "available": "available",
     "loading": "Loading...",
     "empty": "No models found",
-    "clickToCopy": "Click to copy model ID"
+    "clickToCopy": "Click to copy model ID",
+    "searchPlaceholder": "Search model name or ID...",
+    "allCategories": "All"
   },
   "chat": {
     "selectModel": "Select Model",

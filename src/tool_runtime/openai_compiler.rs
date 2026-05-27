@@ -1,6 +1,9 @@
 use crate::config::{ToolRuntimeConfig, ToolRuntimeProvider};
 use crate::error::AppError;
 use crate::model::anthropic::{AnthropicTool, MessagesRequest, ToolChoice};
+use crate::tool_runtime::protocol::{
+    ToolChoiceSpec, ToolEndpointKind, ToolRuntimeRequestContext, ToolSpec,
+};
 use serde::{Deserialize, Serialize};
 
 /// 编译后的工具调用结构
@@ -353,6 +356,344 @@ pub async fn compile_tool_decision_with_usage(
             compile_tool_decision_anthropic(http_client, config, req, ouyi_output).await
         }
     }
+}
+
+/// 基于协议无关上下文编译工具决策
+/// OpenAI 端点只使用 OpenAI-compatible 工具模型
+/// Anthropic 端点根据配置选择 provider
+pub async fn compile_tool_decision_for_context(
+    http_client: reqwest::Client,
+    config: &ToolRuntimeConfig,
+    context: &ToolRuntimeRequestContext,
+    ouyi_output: &str,
+) -> Result<CompilerResult, AppError> {
+    if context.tools.is_empty() {
+        return Ok(CompilerResult {
+            decision: CompilerDecision::FinalAnswer,
+            usage: CompilerUsage {
+                prompt_tokens: 0,
+                completion_tokens: 0,
+            },
+        });
+    }
+
+    match context.endpoint {
+        ToolEndpointKind::OpenAi => {
+            compile_for_openai_endpoint(http_client, config, context, ouyi_output).await
+        }
+        ToolEndpointKind::Anthropic => {
+            compile_for_anthropic_endpoint(http_client, config, context, ouyi_output).await
+        }
+    }
+}
+
+/// 为 OpenAI 端点编译工具决策，只使用 OpenAI-compatible 工具模型
+async fn compile_for_openai_endpoint(
+    http_client: reqwest::Client,
+    config: &ToolRuntimeConfig,
+    context: &ToolRuntimeRequestContext,
+    ouyi_output: &str,
+) -> Result<CompilerResult, AppError> {
+    let valid_tool_names: Vec<String> = context.tools.iter().map(|t| t.name.clone()).collect();
+    let openai_tools = convert_tool_specs_to_openai(&context.tools);
+
+    let tool_choice = context
+        .tool_choice
+        .as_ref()
+        .map(|tc| convert_tool_choice_spec_to_openai(tc))
+        .unwrap_or_else(|| OpenAiToolChoice::String("auto".to_string()));
+
+    let model = config
+        .model
+        .as_ref()
+        .ok_or_else(|| AppError::Config("openai_tool_runtime.model 未配置".to_string()))?;
+
+    let base_url = config
+        .base_url
+        .as_ref()
+        .ok_or_else(|| AppError::Config("openai_tool_runtime.base_url 未配置".to_string()))?;
+
+    let api_key = config.get_api_key()?;
+
+    let user_message = build_compiler_user_message_from_context(context, ouyi_output);
+
+    let openai_request = OpenAiChatRequest {
+        model: model.clone(),
+        messages: vec![
+            OpenAiMessage {
+                role: "system".to_string(),
+                content: "你是工具调用编译器。你的唯一任务是将 Ouyi 主脑输出中的工具意图转换为结构化的 tool_calls。如果 Ouyi 输出明确表示需要调用工具，你必须返回对应的 tool_calls；如果 Ouyi 输出是最终回答或不需要工具，则不返回 tool_calls。不要添加任何额外解释。".to_string(),
+            },
+            OpenAiMessage {
+                role: "user".to_string(),
+                content: user_message,
+            },
+        ],
+        tools: openai_tools,
+        tool_choice,
+    };
+
+    let url = format!("{}/chat/completions", base_url.trim_end_matches('/'));
+
+    let response = http_client
+        .post(&url)
+        .header("Authorization", format!("Bearer {}", api_key))
+        .header("Content-Type", "application/json")
+        .json(&openai_request)
+        .timeout(std::time::Duration::from_secs(config.timeout_secs))
+        .send()
+        .await?
+        .error_for_status()
+        .map_err(|e| AppError::Upstream(format!("编译器请求失败: {}", e)))?;
+
+    let body = response
+        .text()
+        .await
+        .map_err(|e| AppError::Upstream(format!("读取编译器响应失败: {}", e)))?;
+
+    tracing::debug!(body = %body, "编译器响应原文");
+
+    let openai_response: OpenAiChatResponse = serde_json::from_str(&body)
+        .map_err(|e| AppError::Upstream(format!("编译器响应解析失败: {}", e)))?;
+    let usage = CompilerUsage {
+        prompt_tokens: openai_response
+            .usage
+            .as_ref()
+            .and_then(|u| u.prompt_tokens)
+            .unwrap_or(0),
+        completion_tokens: openai_response
+            .usage
+            .as_ref()
+            .and_then(|u| u.completion_tokens)
+            .unwrap_or(0),
+    };
+
+    let choice = openai_response
+        .choices
+        .first()
+        .ok_or_else(|| AppError::Upstream("编译器响应缺少 choices".to_string()))?;
+
+    if let Some(tool_calls) = &choice.message.tool_calls {
+        if tool_calls.is_empty() {
+            return Ok(CompilerResult {
+                decision: CompilerDecision::FinalAnswer,
+                usage,
+            });
+        }
+
+        match parse_openai_tool_calls(tool_calls, &valid_tool_names) {
+            Ok(calls) if !calls.is_empty() => Ok(CompilerResult {
+                decision: CompilerDecision::ToolCalls(calls),
+                usage,
+            }),
+            Ok(_) => Ok(CompilerResult {
+                decision: CompilerDecision::FinalAnswer,
+                usage,
+            }),
+            Err(e) => {
+                tracing::warn!(error = %e, "首次解析 tool_calls 失败，尝试结构化重试");
+                retry_with_structured_prompt(
+                    http_client,
+                    config,
+                    &openai_request,
+                    &valid_tool_names,
+                )
+                .await
+            }
+        }
+    } else {
+        Ok(CompilerResult {
+            decision: CompilerDecision::FinalAnswer,
+            usage,
+        })
+    }
+}
+
+/// 为 Anthropic 端点编译工具决策，根据配置选择 provider
+async fn compile_for_anthropic_endpoint(
+    http_client: reqwest::Client,
+    config: &ToolRuntimeConfig,
+    context: &ToolRuntimeRequestContext,
+    ouyi_output: &str,
+) -> Result<CompilerResult, AppError> {
+    match config.provider {
+        ToolRuntimeProvider::OpenaiCompatible => {
+            compile_for_openai_endpoint(http_client, config, context, ouyi_output).await
+        }
+        ToolRuntimeProvider::Anthropic => {
+            compile_for_anthropic_provider(http_client, config, context, ouyi_output).await
+        }
+    }
+}
+
+/// 使用 Anthropic provider 编译工具决策
+async fn compile_for_anthropic_provider(
+    http_client: reqwest::Client,
+    config: &ToolRuntimeConfig,
+    context: &ToolRuntimeRequestContext,
+    ouyi_output: &str,
+) -> Result<CompilerResult, AppError> {
+    let valid_tool_names: Vec<String> = context.tools.iter().map(|t| t.name.clone()).collect();
+    let model = config
+        .model
+        .as_ref()
+        .ok_or_else(|| AppError::Config("tool_runtime.model 未配置".to_string()))?;
+    let base_url = config
+        .base_url
+        .as_deref()
+        .unwrap_or("https://api.anthropic.com")
+        .trim_end_matches('/');
+    let base_url = base_url.strip_suffix("/v1").unwrap_or(base_url);
+    let api_key = config.get_api_key()?;
+
+    let tools = convert_tool_specs_to_anthropic(&context.tools);
+    let tool_choice = convert_tool_choice_spec_to_anthropic(context.tool_choice.as_ref());
+
+    let request = AnthropicCompilerRequest {
+        model: model.clone(),
+        system: "你是工具调用编译器。你的唯一任务是将 Ouyi 主脑输出中的工具意图转换为结构化的 tool_use。如果 Ouyi 输出明确表示需要调用工具，你必须调用对应工具；如果 Ouyi 输出是最终回答或不需要工具，则不要调用工具。不要添加任何额外解释。".to_string(),
+        messages: vec![AnthropicCompilerMessage {
+            role: "user".to_string(),
+            content: build_compiler_user_message_from_context(context, ouyi_output),
+        }],
+        max_tokens: 512,
+        tools,
+        tool_choice,
+    };
+
+    let url = format!("{}/v1/messages", base_url);
+    let response = http_client
+        .post(&url)
+        .header("x-api-key", api_key)
+        .header("anthropic-version", "2023-06-01")
+        .header("Content-Type", "application/json")
+        .json(&request)
+        .timeout(std::time::Duration::from_secs(config.timeout_secs))
+        .send()
+        .await?
+        .error_for_status()
+        .map_err(|e| AppError::Upstream(format!("编译器请求失败: {}", e)))?;
+
+    let body = response
+        .text()
+        .await
+        .map_err(|e| AppError::Upstream(format!("读取编译器响应失败: {}", e)))?;
+
+    tracing::debug!(body = %body, "Anthropic 编译器响应原文");
+
+    let anthropic_response: AnthropicCompilerResponse = serde_json::from_str(&body)
+        .map_err(|e| AppError::Upstream(format!("编译器响应解析失败: {}", e)))?;
+    let usage = CompilerUsage {
+        prompt_tokens: anthropic_response
+            .usage
+            .as_ref()
+            .and_then(|u| u.input_tokens)
+            .unwrap_or(0),
+        completion_tokens: anthropic_response
+            .usage
+            .as_ref()
+            .and_then(|u| u.output_tokens)
+            .unwrap_or(0),
+    };
+
+    let calls = parse_anthropic_tool_uses(&anthropic_response.content, &valid_tool_names)?;
+    if calls.is_empty() {
+        Ok(CompilerResult {
+            decision: CompilerDecision::FinalAnswer,
+            usage,
+        })
+    } else {
+        Ok(CompilerResult {
+            decision: CompilerDecision::ToolCalls(calls),
+            usage,
+        })
+    }
+}
+
+/// 将 ToolSpec 转换为 OpenAI 工具格式
+fn convert_tool_specs_to_openai(specs: &[ToolSpec]) -> Vec<OpenAiTool> {
+    specs
+        .iter()
+        .map(|spec| OpenAiTool {
+            r#type: "function".to_string(),
+            function: OpenAiFunction {
+                name: spec.name.clone(),
+                description: spec.description.clone(),
+                parameters: spec.input_schema.clone(),
+            },
+        })
+        .collect()
+}
+
+/// 将 ToolSpec 转换为 Anthropic 工具格式
+fn convert_tool_specs_to_anthropic(specs: &[ToolSpec]) -> Vec<AnthropicTool> {
+    specs
+        .iter()
+        .map(|spec| AnthropicTool {
+            name: spec.name.clone(),
+            description: spec.description.clone(),
+            input_schema: spec.input_schema.clone(),
+        })
+        .collect()
+}
+
+/// 将 ToolChoiceSpec 转换为 OpenAI tool_choice
+fn convert_tool_choice_spec_to_openai(spec: &ToolChoiceSpec) -> OpenAiToolChoice {
+    match spec {
+        ToolChoiceSpec::Auto => OpenAiToolChoice::String("auto".to_string()),
+        ToolChoiceSpec::Required => OpenAiToolChoice::String("required".to_string()),
+        ToolChoiceSpec::Tool(name) => OpenAiToolChoice::Object {
+            r#type: "function".to_string(),
+            function: OpenAiToolChoiceFunction { name: name.clone() },
+        },
+    }
+}
+
+/// 将 ToolChoiceSpec 转换为 Anthropic tool_choice
+fn convert_tool_choice_spec_to_anthropic(
+    spec: Option<&ToolChoiceSpec>,
+) -> AnthropicCompilerToolChoice {
+    match spec {
+        Some(ToolChoiceSpec::Auto) | None => AnthropicCompilerToolChoice::Auto,
+        Some(ToolChoiceSpec::Required) => AnthropicCompilerToolChoice::Any,
+        Some(ToolChoiceSpec::Tool(name)) => {
+            AnthropicCompilerToolChoice::Tool { name: name.clone() }
+        }
+    }
+}
+
+/// 基于上下文构建编译器用户消息
+fn build_compiler_user_message_from_context(
+    context: &ToolRuntimeRequestContext,
+    ouyi_output: &str,
+) -> String {
+    let mut content = String::new();
+
+    content.push_str("以下是当前对话上下文：\n\n");
+
+    if let Some(user_text) = &context.latest_user_text {
+        content.push_str("用户最新消息：\n");
+        content.push_str(user_text);
+        content.push('\n');
+    }
+
+    if let Some(tool_result) = &context.latest_tool_result {
+        content.push_str("\n最近的工具返回结果：\n");
+        content.push_str(tool_result);
+        content.push('\n');
+    }
+
+    content.push_str("\nOuyi 主脑输出：\n");
+    content.push_str(ouyi_output);
+    content.push('\n');
+
+    content.push_str(concat!(
+        "\n请只输出工具调用，不要输出最终回答。",
+        "如果上述内容表达了工具意图，请选择最匹配的可用工具并生成合法参数。",
+        "如果没有可执行工具意图，请不要调用任何工具。"
+    ));
+
+    content
 }
 
 async fn compile_tool_decision_openai(

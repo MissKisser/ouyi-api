@@ -1,7 +1,7 @@
 {
-  "tool_name": "Read",
-  "tool_input_preview": "{\"file_path\":\"C:\\\\Users\\\\missk\\\\.playwright-mcp\\\\console-2026-05-09T06-41-48-778Z.log\"}",
-  "error": "File does not exist. Note: your current working directory is D:\\document\\Projects\\ouyi-api\\web.",
-  "timestamp": "2026-05-09T06:43:10.274Z",
+  "tool_name": "Bash",
+  "tool_input_preview": "{\"command\":\"cd web && npm run build 2>&1 | tail -30\",\"timeout\":120000,\"description\":\"Run frontend build\"}",
+  "error": "Exit code 1\n/usr/bin/bash: line 1: cd: web: No such file or directory",
+  "timestamp": "2026-05-13T09:50:19.769Z",
   "retry_count": 1
 }

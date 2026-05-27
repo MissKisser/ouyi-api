@@ -49,6 +49,7 @@ pub struct RequestLog {
     pub prompt_tokens: u64,
     pub completion_tokens: u64,
     pub error: Option<String>,
+    pub platform: String,
 }
 
 /// 工具运行时日志条目
@@ -56,6 +57,7 @@ pub struct RequestLog {
 pub struct ToolRuntimeLog {
     pub timestamp: DateTime<Utc>,
     pub request_id: String,
+    pub endpoint: String,
     pub mode: String,
     pub provider: String,
     pub model: String,
@@ -148,6 +150,7 @@ impl StatsCollector {
         prompt_tokens: u64,
         completion_tokens: u64,
         model: &str,
+        platform: &str,
     ) {
         self.stats.active_requests.fetch_sub(1, Ordering::Relaxed);
         self.stats
@@ -171,10 +174,11 @@ impl StatsCollector {
             prompt_tokens,
             completion_tokens,
             error: None,
+            platform: platform.to_string(),
         });
     }
 
-    pub fn record_error(&self, latency_ms: u64, model: &str, error: &str) {
+    pub fn record_error(&self, latency_ms: u64, model: &str, error: &str, platform: &str) {
         self.stats.active_requests.fetch_sub(1, Ordering::Relaxed);
         self.stats.failed_requests.fetch_add(1, Ordering::Relaxed);
         self.stats
@@ -189,6 +193,7 @@ impl StatsCollector {
             prompt_tokens: 0,
             completion_tokens: 0,
             error: Some(error.to_string()),
+            platform: platform.to_string(),
         });
     }
 
@@ -240,6 +245,7 @@ impl StatsCollector {
     pub fn record_tool_runtime_success(
         &self,
         request_id: &str,
+        endpoint: &str,
         mode: ToolRuntimeMode,
         provider: &str,
         model: &str,
@@ -266,6 +272,7 @@ impl StatsCollector {
         let log = ToolRuntimeLog {
             timestamp: Utc::now(),
             request_id: request_id.to_string(),
+            endpoint: endpoint.to_string(),
             mode: mode.as_str().to_string(),
             provider: provider.to_string(),
             model: model.to_string(),
@@ -285,6 +292,7 @@ impl StatsCollector {
     pub fn record_tool_runtime_error(
         &self,
         request_id: &str,
+        endpoint: &str,
         mode: ToolRuntimeMode,
         provider: &str,
         model: &str,
@@ -312,6 +320,7 @@ impl StatsCollector {
         let log = ToolRuntimeLog {
             timestamp: Utc::now(),
             request_id: request_id.to_string(),
+            endpoint: endpoint.to_string(),
             mode: mode.as_str().to_string(),
             provider: provider.to_string(),
             model: model.to_string(),
@@ -419,6 +428,7 @@ mod tests {
 
         collector.record_tool_runtime_success(
             "msg_1",
+            "anthropic",
             ToolRuntimeMode::Compiler,
             "openai-compatible",
             "cheap-tool-model",
