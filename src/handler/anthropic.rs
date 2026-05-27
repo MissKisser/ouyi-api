@@ -3328,4 +3328,145 @@ mod tests {
         assert_eq!(routing.effective_model, "unknown-model-xyz");
         assert_eq!(routing.ouyi_model, "unknown-model-xyz");
     }
+
+    fn write_tool() -> AnthropicTool {
+        AnthropicTool {
+            name: "Write".to_string(),
+            description: "Write a file".to_string(),
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "file_path": {"type": "string"},
+                    "content": {"type": "string"}
+                },
+                "required": ["file_path", "content"]
+            }),
+        }
+    }
+
+    async fn ouyi_payload_write_handler() -> axum::response::Response {
+        ouyi_sse_response(concat!(
+            "准备将报告写入文件。\n",
+            "<ouyi_payload id=\"p1\">\n",
+            "# 报告\n",
+            "\"quote\"\n",
+            "</ouyi_payload>\n",
+            "将 payload p1 写入 docs/report.md。"
+        ))
+    }
+
+    async fn tool_compiler_write_payload_handler(
+        State(counter): State<Arc<AtomicUsize>>,
+    ) -> axum::Json<serde_json::Value> {
+        counter.fetch_add(1, Ordering::SeqCst);
+        axum::Json(json!({
+            "choices": [{
+                "message": {
+                    "tool_calls": [{
+                        "id": "call_from_tool_model",
+                        "type": "function",
+                        "function": {
+                            "name": "Write",
+                            "arguments": "{\"file_path\":\"docs/report.md\",\"content_ref\":\"p1\"}"
+                        }
+                    }]
+                }
+            }],
+            "usage": {
+                "prompt_tokens": 10,
+                "completion_tokens": 5
+            }
+        }))
+    }
+
+    async fn tool_compiler_bad_arguments_handler(
+        State(counter): State<Arc<AtomicUsize>>,
+    ) -> axum::Json<serde_json::Value> {
+        counter.fetch_add(1, Ordering::SeqCst);
+        axum::Json(json!({
+            "choices": [{
+                "message": {
+                    "tool_calls": [{
+                        "id": "call_bad",
+                        "type": "function",
+                        "function": {
+                            "name": "Write",
+                            "arguments": "{\"file_path\":\"docs/report.md\",\"content\":\""
+                        }
+                    }]
+                }
+            }]
+        }))
+    }
+
+    #[tokio::test]
+    async fn test_payload_write_tool_use_preserves_ouyi_content() {
+        let tool_requests = Arc::new(AtomicUsize::new(0));
+        let ouyi_base_url = spawn_mock_router(
+            Router::new()
+                .route("/api/chat/session", post(ouyi_session_handler))
+                .route("/api/chat/completions", post(ouyi_payload_write_handler)),
+        )
+        .await;
+        let tool_base_url = spawn_mock_router(
+            Router::new()
+                .route(
+                    "/chat/completions",
+                    post(tool_compiler_write_payload_handler),
+                )
+                .with_state(tool_requests.clone()),
+        )
+        .await;
+
+        let state = make_test_state(test_config(ouyi_base_url, tool_base_url));
+        let mut req = make_request_with_tools();
+        req.stream = Some(false);
+        req.tools = Some(vec![write_tool()]);
+        let routing = resolve_model_routing(&req.model, &state.model_mapper);
+
+        let response = handle_compiler_tool_runtime_message(state, req, routing)
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(tool_requests.load(Ordering::SeqCst), 1);
+
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        let value: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(value["stop_reason"], "tool_use");
+        assert_eq!(value["content"][0]["type"], "tool_use");
+        assert_eq!(value["content"][0]["name"], "Write");
+        assert_eq!(value["content"][0]["input"]["content"], "# 报告\n\"quote\"");
+        assert_eq!(value["content"][0]["input"]["file_path"], "docs/report.md");
+    }
+
+    #[tokio::test]
+    async fn test_tool_compiler_bad_arguments_does_not_return_400() {
+        let tool_requests = Arc::new(AtomicUsize::new(0));
+        let ouyi_base_url = spawn_mock_router(
+            Router::new()
+                .route("/api/chat/session", post(ouyi_session_handler))
+                .route("/api/chat/completions", post(ouyi_payload_write_handler)),
+        )
+        .await;
+        let tool_base_url = spawn_mock_router(
+            Router::new()
+                .route(
+                    "/chat/completions",
+                    post(tool_compiler_bad_arguments_handler),
+                )
+                .with_state(tool_requests.clone()),
+        )
+        .await;
+
+        let state = make_test_state(test_config(ouyi_base_url, tool_base_url));
+        let mut req = make_request_with_tools();
+        req.stream = Some(false);
+        req.tools = Some(vec![write_tool()]);
+        let routing = resolve_model_routing(&req.model, &state.model_mapper);
+
+        let response = handle_compiler_tool_runtime_message(state, req, routing)
+            .await
+            .unwrap();
+        assert_ne!(response.status(), axum::http::StatusCode::BAD_REQUEST);
+    }
 }
