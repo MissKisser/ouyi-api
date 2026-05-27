@@ -466,6 +466,11 @@ fn normalize_ouyi_display_text(text: &str, latest_user_text: Option<&str>) -> St
     normalize_plain_text(&parsed.normal_text, latest_user_text)
 }
 
+fn broker_error_to_final_answer_text(ouyi_output: &str) -> String {
+    let extracted = crate::tool_runtime::payload::extract_payloads(ouyi_output);
+    normalize_plain_text(&extracted.sanitized_text, None)
+}
+
 async fn request_final_answer_after_suppressed_tool_intent(
     client: &OuyiHttpClient,
     session_id: i64,
@@ -1086,15 +1091,8 @@ async fn handle_compiler_tool_runtime_message(
                 broker_started.elapsed().as_millis() as u64,
                 &e.to_string(),
             );
-            state.stats.record_error(
-                start_time.elapsed().as_millis() as u64,
-                &model_full,
-                &e.to_string(),
-                "ouyi8",
-            );
-            state.active_sessions.remove(&session_id);
-            spawn_session_cleanup(client, session_id);
-            return Err(e);
+            tracing::warn!(error = %e, "工具决策异常，返回主脑文本");
+            BrokerDecision::FinalAnswer { usage: None }
         }
     };
 
@@ -1347,11 +1345,8 @@ async fn handle_anthropic_tools_plain_output(
                 &e.to_string(),
                 &platform_key,
             );
-            if let Some((client, session_id)) = reusable_session {
-                state.active_sessions.remove(&session_id);
-                spawn_session_cleanup(client, session_id);
-            }
-            return Err(e);
+            tracing::warn!(error = %e, "工具决策异常，返回主脑文本");
+            BrokerDecision::FinalAnswer { usage: None }
         }
     };
 
