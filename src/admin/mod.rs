@@ -232,9 +232,7 @@ mod tests {
     async fn protected_admin_api_requires_bearer_token() {
         let state = make_test_state();
         let app = admin_routes(state.clone()).with_state(state);
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
-            .await
-            .unwrap();
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
         let server = tokio::spawn(async move {
             axum::serve(listener, app).await.unwrap();

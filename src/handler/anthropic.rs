@@ -21,6 +21,8 @@ use crate::model::anthropic::{AnthropicContent, ContentBlock, MessagesRequest};
 use crate::platform::OuyiPlatform;
 use crate::tool_runtime;
 
+const TOOL_RESULT_CONTENT_MAX_BYTES: usize = 64 * 1024;
+
 /// 工具运行时路由决策
 #[derive(Debug, Clone)]
 pub enum RuntimeRoute {
@@ -239,7 +241,10 @@ fn format_tool_results_for_reuse(req: &MessagesRequest) -> String {
                         .get(tool_use_id.as_str())
                         .map(|s| s.as_str())
                         .unwrap_or(tool_use_id.as_str());
-                    let display_content = truncate_utf8_by_byte_limit_with_notice(content, 2000);
+                    let display_content = truncate_utf8_by_byte_limit_with_notice(
+                        content,
+                        TOOL_RESULT_CONTENT_MAX_BYTES,
+                    );
                     parts.push(format!(
                         "工具 {} 的执行结果：\n{}",
                         tool_name, display_content
@@ -2325,27 +2330,40 @@ mod tests {
     }
 
     #[test]
-    fn test_format_tool_results_for_reuse_truncation() {
+    fn test_format_tool_results_for_reuse_preserves_typical_file_output() {
         let long_content = "x".repeat(3000);
         let tool_result = make_tool_result_msg("call_0", &long_content);
         let req = make_messages_request(vec![tool_result]);
 
         let result = format_tool_results_for_reuse(&req);
-        assert!(result.contains("截断"));
-        assert!(result.contains("3000"));
-        assert!(result.len() < long_content.len() + 200); // 应远小于原始大小
+        assert!(!result.contains("截断"));
+        assert!(result.contains(&long_content));
     }
 
     #[test]
-    fn test_format_tool_results_for_reuse_truncation_handles_multibyte_text() {
+    fn test_format_tool_results_for_reuse_preserves_typical_multibyte_file_output() {
         let long_content = "方".repeat(1000);
         let tool_result = make_tool_result_msg("call_0", &long_content);
         let req = make_messages_request(vec![tool_result]);
 
         let result = format_tool_results_for_reuse(&req);
 
-        assert!(result.contains("截断"));
-        assert!(result.contains("1000"));
+        assert!(!result.contains("截断"));
+        assert!(result.contains(&long_content));
+    }
+
+    #[test]
+    fn test_format_tool_results_for_reuse_truncates_extreme_output_with_notice() {
+        let long_content = "x".repeat(TOOL_RESULT_CONTENT_MAX_BYTES + 1);
+        let tool_result = make_tool_result_msg("call_0", &long_content);
+        let req = make_messages_request(vec![tool_result]);
+
+        let result = format_tool_results_for_reuse(&req);
+
+        assert!(result.contains(&format!(
+            "内容截断，共 {} 字符",
+            TOOL_RESULT_CONTENT_MAX_BYTES + 1
+        )));
     }
 
     #[test]

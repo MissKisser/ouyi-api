@@ -27,6 +27,7 @@ const TOOL_CALL_FORMAT: &str = concat!(
 );
 
 const TOOL_CALL_REMINDER: &str = "\n\n【工具调用提醒】如果需要使用工具，请表达工具意图；长文本放入 ouyi_payload，服务端会转换为 Claude Code 工具调用。";
+const TOOL_RESULT_CONTENT_MAX_BYTES: usize = 64 * 1024;
 
 fn truncate_utf8_by_byte_limit_with_notice(content: &str, max_bytes: usize) -> String {
     if content.len() <= max_bytes {
@@ -223,8 +224,10 @@ pub fn convert_anthropic_request(
                                 .get(tool_use_id)
                                 .map(|s| s.as_str())
                                 .unwrap_or(tool_use_id);
-                            let display_content =
-                                truncate_utf8_by_byte_limit_with_notice(content, 2000);
+                            let display_content = truncate_utf8_by_byte_limit_with_notice(
+                                content,
+                                TOOL_RESULT_CONTENT_MAX_BYTES,
+                            );
                             role_texts.push(format!(
                                 "[Tool Result for {}]:\n<tool_result name=\"{}\">\n{}\n</tool_result>\n[End of tool result for {}. Continue.]",
                                 tool_name, tool_name, display_content, tool_name
@@ -345,7 +348,7 @@ mod tests {
     }
 
     #[test]
-    fn test_tool_result_truncation_handles_multibyte_text() {
+    fn test_tool_result_preserves_typical_multibyte_file_output() {
         let req = make_req(AnthropicContent::Blocks(vec![ContentBlock::ToolResult {
             tool_use_id: "tool_1".to_string(),
             content: "方".repeat(1000),
@@ -353,7 +356,23 @@ mod tests {
 
         let result = convert_anthropic_request(&req, "test", false).unwrap();
 
-        assert!(result.text.contains("[...内容截断，共 1000 字符...]"));
+        assert!(!result.text.contains("内容截断"));
+        assert!(result.text.contains(&"方".repeat(1000)));
+    }
+
+    #[test]
+    fn test_tool_result_truncates_extreme_output_with_notice() {
+        let req = make_req(AnthropicContent::Blocks(vec![ContentBlock::ToolResult {
+            tool_use_id: "tool_1".to_string(),
+            content: "x".repeat(TOOL_RESULT_CONTENT_MAX_BYTES + 1),
+        }]));
+
+        let result = convert_anthropic_request(&req, "test", false).unwrap();
+
+        assert!(result.text.contains(&format!(
+            "内容截断，共 {} 字符",
+            TOOL_RESULT_CONTENT_MAX_BYTES + 1
+        )));
     }
 
     #[test]
