@@ -39,6 +39,21 @@ pub async fn responses(
     }
 }
 
+fn record_responses_error(
+    state: &AppState,
+    start_time: std::time::Instant,
+    model: &str,
+    error: &AppError,
+    platform: &str,
+) {
+    state.stats.record_error(
+        start_time.elapsed().as_millis() as u64,
+        model,
+        &error.to_string(),
+        platform,
+    );
+}
+
 /// 8.0 平台 Responses 处理
 async fn responses_v8(
     state: Arc<AppState>,
@@ -51,8 +66,14 @@ async fn responses_v8(
     let config = state.config.read().await.clone();
     let should_thinking = state.model_mapper.should_thinking(&chat_req.model);
 
-    let ouyi_req =
-        convert_request(&chat_req, &model_full, should_thinking).map_err(AppError::Internal)?;
+    let ouyi_req = match convert_request(&chat_req, &model_full, should_thinking) {
+        Ok(req) => req,
+        Err(e) => {
+            let err = AppError::Internal(e);
+            record_responses_error(&state, start_time, &model_full, &err, "ouyi8");
+            return Err(err);
+        }
+    };
 
     let jwt_token = match state.account_store.get_next_token().await {
         Some(token) => token,
@@ -60,9 +81,9 @@ async fn responses_v8(
     };
 
     if jwt_token.is_empty() {
-        return Err(AppError::BadRequest(
-            "未配置 JWT token 且无可用账号 token".to_string(),
-        ));
+        let err = AppError::BadRequest("未配置 JWT token 且无可用账号 token".to_string());
+        record_responses_error(&state, start_time, &model_full, &err, "ouyi8");
+        return Err(err);
     }
 
     let client = OuyiHttpClient::new(
@@ -163,30 +184,44 @@ async fn responses_v7(
     let config = state.config.read().await.clone();
     let platform_key = state.platform.read().await.config_key();
 
-    let v7_config = config
-        .ouyi_v7
-        .as_ref()
-        .ok_or_else(|| AppError::Config("未配置 7.0 平台".to_string()))?;
+    let v7_config = match config.ouyi_v7.as_ref() {
+        Some(config) => config,
+        None => {
+            let err = AppError::Config("未配置 7.0 平台".to_string());
+            record_responses_error(&state, start_time, &model_full, &err, platform_key);
+            return Err(err);
+        }
+    };
 
     let max_history = v7_config.max_history_messages;
 
     // 7.0 不支持工具
     if req.tools.is_some() {
-        return Err(AppError::BadRequest("7.0 平台暂不支持工具调用".to_string()));
+        let err = AppError::BadRequest("7.0 平台暂不支持工具调用".to_string());
+        record_responses_error(&state, start_time, &model_full, &err, platform_key);
+        return Err(err);
     }
 
-    let ouyi_input = crate::adapter::ouyi_v7_request::from_openai_chat(
+    let ouyi_input = match crate::adapter::ouyi_v7_request::from_openai_chat(
         &chat_req,
         model_full.clone(),
         max_history,
-    )?;
+    ) {
+        Ok(input) => input,
+        Err(e) => {
+            record_responses_error(&state, start_time, &model_full, &e, platform_key);
+            return Err(e);
+        }
+    };
 
     let client = {
         let ouyi_client = state.ouyi_client.read().await;
         match &*ouyi_client {
             crate::client::OuyiClient::V7(client) => client.clone(),
             crate::client::OuyiClient::V8(_) => {
-                return Err(AppError::Internal("当前运行客户端不是 7.0".to_string()));
+                let err = AppError::Internal("当前运行客户端不是 7.0".to_string());
+                record_responses_error(&state, start_time, &model_full, &err, platform_key);
+                return Err(err);
             }
         }
     };
@@ -246,7 +281,14 @@ async fn handle_v7_responses_stream(
         .unwrap_or(80);
 
     let task_id = format!("resp_{}", uuid_short());
-    let response = build_responses_stream_from_plain(model, &task_id, text, chunk_chars)?;
+    let response = match build_responses_stream_from_plain(model, &task_id, text, chunk_chars) {
+        Ok(response) => response,
+        Err(e) => {
+            let platform_key = state.platform.read().await.config_key();
+            record_responses_error(&state, start_time, &model_full, &e, platform_key);
+            return Err(e);
+        }
+    };
 
     let stream_elapsed = start_time.elapsed().as_millis() as u64;
     let platform_key = state.platform.read().await.config_key();
@@ -877,4 +919,126 @@ fn uuid_short() -> String {
         .unwrap_or_default()
         .as_nanos();
     format!("{:x}", ts % 0xFFFFFF)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use axum::Json;
+    use axum::extract::State;
+    use serde_json::json;
+    use std::sync::Arc;
+    use std::sync::atomic::Ordering;
+
+    use crate::admin::stats::StatsCollector;
+    use crate::admin::{AccountStore, auth::AdminStore};
+    use crate::client::ouyi_v7::Ouyi7HttpClient;
+    use crate::config::{
+        AdminConfig, AppConfig, LimitsConfig, Ouyi7Config, OuyiConfig, PlatformConfig,
+        ServerConfig, ToolCallConfig,
+    };
+    use crate::model::mapper::ModelMapper;
+
+    fn make_v7_test_state(ouyi_base_url: String) -> Arc<AppState> {
+        let http_client = reqwest::Client::builder()
+            .timeout(std::time::Duration::from_secs(5))
+            .build()
+            .unwrap();
+        let mapper = ModelMapper::new();
+        mapper.load_fallback();
+        let platform = OuyiPlatform::Ouyi7;
+        let config = AppConfig {
+            server: ServerConfig {
+                host: "127.0.0.1".to_string(),
+                port: 0,
+            },
+            ouyi: OuyiConfig {
+                base_url: ouyi_base_url.clone(),
+                jwt_token: "test-jwt".to_string(),
+                app_version: "3.0.3".to_string(),
+                model_refresh_interval_secs: 3600,
+            },
+            limits: LimitsConfig {
+                request_timeout_secs: 5,
+                no_data_timeout_secs: 5,
+                max_response_bytes: 1024 * 1024,
+                max_messages_bytes: 1024 * 1024,
+            },
+            admin: Some(AdminConfig {
+                jwt_secret: Some("test-secret".to_string()),
+                password_hash: None,
+            }),
+            tool_call: ToolCallConfig::default(),
+            tool_runtime: None,
+            openai_tool_runtime: None,
+            platform: Some(PlatformConfig {
+                default: platform,
+                prompt_on_start: false,
+            }),
+            ouyi_v7: Some(Ouyi7Config {
+                base_url: ouyi_base_url.clone(),
+                chatapi_prefix: "/chatapi".to_string(),
+                jwt_token: "test-v7-jwt".to_string(),
+                default_model: "ouyi-chat".to_string(),
+                model_refresh_interval_secs: 3600,
+                max_history_messages: 20,
+                simulated_stream_chunk_chars: 80,
+            }),
+        };
+
+        Arc::new(AppState {
+            ouyi_client: tokio::sync::RwLock::new(crate::client::OuyiClient::V7(
+                Ouyi7HttpClient::new(
+                    http_client.clone(),
+                    ouyi_base_url.clone(),
+                    "/chatapi".to_string(),
+                    "test-v7-jwt".to_string(),
+                ),
+            )),
+            config: tokio::sync::RwLock::new(config),
+            http_client,
+            active_sessions: dashmap::DashMap::new(),
+            tool_sessions: dashmap::DashMap::new(),
+            tool_ledger: crate::tool_runtime::ToolLedger::new(),
+            model_mapper: mapper,
+            admin_store: tokio::sync::RwLock::new(AdminStore::new(
+                "test-secret".to_string(),
+                String::new(),
+            )),
+            account_store: AccountStore::new(),
+            stats: StatsCollector::new(),
+            platform: tokio::sync::RwLock::new(platform),
+            platform_status: tokio::sync::RwLock::new(crate::platform::PlatformStatus::new(
+                platform,
+                ouyi_base_url,
+            )),
+        })
+    }
+
+    #[tokio::test]
+    async fn test_ouyi7_responses_tools_rejection_records_error_and_clears_active_request() {
+        let state = make_v7_test_state("http://127.0.0.1:1".to_string());
+        let req = ResponsesRequest {
+            model: "gpt-4o".to_string(),
+            input: json!("hello"),
+            instructions: None,
+            stream: false,
+            tools: Some(vec![json!({
+                "type": "function",
+                "name": "Bash",
+                "description": "Run shell command",
+                "parameters": {"type": "object"}
+            })]),
+            temperature: None,
+            max_output_tokens: None,
+        };
+
+        let err = responses(State(state.clone()), Json(req))
+            .await
+            .unwrap_err();
+
+        assert!(matches!(err, AppError::BadRequest(_)));
+        assert_eq!(state.stats.stats.active_requests.load(Ordering::Relaxed), 0);
+        assert_eq!(state.stats.stats.failed_requests.load(Ordering::Relaxed), 1);
+    }
 }

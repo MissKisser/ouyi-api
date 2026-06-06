@@ -69,6 +69,21 @@ pub async fn chat_completions(
     }
 }
 
+fn record_chat_error(
+    state: &AppState,
+    start_time: std::time::Instant,
+    model: &str,
+    error: &AppError,
+    platform: &str,
+) {
+    state.stats.record_error(
+        start_time.elapsed().as_millis() as u64,
+        model,
+        &error.to_string(),
+        platform,
+    );
+}
+
 /// 8.0 平台聊天处理
 async fn chat_completions_v8(
     state: Arc<AppState>,
@@ -84,8 +99,14 @@ async fn chat_completions_v8(
     let has_tools = req.tools.as_ref().is_some_and(|tools| !tools.is_empty());
 
     // 请求转换
-    let ouyi_req =
-        convert_request(&req, &model_full, should_thinking).map_err(AppError::Internal)?;
+    let ouyi_req = match convert_request(&req, &model_full, should_thinking) {
+        Ok(req) => req,
+        Err(e) => {
+            let err = AppError::Internal(e);
+            record_chat_error(&state, start_time, &model_full, &err, &platform_str);
+            return Err(err);
+        }
+    };
 
     let jwt_token = match state.account_store.get_next_token().await {
         Some(token) => token,
@@ -93,9 +114,9 @@ async fn chat_completions_v8(
     };
 
     if jwt_token.is_empty() {
-        return Err(AppError::BadRequest(
-            "未配置 JWT token 且无可用账号 token".to_string(),
-        ));
+        let err = AppError::BadRequest("未配置 JWT token 且无可用账号 token".to_string());
+        record_chat_error(&state, start_time, &model_full, &err, &platform_str);
+        return Err(err);
     }
 
     let client = OuyiHttpClient::new(
@@ -187,27 +208,40 @@ async fn chat_completions_v7(
     let config = state.config.read().await.clone();
     let platform_str = state.platform.read().await.config_key();
 
-    let v7_config = config
-        .ouyi_v7
-        .as_ref()
-        .ok_or_else(|| AppError::Config("未配置 7.0 平台".to_string()))?;
-
     let model_full = state.model_mapper.to_ouyi(&req.model);
+    let v7_config = match config.ouyi_v7.as_ref() {
+        Some(config) => config,
+        None => {
+            let err = AppError::Config("未配置 7.0 平台".to_string());
+            record_chat_error(&state, start_time, &model_full, &err, &platform_str);
+            return Err(err);
+        }
+    };
     let max_history = v7_config.max_history_messages;
 
     let has_tools = req.tools.as_ref().is_some_and(|tools| !tools.is_empty());
 
     // 请求转换
-    let ouyi_input =
-        crate::adapter::ouyi_v7_request::from_openai_chat(&req, model_full.clone(), max_history)
-            .map_err(|e| e)?;
+    let ouyi_input = match crate::adapter::ouyi_v7_request::from_openai_chat(
+        &req,
+        model_full.clone(),
+        max_history,
+    ) {
+        Ok(input) => input,
+        Err(e) => {
+            record_chat_error(&state, start_time, &model_full, &e, &platform_str);
+            return Err(e);
+        }
+    };
 
     let client = {
         let ouyi_client = state.ouyi_client.read().await;
         match &*ouyi_client {
             crate::client::OuyiClient::V7(client) => client.clone(),
             crate::client::OuyiClient::V8(_) => {
-                return Err(AppError::Internal("当前运行客户端不是 7.0".to_string()));
+                let err = AppError::Internal("当前运行客户端不是 7.0".to_string());
+                record_chat_error(&state, start_time, &model_full, &err, &platform_str);
+                return Err(err);
             }
         }
     };
@@ -266,7 +300,14 @@ async fn handle_v7_stream_response(
         .unwrap_or(80);
 
     let task_id = format!("chatcmpl-{}", uuid_short());
-    let response = build_openai_text_stream_from_plain(model, &task_id, text, chunk_chars)?;
+    let response = match build_openai_text_stream_from_plain(model, &task_id, text, chunk_chars) {
+        Ok(response) => response,
+        Err(e) => {
+            let platform_key = state.platform.read().await.config_key();
+            record_chat_error(&state, start_time, &model_full, &e, &platform_key);
+            return Err(e);
+        }
+    };
 
     let stream_elapsed = start_time.elapsed().as_millis() as u64;
     let platform_key = state.platform.read().await.config_key();
@@ -575,10 +616,17 @@ async fn maybe_build_openai_long_task_poll_response(
             Ok(None)
         }
         LongTaskResult::Pending => {
-            let updated = state
+            let updated = match state
                 .tool_ledger
                 .increment_long_task_poll_by_task_id(&task.task_id)
-                .ok_or_else(|| AppError::BadRequest("长时任务状态不存在".to_string()))?;
+            {
+                Some(updated) => updated,
+                None => {
+                    let err = AppError::BadRequest("长时任务状态不存在".to_string());
+                    record_chat_error(state, start_time, model, &err, &platform_key);
+                    return Err(err);
+                }
+            };
             if updated.polls > updated.max_polls {
                 state.tool_ledger.complete_long_task(&task.task_id);
                 let msg = format!("长时任务轮询超限: {}", updated.file_path);
@@ -653,7 +701,13 @@ async fn maybe_build_openai_long_task_poll_response(
 
             let task_id = format!("chatcmpl-{}", uuid_short());
             let response = if req.stream {
-                build_openai_tool_call_stream_response(model, &task_id, calls)?
+                match build_openai_tool_call_stream_response(model, &task_id, calls) {
+                    Ok(response) => response,
+                    Err(e) => {
+                        record_chat_error(state, start_time, model, &e, &platform_key);
+                        return Err(e);
+                    }
+                }
             } else {
                 Json(build_openai_tool_call_response(
                     model, &task_id, calls, 0, 0,
@@ -813,21 +867,32 @@ async fn handle_openai_tools_plain_output(
     let config = state.config.read().await.openai_tool_runtime.clone();
     let runtime_started = std::time::Instant::now();
 
-    let decision = crate::tool_runtime::decision::decide_openai_tools_from_text(
+    let decision = match crate::tool_runtime::decision::decide_openai_tools_from_text(
         state.http_client.clone(),
         config.as_ref(),
         &req,
         &ouyi_output,
     )
-    .await?;
+    .await
+    {
+        Ok(decision) => decision,
+        Err(e) => {
+            record_chat_error(&state, start_time, &short_model, &e, platform_key);
+            return Err(e);
+        }
+    };
 
     match decision {
         ToolTextDecision::ToolCalls { calls, meta } => {
             for call in &calls {
                 let call_key = format!("{}:{}", short_model, call.id);
-                state
+                if let Err(e) = state
                     .tool_ledger
-                    .record_tool_use(&call_key, &call.id, &call.name)?;
+                    .record_tool_use(&call_key, &call.id, &call.name)
+                {
+                    record_chat_error(&state, start_time, &short_model, &e, platform_key);
+                    return Err(e);
+                }
 
                 let broker_call = BrokerToolCall {
                     id: call.id.clone(),
@@ -835,12 +900,15 @@ async fn handle_openai_tools_plain_output(
                     input: call.input.clone(),
                 };
                 if let Some(plan) = detect_long_task(&broker_call) {
-                    state.tool_ledger.attach_long_task(
+                    if let Err(e) = state.tool_ledger.attach_long_task(
                         &call_key,
                         plan.file_path,
                         plan.done_marker,
                         plan.max_polls,
-                    )?;
+                    ) {
+                        record_chat_error(&state, start_time, &short_model, &e, platform_key);
+                        return Err(e);
+                    }
                 }
             }
 
@@ -1194,6 +1262,25 @@ mod tests {
         )
         .await;
         make_test_state(test_config(ouyi_base_url, tool_base_url))
+    }
+
+    #[tokio::test]
+    async fn test_chat_missing_jwt_records_error_and_clears_active_request() {
+        let mut config = test_config(
+            "http://127.0.0.1:1".to_string(),
+            "http://127.0.0.1:2".to_string(),
+        );
+        config.ouyi.jwt_token.clear();
+        let state = make_test_state(config);
+        let req = openai_request(false);
+
+        let err = chat_completions(State(state.clone()), Json(req))
+            .await
+            .unwrap_err();
+
+        assert!(matches!(err, AppError::BadRequest(_)));
+        assert_eq!(state.stats.stats.active_requests.load(Ordering::Relaxed), 0);
+        assert_eq!(state.stats.stats.failed_requests.load(Ordering::Relaxed), 1);
     }
 
     #[tokio::test]

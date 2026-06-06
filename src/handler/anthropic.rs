@@ -577,6 +577,21 @@ pub async fn messages(
     }
 }
 
+fn record_anthropic_error(
+    state: &AppState,
+    start_time: std::time::Instant,
+    model: &str,
+    error: &AppError,
+    platform: &str,
+) {
+    state.stats.record_error(
+        start_time.elapsed().as_millis() as u64,
+        model,
+        &error.to_string(),
+        platform,
+    );
+}
+
 /// 原 Ouyi 链路处理（无工具或未配置工具运行时）
 async fn handle_original_ouyi_message(
     state: Arc<AppState>,
@@ -605,8 +620,14 @@ async fn handle_original_ouyi_message(
     state.stats.record_start();
     let start_time = std::time::Instant::now();
 
-    let ouyi_req = convert_anthropic_request(&req, &model_full, should_thinking)
-        .map_err(|e| AppError::BadRequest(e))?;
+    let ouyi_req = match convert_anthropic_request(&req, &model_full, should_thinking) {
+        Ok(req) => req,
+        Err(e) => {
+            let err = AppError::BadRequest(e);
+            record_anthropic_error(&state, start_time, &model_full, &err, "ouyi8");
+            return Err(err);
+        }
+    };
 
     // 判断是否为工具回传请求，尝试复用缓存会话
     let tool_use_id = extract_last_tool_use_id(&req);
@@ -623,9 +644,10 @@ async fn handle_original_ouyi_message(
                     None => config.ouyi.jwt_token.clone(),
                 };
                 if jwt_token.is_empty() {
-                    return Err(AppError::BadRequest(
-                        "未配置 JWT token 且无可用账号 token".to_string(),
-                    ));
+                    let err =
+                        AppError::BadRequest("未配置 JWT token 且无可用账号 token".to_string());
+                    record_anthropic_error(&state, start_time, &model_full, &err, "ouyi8");
+                    return Err(err);
                 }
                 let client = OuyiHttpClient::new(
                     state.http_client.clone(),
@@ -642,9 +664,10 @@ async fn handle_original_ouyi_message(
                     None => config.ouyi.jwt_token.clone(),
                 };
                 if jwt_token.is_empty() {
-                    return Err(AppError::BadRequest(
-                        "未配置 JWT token 且无可用账号 token".to_string(),
-                    ));
+                    let err =
+                        AppError::BadRequest("未配置 JWT token 且无可用账号 token".to_string());
+                    record_anthropic_error(&state, start_time, &model_full, &err, "ouyi8");
+                    return Err(err);
                 }
                 let client = OuyiHttpClient::new(
                     state.http_client.clone(),
@@ -674,9 +697,9 @@ async fn handle_original_ouyi_message(
             None => config.ouyi.jwt_token.clone(),
         };
         if jwt_token.is_empty() {
-            return Err(AppError::BadRequest(
-                "未配置 JWT token 且无可用账号 token".to_string(),
-            ));
+            let err = AppError::BadRequest("未配置 JWT token 且无可用账号 token".to_string());
+            record_anthropic_error(&state, start_time, &model_full, &err, "ouyi8");
+            return Err(err);
         }
         let client = OuyiHttpClient::new(
             state.http_client.clone(),
@@ -782,19 +805,38 @@ async fn handle_ouyi7_message(
     let start_time = std::time::Instant::now();
 
     // 请求转换
-    let ouyi_input = crate::adapter::ouyi_v7_request::from_anthropic_messages(
+    let ouyi_input = match crate::adapter::ouyi_v7_request::from_anthropic_messages(
         &req,
         model_full.clone(),
         max_history,
-    )
-    .map_err(|e| e)?;
+    ) {
+        Ok(input) => input,
+        Err(e) => {
+            record_anthropic_error(
+                &state,
+                start_time,
+                &model_full,
+                &e,
+                state.platform.read().await.config_key(),
+            );
+            return Err(e);
+        }
+    };
 
     let client = {
         let ouyi_client = state.ouyi_client.read().await;
         match &*ouyi_client {
             crate::client::OuyiClient::V7(client) => client.clone(),
             crate::client::OuyiClient::V8(_) => {
-                return Err(AppError::Internal("当前运行客户端不是 7.0".to_string()));
+                let err = AppError::Internal("当前运行客户端不是 7.0".to_string());
+                record_anthropic_error(
+                    &state,
+                    start_time,
+                    &model_full,
+                    &err,
+                    state.platform.read().await.config_key(),
+                );
+                return Err(err);
             }
         }
     };
@@ -861,7 +903,14 @@ async fn handle_v7_anthropic_stream(
         .unwrap_or(80);
 
     let task_id = format!("msg_{}", uuid_short());
-    let response = build_anthropic_stream_from_plain(model, &task_id, text, chunk_chars)?;
+    let response = match build_anthropic_stream_from_plain(model, &task_id, text, chunk_chars) {
+        Ok(response) => response,
+        Err(e) => {
+            let platform_key = state.platform.read().await.config_key();
+            record_anthropic_error(&state, start_time, &model_full, &e, &platform_key);
+            return Err(e);
+        }
+    };
 
     let stream_elapsed = start_time.elapsed().as_millis() as u64;
     let platform_key = state.platform.read().await.config_key();
@@ -930,9 +979,9 @@ async fn handle_compiler_tool_runtime_message(
         None => app_config.ouyi.jwt_token.clone(),
     };
     if jwt_token.is_empty() {
-        return Err(AppError::BadRequest(
-            "未配置 JWT token 且无可用账号 token".to_string(),
-        ));
+        let err = AppError::BadRequest("未配置 JWT token 且无可用账号 token".to_string());
+        record_anthropic_error(&state, start_time, &model_full, &err, "ouyi8");
+        return Err(err);
     }
 
     let client = OuyiHttpClient::new(
@@ -1127,9 +1176,13 @@ async fn handle_compiler_tool_runtime_message(
             // 记录工具调用到 ledger
             for call in &compiled_calls {
                 let key = format!("{}:{}", req.model, call.id);
-                state
+                if let Err(e) = state
                     .tool_ledger
-                    .record_tool_use(&key, &call.id, &call.name)?;
+                    .record_tool_use(&key, &call.id, &call.name)
+                {
+                    record_anthropic_error(&state, start_time, &model_full, &e, "ouyi8");
+                    return Err(e);
+                }
 
                 // 检测长时任务并附加状态
                 let broker_call = crate::tool_runtime::broker::BrokerToolCall {
@@ -1138,12 +1191,15 @@ async fn handle_compiler_tool_runtime_message(
                     input: call.input.clone(),
                 };
                 if let Some(plan) = crate::tool_runtime::broker::detect_long_task(&broker_call) {
-                    state.tool_ledger.attach_long_task(
+                    if let Err(e) = state.tool_ledger.attach_long_task(
                         &key,
                         plan.file_path,
                         plan.done_marker,
                         plan.max_polls,
-                    )?;
+                    ) {
+                        record_anthropic_error(&state, start_time, &model_full, &e, "ouyi8");
+                        return Err(e);
+                    }
                 }
             }
 
@@ -1339,12 +1395,6 @@ async fn handle_anthropic_tools_plain_output(
                 broker_started.elapsed().as_millis() as u64,
                 &e.to_string(),
             );
-            state.stats.record_error(
-                start_time.elapsed().as_millis() as u64,
-                &model_full,
-                &e.to_string(),
-                &platform_key,
-            );
             tracing::warn!(error = %e, "工具决策异常，返回主脑文本");
             BrokerDecision::FinalAnswer { usage: None }
         }
@@ -1380,9 +1430,13 @@ async fn handle_anthropic_tools_plain_output(
             // 记录工具调用到 ledger
             for call in &compiled_calls {
                 let key = format!("{}:{}", req.model, call.id);
-                state
+                if let Err(e) = state
                     .tool_ledger
-                    .record_tool_use(&key, &call.id, &call.name)?;
+                    .record_tool_use(&key, &call.id, &call.name)
+                {
+                    record_anthropic_error(&state, start_time, &model_full, &e, platform_key);
+                    return Err(e);
+                }
 
                 let broker_call = crate::tool_runtime::broker::BrokerToolCall {
                     id: call.id.clone(),
@@ -1390,12 +1444,15 @@ async fn handle_anthropic_tools_plain_output(
                     input: call.input.clone(),
                 };
                 if let Some(plan) = crate::tool_runtime::broker::detect_long_task(&broker_call) {
-                    state.tool_ledger.attach_long_task(
+                    if let Err(e) = state.tool_ledger.attach_long_task(
                         &key,
                         plan.file_path,
                         plan.done_marker,
                         plan.max_polls,
-                    )?;
+                    ) {
+                        record_anthropic_error(&state, start_time, &model_full, &e, platform_key);
+                        return Err(e);
+                    }
                 }
             }
 
@@ -3237,6 +3294,26 @@ mod tests {
             model: Some("gpt-4".to_string()),
             timeout_secs: 120,
         }
+    }
+
+    #[tokio::test]
+    async fn test_anthropic_compiler_missing_jwt_records_error_and_clears_active_request() {
+        let mut config = test_config(
+            "http://127.0.0.1:1".to_string(),
+            "http://127.0.0.1:2".to_string(),
+        );
+        config.ouyi.jwt_token.clear();
+        let state = make_test_state(config);
+        let req = make_request_with_tools();
+        let routing = resolve_model_routing(&req.model, &state.model_mapper);
+
+        let err = handle_compiler_tool_runtime_message(state.clone(), req, routing)
+            .await
+            .unwrap_err();
+
+        assert!(matches!(err, AppError::BadRequest(_)));
+        assert_eq!(state.stats.stats.active_requests.load(Ordering::Relaxed), 0);
+        assert_eq!(state.stats.stats.failed_requests.load(Ordering::Relaxed), 1);
     }
 
     #[test]
