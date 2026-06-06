@@ -144,6 +144,14 @@ impl StatsCollector {
         self.stats.active_requests.fetch_add(1, Ordering::Relaxed);
     }
 
+    fn finish_active_request(&self) {
+        let _ = self.stats.active_requests.fetch_update(
+            Ordering::Relaxed,
+            Ordering::Relaxed,
+            |current| current.checked_sub(1),
+        );
+    }
+
     pub fn record_success(
         &self,
         latency_ms: u64,
@@ -152,7 +160,7 @@ impl StatsCollector {
         model: &str,
         platform: &str,
     ) {
-        self.stats.active_requests.fetch_sub(1, Ordering::Relaxed);
+        self.finish_active_request();
         self.stats
             .successful_requests
             .fetch_add(1, Ordering::Relaxed);
@@ -179,7 +187,7 @@ impl StatsCollector {
     }
 
     pub fn record_error(&self, latency_ms: u64, model: &str, error: &str, platform: &str) {
-        self.stats.active_requests.fetch_sub(1, Ordering::Relaxed);
+        self.finish_active_request();
         self.stats.failed_requests.fetch_add(1, Ordering::Relaxed);
         self.stats
             .total_latency_ms
@@ -421,6 +429,17 @@ fn mask_base_url(url: &str) -> String {
 mod tests {
     use super::*;
     use std::sync::atomic::Ordering;
+
+    #[test]
+    fn record_error_after_success_does_not_underflow_active_requests() {
+        let collector = StatsCollector::new();
+
+        collector.record_start();
+        collector.record_success(10, 1, 1, "model-a", "ouyi8");
+        collector.record_error(11, "model-a", "late error", "ouyi8");
+
+        assert_eq!(collector.stats.active_requests.load(Ordering::Relaxed), 0);
+    }
 
     #[test]
     fn test_tool_runtime_success_updates_tokens_logs_and_model_stats() {
