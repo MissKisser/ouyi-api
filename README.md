@@ -2,11 +2,13 @@
 
 欧亿 AI 平台反向代理服务，提供 OpenAI 和 Anthropic 兼容的 API 接口，附 Web 管理面板。
 
+项目级目标、边界和验收标准见 [SPEC.md](./SPEC.md)。
+
 ## 特性
 
 - **双协议支持** — 同时提供 OpenAI Responses API（`/openai/v1`，面向 Codex）和 Anthropic（`/anthropic`）接口
 - **扩展思考** — 支持 Claude 系列模型的 thinking 模式，流式输出推理过程
-- **工具调用** — Claude Code 工具请求可路由到原生 Anthropic tools 后端，普通对话继续走欧亿
+- **工具调用** — Claude Code 工具请求由欧亿主模型产生意图，再通过 broker / compiler 合成标准工具响应
 - **Usage 统计** — Anthropic 响应包含 input/output token 用量，claude-hud 可正常显示
 - **Web 管理面板** — 仪表盘、模型列表、聊天测试、配置管理、日志查看
 - **多账号池** — 轮询分配上游 token，支持状态追踪和故障切换
@@ -43,11 +45,11 @@ password_hash = "bcrypt-hash-generate-with-python-or-h-tools"
 
 ### 工具运行时
 
-欧亿 Claude 模型未开放原生 tools 能力。需要稳定运行 Claude Code 的多轮工具链时，应配置原生 Anthropic 工具运行时；网关会将包含 `tools` 的 Anthropic Messages 请求转发到该运行时，普通无工具请求仍使用欧亿。
+欧亿 Claude 模型未开放稳定的原生 tools 能力。需要运行 Claude Code 多轮工具链时，可以配置工具编译运行时；网关仍会先让欧亿主模型产生意图，再由 broker / compiler 将意图合成为 Anthropic `tool_use` 或 OpenAI `tool_calls`。历史配置中的 `mode = "native"` 仅保留兼容读取，当前实际仍走 compiler 路径。
 
 ```toml
 [tool_runtime]
-mode = "native"
+mode = "compiler"
 provider = "anthropic"
 base_url = "https://api.anthropic.com"
 api_key_env = "ANTHROPIC_API_KEY"
