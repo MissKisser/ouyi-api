@@ -145,3 +145,106 @@ async fn serve_embedded_fallback(uri: axum::http::Uri) -> Response {
     }
     StatusCode::NOT_FOUND.into_response()
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    use axum::http::StatusCode;
+
+    use crate::admin::auth::AdminStore;
+    use crate::admin::stats::StatsCollector;
+    use crate::client::http::OuyiHttpClient;
+    use crate::config::{
+        AdminConfig, AppConfig, LimitsConfig, OuyiConfig, PlatformConfig, ServerConfig,
+        ToolCallConfig,
+    };
+    use crate::model::mapper::ModelMapper;
+    use crate::platform::{OuyiPlatform, PlatformStatus};
+
+    fn make_test_state() -> Arc<AppState> {
+        let http_client = reqwest::Client::builder()
+            .timeout(std::time::Duration::from_secs(5))
+            .build()
+            .unwrap();
+        let mapper = ModelMapper::new();
+        mapper.load_fallback();
+        let base_url = "http://127.0.0.1:1".to_string();
+        let platform = OuyiPlatform::Ouyi8;
+        let config = AppConfig {
+            server: ServerConfig {
+                host: "127.0.0.1".to_string(),
+                port: 0,
+            },
+            ouyi: OuyiConfig {
+                base_url: base_url.clone(),
+                jwt_token: "test-jwt".to_string(),
+                app_version: "3.0.3".to_string(),
+                model_refresh_interval_secs: 3600,
+            },
+            limits: LimitsConfig {
+                request_timeout_secs: 5,
+                no_data_timeout_secs: 5,
+                max_response_bytes: 1024 * 1024,
+                max_messages_bytes: 1024 * 1024,
+            },
+            admin: Some(AdminConfig {
+                jwt_secret: Some("test-secret".to_string()),
+                password_hash: None,
+            }),
+            tool_call: ToolCallConfig::default(),
+            tool_runtime: None,
+            openai_tool_runtime: None,
+            platform: Some(PlatformConfig {
+                default: platform,
+                prompt_on_start: false,
+            }),
+            ouyi_v7: None,
+        };
+
+        Arc::new(AppState {
+            config: tokio::sync::RwLock::new(config),
+            http_client: http_client.clone(),
+            ouyi_client: tokio::sync::RwLock::new(crate::client::OuyiClient::V8(
+                OuyiHttpClient::new(
+                    http_client,
+                    base_url.clone(),
+                    "test-jwt".to_string(),
+                    "3.0.3".to_string(),
+                ),
+            )),
+            active_sessions: dashmap::DashMap::new(),
+            tool_sessions: dashmap::DashMap::new(),
+            tool_ledger: crate::tool_runtime::ToolLedger::new(),
+            model_mapper: mapper,
+            admin_store: tokio::sync::RwLock::new(AdminStore::new(
+                "test-secret".to_string(),
+                String::new(),
+            )),
+            account_store: AccountStore::new(),
+            stats: StatsCollector::new(),
+            platform: tokio::sync::RwLock::new(platform),
+            platform_status: tokio::sync::RwLock::new(PlatformStatus::new(platform, base_url)),
+        })
+    }
+
+    #[tokio::test]
+    async fn protected_admin_api_requires_bearer_token() {
+        let state = make_test_state();
+        let app = admin_routes(state.clone()).with_state(state);
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+
+        let response = reqwest::get(format!("http://{}/admin/api/status", addr))
+            .await
+            .unwrap();
+        server.abort();
+
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+    }
+}
