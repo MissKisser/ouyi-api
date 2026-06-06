@@ -66,6 +66,15 @@ async fn responses_v8(
     let config = state.config.read().await.clone();
     let should_thinking = state.model_mapper.should_thinking(&chat_req.model);
 
+    if req.tools.as_ref().is_some_and(|tools| !tools.is_empty()) {
+        let err = AppError::BadRequest(
+            "Responses API 暂不支持工具调用，请使用 /v1/chat/completions 或 /anthropic/v1/messages"
+                .to_string(),
+        );
+        record_responses_error(&state, start_time, &model_full, &err, "ouyi8");
+        return Err(err);
+    }
+
     let ouyi_req = match convert_request(&chat_req, &model_full, should_thinking) {
         Ok(req) => req,
         Err(e) => {
@@ -939,6 +948,81 @@ mod tests {
     };
     use crate::model::mapper::ModelMapper;
 
+    fn make_test_state(config: AppConfig) -> Arc<AppState> {
+        let http_client = reqwest::Client::builder()
+            .timeout(std::time::Duration::from_secs(5))
+            .build()
+            .unwrap();
+        let mapper = ModelMapper::new();
+        mapper.load_fallback();
+        let platform = config
+            .platform
+            .as_ref()
+            .map(|p| p.default)
+            .unwrap_or(OuyiPlatform::Ouyi8);
+        let base_url = config.ouyi.base_url.clone();
+
+        Arc::new(AppState {
+            ouyi_client: tokio::sync::RwLock::new(crate::client::OuyiClient::V8(
+                OuyiHttpClient::new(
+                    http_client.clone(),
+                    config.ouyi.base_url.clone(),
+                    config.ouyi.jwt_token.clone(),
+                    config.ouyi.app_version.clone(),
+                ),
+            )),
+            config: tokio::sync::RwLock::new(config),
+            http_client,
+            active_sessions: dashmap::DashMap::new(),
+            tool_sessions: dashmap::DashMap::new(),
+            tool_ledger: crate::tool_runtime::ToolLedger::new(),
+            model_mapper: mapper,
+            admin_store: tokio::sync::RwLock::new(AdminStore::new(
+                "test-secret".to_string(),
+                String::new(),
+            )),
+            account_store: AccountStore::new(),
+            stats: StatsCollector::new(),
+            platform: tokio::sync::RwLock::new(platform),
+            platform_status: tokio::sync::RwLock::new(crate::platform::PlatformStatus::new(
+                platform, base_url,
+            )),
+        })
+    }
+
+    fn test_config(ouyi_base_url: String) -> AppConfig {
+        AppConfig {
+            server: ServerConfig {
+                host: "127.0.0.1".to_string(),
+                port: 0,
+            },
+            ouyi: OuyiConfig {
+                base_url: ouyi_base_url,
+                jwt_token: "test-jwt".to_string(),
+                app_version: "3.0.3".to_string(),
+                model_refresh_interval_secs: 3600,
+            },
+            limits: LimitsConfig {
+                request_timeout_secs: 5,
+                no_data_timeout_secs: 5,
+                max_response_bytes: 1024 * 1024,
+                max_messages_bytes: 1024 * 1024,
+            },
+            admin: Some(AdminConfig {
+                jwt_secret: Some("test-secret".to_string()),
+                password_hash: None,
+            }),
+            tool_call: ToolCallConfig::default(),
+            tool_runtime: None,
+            openai_tool_runtime: None,
+            platform: Some(PlatformConfig {
+                default: OuyiPlatform::Ouyi8,
+                prompt_on_start: false,
+            }),
+            ouyi_v7: None,
+        }
+    }
+
     fn make_v7_test_state(ouyi_base_url: String) -> Arc<AppState> {
         let http_client = reqwest::Client::builder()
             .timeout(std::time::Duration::from_secs(5))
@@ -1018,6 +1102,33 @@ mod tests {
     #[tokio::test]
     async fn test_ouyi7_responses_tools_rejection_records_error_and_clears_active_request() {
         let state = make_v7_test_state("http://127.0.0.1:1".to_string());
+        let req = ResponsesRequest {
+            model: "gpt-4o".to_string(),
+            input: json!("hello"),
+            instructions: None,
+            stream: false,
+            tools: Some(vec![json!({
+                "type": "function",
+                "name": "Bash",
+                "description": "Run shell command",
+                "parameters": {"type": "object"}
+            })]),
+            temperature: None,
+            max_output_tokens: None,
+        };
+
+        let err = responses(State(state.clone()), Json(req))
+            .await
+            .unwrap_err();
+
+        assert!(matches!(err, AppError::BadRequest(_)));
+        assert_eq!(state.stats.stats.active_requests.load(Ordering::Relaxed), 0);
+        assert_eq!(state.stats.stats.failed_requests.load(Ordering::Relaxed), 1);
+    }
+
+    #[tokio::test]
+    async fn test_ouyi8_responses_rejects_tools_until_response_tool_output_is_modeled() {
+        let state = make_test_state(test_config("http://127.0.0.1:1".to_string()));
         let req = ResponsesRequest {
             model: "gpt-4o".to_string(),
             input: json!("hello"),
