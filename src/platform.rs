@@ -102,6 +102,20 @@ pub fn select_platform_from_config(
     config: Option<&crate::config::PlatformConfig>,
     is_terminal: bool,
 ) -> Result<OuyiPlatform, String> {
+    let env_platform = std::env::var("OUYI_PLATFORM").ok();
+    select_platform_from_config_and_env(config, env_platform.as_deref(), is_terminal)
+}
+
+pub fn select_platform_from_config_and_env(
+    config: Option<&crate::config::PlatformConfig>,
+    env_platform: Option<&str>,
+    is_terminal: bool,
+) -> Result<OuyiPlatform, String> {
+    if let Some(value) = env_platform {
+        return OuyiPlatform::from_env_value(value)
+            .ok_or_else(|| format!("无效 Ouyi 平台环境变量 OUYI_PLATFORM: {}", value));
+    }
+
     let default = config
         .map(|config| config.default)
         .unwrap_or(OuyiPlatform::Ouyi8);
@@ -185,6 +199,25 @@ mod tests {
         let result = select_platform_from_config(Some(&config), false);
 
         assert_eq!(result.unwrap(), OuyiPlatform::Ouyi7);
+    }
+
+    #[test]
+    fn test_select_platform_env_overrides_config_default() {
+        let config = crate::config::PlatformConfig {
+            default: OuyiPlatform::Ouyi8,
+            prompt_on_start: false,
+        };
+
+        let result = select_platform_from_config_and_env(Some(&config), Some("ouyi7"), false);
+
+        assert_eq!(result.unwrap(), OuyiPlatform::Ouyi7);
+    }
+
+    #[test]
+    fn test_select_platform_env_rejects_invalid_value() {
+        let result = select_platform_from_config_and_env(None, Some("bad"), false);
+
+        assert!(result.is_err());
     }
 
     #[test]
