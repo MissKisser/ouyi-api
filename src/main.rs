@@ -630,4 +630,56 @@ simulated_stream_chunk_chars = 80
         assert_eq!(mapper.model_count(), 1);
         assert_eq!(mapper.to_ouyi("gpt-4o"), "gpt-4o");
     }
+
+    #[tokio::test]
+    #[ignore = "requires local config.toml credentials and external Ouyi network"]
+    async fn real_configured_ouyi_jwt_token_probe_without_printing_secret() {
+        let config = AppConfig::load().expect("config should load");
+        let selected_platform = select_platform_from_config(config.platform.as_ref(), false)
+            .expect("platform selection should not prompt in tests");
+        let http_client = reqwest::Client::builder()
+            .timeout(std::time::Duration::from_secs(15))
+            .build()
+            .expect("http client should build");
+
+        match selected_platform {
+            OuyiPlatform::Ouyi8 => {
+                assert!(
+                    !config.ouyi.jwt_token.trim().is_empty(),
+                    "configured Ouyi 8.0 JWT token is empty"
+                );
+                let client = OuyiHttpClient::new(
+                    http_client,
+                    config.ouyi.base_url,
+                    config.ouyi.jwt_token,
+                    config.ouyi.app_version,
+                );
+                let valid = client
+                    .verify_token()
+                    .await
+                    .expect("Ouyi 8.0 token probe request should complete");
+                assert!(valid, "configured Ouyi 8.0 JWT token was rejected");
+            }
+            OuyiPlatform::Ouyi7 => {
+                let v7_config = config
+                    .ouyi_v7
+                    .expect("configured platform is Ouyi 7.0 but [ouyi_v7] is missing");
+                assert!(
+                    !v7_config.jwt_token.trim().is_empty(),
+                    "configured Ouyi 7.0 JWT token is empty"
+                );
+                let client = Ouyi7HttpClient::new(
+                    http_client,
+                    v7_config.base_url,
+                    v7_config.chatapi_prefix,
+                    v7_config.jwt_token,
+                );
+                let valid = client
+                    .verify_token()
+                    .await
+                    .expect("Ouyi 7.0 token probe request should complete");
+                assert!(valid, "configured Ouyi 7.0 JWT token was rejected");
+            }
+        }
+    }
 }
