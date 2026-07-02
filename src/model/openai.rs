@@ -192,8 +192,14 @@ pub struct ResponseOutputItem {
     #[serde(rename = "type")]
     pub item_type: String,
     pub id: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub call_id: Option<String>,
     pub status: String,
     pub role: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub name: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub arguments: Option<String>,
     pub content: Vec<ResponseContentPart>,
 }
 
@@ -210,4 +216,55 @@ pub struct ResponseUsage {
     pub input_tokens: u64,
     pub output_tokens: u64,
     pub total_tokens: u64,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn response_output_item_function_call_serializes_with_call_id_and_arguments() {
+        let item = ResponseOutputItem {
+            item_type: "function_call".to_string(),
+            id: "fc_1".to_string(),
+            call_id: Some("call_abc".to_string()),
+            status: "completed".to_string(),
+            role: "assistant".to_string(),
+            name: Some("Bash".to_string()),
+            arguments: Some("{\"command\":\"ls\"}".to_string()),
+            content: Vec::new(),
+        };
+        let v = serde_json::to_value(&item).unwrap();
+        assert_eq!(v["type"], "function_call");
+        assert_eq!(v["call_id"], "call_abc");
+        assert_eq!(v["name"], "Bash");
+        assert_eq!(v["arguments"], "{\"command\":\"ls\"}");
+        // content should be skipped or empty array
+        assert!(v.get("content").is_none() || v["content"].is_array());
+    }
+
+    #[test]
+    fn response_output_item_message_omits_function_call_fields() {
+        let item = ResponseOutputItem {
+            item_type: "message".to_string(),
+            id: "msg_1".to_string(),
+            call_id: None,
+            status: "completed".to_string(),
+            role: "assistant".to_string(),
+            name: None,
+            arguments: None,
+            content: vec![ResponseContentPart {
+                content_type: "output_text".to_string(),
+                text: "hi".to_string(),
+                annotations: Vec::new(),
+            }],
+        };
+        let v = serde_json::to_value(&item).unwrap();
+        assert_eq!(v["type"], "message");
+        assert!(v.get("call_id").is_none());
+        assert!(v.get("name").is_none());
+        assert!(v.get("arguments").is_none());
+        assert_eq!(v["content"][0]["text"], "hi");
+    }
 }

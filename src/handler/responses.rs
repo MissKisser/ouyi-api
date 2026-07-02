@@ -898,8 +898,11 @@ fn build_responses_response(
     let output = ResponseOutputItem {
         item_type: "message".to_string(),
         id: msg_id,
+        call_id: None,
         status: "completed".to_string(),
         role: "assistant".to_string(),
+        name: None,
+        arguments: None,
         content: vec![ResponseContentPart {
             content_type: "output_text".to_string(),
             text,

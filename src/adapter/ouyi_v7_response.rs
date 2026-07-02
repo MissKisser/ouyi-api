@@ -279,8 +279,11 @@ pub fn build_responses_response_from_plain(
         output: vec![ResponseOutputItem {
             item_type: "message".to_string(),
             id: format!("msg_{}", now_unix_secs()),
+            call_id: None,
             status: "completed".to_string(),
             role: "assistant".to_string(),
+            name: None,
+            arguments: None,
             content: vec![ResponseContentPart {
                 content_type: "output_text".to_string(),
                 text: text.to_string(),
