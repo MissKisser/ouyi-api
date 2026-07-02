@@ -18,6 +18,29 @@ pub struct PipelineMeta {
     pub short_model: String,
 }
 
+impl PipelineMeta {
+    /// 从决策层 meta 构造 pipeline meta，注入调用方提供的 platform_key / short_model。
+    fn from_decision(
+        dmeta: &crate::tool_runtime::decision::ToolDecisionMeta,
+        platform_key: &str,
+        short_model: &str,
+    ) -> Self {
+        Self {
+            provider: dmeta.provider.clone(),
+            model: dmeta.model.clone(),
+            base_url: if dmeta.base_url.is_empty() {
+                None
+            } else {
+                Some(dmeta.base_url.clone())
+            },
+            prompt_tokens: dmeta.usage.prompt_tokens,
+            completion_tokens: dmeta.usage.completion_tokens,
+            platform_key: platform_key.to_string(),
+            short_model: short_model.to_string(),
+        }
+    }
+}
+
 #[derive(Debug, Clone)]
 pub enum PipelineOutput {
     ToolCalls {
@@ -41,6 +64,7 @@ pub async fn run_openai_tool_pipeline(
         ToolDecisionMode, ToolTextDecision, decide_openai_tools_from_text,
     };
 
+    let short_model = request.model.clone();
     let runtime_cfg = state.config.read().await.openai_tool_runtime.clone();
 
     // 阶段 A：决策
@@ -64,33 +88,17 @@ pub async fn run_openai_tool_pipeline(
                     prompt_tokens: 0,
                     completion_tokens: 0,
                     platform_key: platform_key.into(),
-                    short_model: request.model.clone(),
+                    short_model: short_model.clone(),
                 },
             };
         }
-    };
-
-    // 阶段 D：构造 meta 的小工具
-    let build_meta = |short_model: String,
-                      provider: String,
-                      model: String,
-                      base_url: String,
-                      pt: u64,
-                      ct: u64| PipelineMeta {
-        provider,
-        model,
-        base_url: if base_url.is_empty() { None } else { Some(base_url) },
-        prompt_tokens: pt,
-        completion_tokens: ct,
-        platform_key: platform_key.into(),
-        short_model,
     };
 
     match decision {
         ToolTextDecision::ToolCalls { calls, meta: dmeta } => {
             // 阶段 B：ledger 写入
             for call in &calls {
-                let call_key = format!("{}:{}", request.model, call.id);
+                let call_key = format!("{}:{}", short_model, call.id);
                 if let Err(e) = state
                     .tool_ledger
                     .record_tool_use(&call_key, &call.id, &call.name)
@@ -98,14 +106,7 @@ pub async fn run_openai_tool_pipeline(
                     tracing::warn!(error = %e, call_id = %call.id, "ledger.record_tool_use failed; degrading to FinalAnswer");
                     return PipelineOutput::FinalAnswer {
                         text: upstream_output,
-                        meta: build_meta(
-                            request.model.clone(),
-                            dmeta.provider,
-                            dmeta.model,
-                            dmeta.base_url,
-                            dmeta.usage.prompt_tokens,
-                            dmeta.usage.completion_tokens,
-                        ),
+                        meta: PipelineMeta::from_decision(&dmeta, platform_key, &short_model),
                     };
                 }
                 let broker_call = crate::tool_runtime::broker::BrokerToolCall {
@@ -150,14 +151,7 @@ pub async fn run_openai_tool_pipeline(
             }
             PipelineOutput::ToolCalls {
                 calls,
-                meta: build_meta(
-                    request.model.clone(),
-                    dmeta.provider,
-                    dmeta.model,
-                    dmeta.base_url,
-                    dmeta.usage.prompt_tokens,
-                    dmeta.usage.completion_tokens,
-                ),
+                meta: PipelineMeta::from_decision(&dmeta, platform_key, &short_model),
             }
         }
         ToolTextDecision::FinalAnswer { meta: dmeta } => {
@@ -165,19 +159,12 @@ pub async fn run_openai_tool_pipeline(
                 start_time.elapsed().as_millis() as u64,
                 dmeta.usage.prompt_tokens,
                 dmeta.usage.completion_tokens,
-                &request.model,
+                &short_model,
                 platform_key,
             );
             PipelineOutput::FinalAnswer {
                 text: upstream_output,
-                meta: build_meta(
-                    request.model.clone(),
-                    dmeta.provider,
-                    dmeta.model,
-                    dmeta.base_url,
-                    dmeta.usage.prompt_tokens,
-                    dmeta.usage.completion_tokens,
-                ),
+                meta: PipelineMeta::from_decision(&dmeta, platform_key, &short_model),
             }
         }
     }
