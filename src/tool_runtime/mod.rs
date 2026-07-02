@@ -14,6 +14,9 @@ pub mod payload;
 pub mod protocol;
 pub mod schema;
 
+#[cfg(test)]
+mod broker_probe;
+
 pub(crate) fn uuid_short() -> String {
     use std::time::{SystemTime, UNIX_EPOCH};
     let ts = SystemTime::now()
