@@ -1,6 +1,9 @@
 use crate::config::{ToolRuntimeConfig, ToolRuntimeProvider};
 use crate::error::AppError;
-use crate::model::anthropic::{AnthropicTool, MessagesRequest, ToolChoice};
+use crate::model::anthropic::{AnthropicTool, MessagesRequest};
+use crate::tool_runtime::protocol::{
+    ToolChoiceSpec, ToolEndpointKind, ToolRuntimeRequestContext, ToolSpec,
+};
 use serde::{Deserialize, Serialize};
 
 /// 编译后的工具调用结构
@@ -161,110 +164,6 @@ enum AnthropicCompilerContentBlock {
     Other,
 }
 
-/// 将 Anthropic tools schema 转换为 OpenAI-compatible function tools
-fn convert_anthropic_tools_to_openai(anthropic_tools: &[AnthropicTool]) -> Vec<OpenAiTool> {
-    anthropic_tools
-        .iter()
-        .map(|tool| OpenAiTool {
-            r#type: "function".to_string(),
-            function: OpenAiFunction {
-                name: tool.name.clone(),
-                description: tool.description.clone(),
-                parameters: tool.input_schema.clone(),
-            },
-        })
-        .collect()
-}
-
-/// 将 Anthropic tool_choice 转换为 OpenAI-compatible tool_choice
-fn convert_anthropic_tool_choice_to_openai(
-    tool_choice: &ToolChoice,
-    _tools: &[AnthropicTool],
-) -> OpenAiToolChoice {
-    match tool_choice {
-        ToolChoice::Auto => OpenAiToolChoice::String("auto".to_string()),
-        ToolChoice::Any => OpenAiToolChoice::String("required".to_string()),
-        ToolChoice::Tool { name } => OpenAiToolChoice::Object {
-            r#type: "function".to_string(),
-            function: OpenAiToolChoiceFunction { name: name.clone() },
-        },
-    }
-}
-
-fn convert_anthropic_tool_choice_to_anthropic(
-    tool_choice: Option<&ToolChoice>,
-) -> AnthropicCompilerToolChoice {
-    match tool_choice {
-        Some(ToolChoice::Any) => AnthropicCompilerToolChoice::Any,
-        Some(ToolChoice::Tool { name }) => AnthropicCompilerToolChoice::Tool { name: name.clone() },
-        Some(ToolChoice::Auto) | None => AnthropicCompilerToolChoice::Auto,
-    }
-}
-
-/// 构建编译器请求的用户消息内容
-pub(crate) fn build_compiler_user_message(req: &MessagesRequest, ouyi_output: &str) -> String {
-    let mut content = String::new();
-
-    content.push_str("以下是当前对话上下文：\n\n");
-
-    if let Some(latest_user_msg) = req.messages.iter().rev().find(|m| m.role == "user") {
-        content.push_str("用户最新消息：\n");
-        match &latest_user_msg.content {
-            crate::model::anthropic::AnthropicContent::Text(text) => {
-                content.push_str(text);
-                content.push('\n');
-            }
-            crate::model::anthropic::AnthropicContent::Blocks(blocks) => {
-                for block in blocks.iter().rev() {
-                    if let crate::model::anthropic::ContentBlock::Text { text } = block {
-                        content.push_str(text);
-                        content.push('\n');
-                        break;
-                    }
-                }
-            }
-        }
-    }
-
-    if let Some(latest_tool_result) = crate::tool_runtime::latest_tool_result_id(req) {
-        if let crate::model::anthropic::AnthropicContent::Blocks(blocks) = &req
-            .messages
-            .iter()
-            .rev()
-            .find(|m| m.role == "user")
-            .unwrap()
-            .content
-        {
-            for block in blocks.iter().rev() {
-                if let crate::model::anthropic::ContentBlock::ToolResult {
-                    tool_use_id,
-                    content: result_content,
-                } = block
-                {
-                    if tool_use_id == &latest_tool_result {
-                        content.push_str("\n最近的工具返回结果：\n");
-                        content.push_str(result_content);
-                        content.push('\n');
-                        break;
-                    }
-                }
-            }
-        }
-    }
-
-    content.push_str("\nOuyi 主脑输出：\n");
-    content.push_str(ouyi_output);
-    content.push('\n');
-
-    content.push_str(concat!(
-        "\n请只输出工具调用，不要输出最终回答。",
-        "如果上述内容表达了工具意图，请选择最匹配的可用工具并生成合法参数。",
-        "如果没有可执行工具意图，请不要调用任何工具。"
-    ));
-
-    content
-}
-
 /// 解析 OpenAI tool_calls 为 CompiledToolCall
 fn parse_openai_tool_calls(
     tool_calls: &[OpenAiToolCall],
@@ -338,35 +237,85 @@ fn parse_anthropic_tool_uses(
     Ok(compiled_calls)
 }
 
-/// 调用 OpenAI-compatible API 编译工具决策并返回用量
-pub async fn compile_tool_decision_with_usage(
+/// 带 payload 的工具决策编译（旧函数委托至此）
+pub async fn compile_tool_decision_with_usage_and_payloads(
     http_client: reqwest::Client,
     config: &ToolRuntimeConfig,
     req: &MessagesRequest,
     ouyi_output: &str,
+    payloads: Vec<crate::tool_runtime::payload::ToolPayload>,
 ) -> Result<CompilerResult, AppError> {
-    match config.provider {
-        ToolRuntimeProvider::OpenaiCompatible => {
-            compile_tool_decision_openai(http_client, config, req, ouyi_output).await
-        }
-        ToolRuntimeProvider::Anthropic => {
-            compile_tool_decision_anthropic(http_client, config, req, ouyi_output).await
-        }
-    }
-}
-
-async fn compile_tool_decision_openai(
-    http_client: reqwest::Client,
-    config: &ToolRuntimeConfig,
-    req: &MessagesRequest,
-    ouyi_output: &str,
-) -> Result<CompilerResult, AppError> {
-    let tools = req
+    let tool_specs: Vec<ToolSpec> = req
         .tools
         .as_ref()
-        .ok_or_else(|| AppError::BadRequest("compile_tool_decision 需要 tools 参数".to_string()))?;
+        .map(|tools| crate::tool_runtime::protocol::anthropic_tools_to_specs(tools.as_slice()))
+        .unwrap_or_default();
 
-    if tools.is_empty() {
+    let latest_user_text = req
+        .messages
+        .iter()
+        .rev()
+        .find(|m| m.role == "user")
+        .and_then(|m| match &m.content {
+            crate::model::anthropic::AnthropicContent::Text(t) => Some(t.clone()),
+            crate::model::anthropic::AnthropicContent::Blocks(blocks) => {
+                blocks.iter().rev().find_map(|b| {
+                    if let crate::model::anthropic::ContentBlock::Text { text } = b {
+                        Some(text.clone())
+                    } else {
+                        None
+                    }
+                })
+            }
+        });
+
+    let latest_tool_result = crate::tool_runtime::latest_tool_result_id(req).and_then(|id| {
+        req.messages.iter().rev().find_map(|m| {
+            if let crate::model::anthropic::AnthropicContent::Blocks(blocks) = &m.content {
+                blocks.iter().rev().find_map(|b| {
+                    if let crate::model::anthropic::ContentBlock::ToolResult {
+                        tool_use_id,
+                        content,
+                    } = b
+                    {
+                        if tool_use_id == &id {
+                            Some(content.clone())
+                        } else {
+                            None
+                        }
+                    } else {
+                        None
+                    }
+                })
+            } else {
+                None
+            }
+        })
+    });
+
+    let context = ToolRuntimeRequestContext {
+        endpoint: ToolEndpointKind::Anthropic,
+        model: req.model.clone(),
+        latest_user_text,
+        latest_tool_result,
+        tools: tool_specs,
+        tool_choice: None,
+        payloads,
+    };
+
+    compile_tool_decision_for_context(http_client, config, &context, ouyi_output).await
+}
+
+/// 基于协议无关上下文编译工具决策
+/// OpenAI 端点只使用 OpenAI-compatible 工具模型
+/// Anthropic 端点根据配置选择 provider
+pub async fn compile_tool_decision_for_context(
+    http_client: reqwest::Client,
+    config: &ToolRuntimeConfig,
+    context: &ToolRuntimeRequestContext,
+    ouyi_output: &str,
+) -> Result<CompilerResult, AppError> {
+    if context.tools.is_empty() {
         return Ok(CompilerResult {
             decision: CompilerDecision::FinalAnswer,
             usage: CompilerUsage {
@@ -376,28 +325,46 @@ async fn compile_tool_decision_openai(
         });
     }
 
-    let valid_tool_names: Vec<String> = tools.iter().map(|t| t.name.clone()).collect();
-    let openai_tools = convert_anthropic_tools_to_openai(tools);
+    match context.endpoint {
+        ToolEndpointKind::OpenAi => {
+            compile_for_openai_endpoint(http_client, config, context, ouyi_output).await
+        }
+        ToolEndpointKind::Anthropic => {
+            compile_for_anthropic_endpoint(http_client, config, context, ouyi_output).await
+        }
+    }
+}
 
-    let tool_choice = req
+/// 为 OpenAI 端点编译工具决策，只使用 OpenAI-compatible 工具模型
+async fn compile_for_openai_endpoint(
+    http_client: reqwest::Client,
+    config: &ToolRuntimeConfig,
+    context: &ToolRuntimeRequestContext,
+    ouyi_output: &str,
+) -> Result<CompilerResult, AppError> {
+    let valid_tool_names: Vec<String> = context.tools.iter().map(|t| t.name.clone()).collect();
+    let compiler_specs = crate::tool_runtime::schema::compiler_tool_specs(&context.tools);
+    let openai_tools = convert_tool_specs_to_openai(&compiler_specs);
+
+    let tool_choice = context
         .tool_choice
         .as_ref()
-        .map(|tc| convert_anthropic_tool_choice_to_openai(tc, tools))
+        .map(|tc| convert_tool_choice_spec_to_openai(tc))
         .unwrap_or_else(|| OpenAiToolChoice::String("auto".to_string()));
 
     let model = config
         .model
         .as_ref()
-        .ok_or_else(|| AppError::Config("tool_runtime.model 未配置".to_string()))?;
+        .ok_or_else(|| AppError::Config("openai_tool_runtime.model 未配置".to_string()))?;
 
     let base_url = config
         .base_url
         .as_ref()
-        .ok_or_else(|| AppError::Config("tool_runtime.base_url 未配置".to_string()))?;
+        .ok_or_else(|| AppError::Config("openai_tool_runtime.base_url 未配置".to_string()))?;
 
     let api_key = config.get_api_key()?;
 
-    let user_message = build_compiler_user_message(req, ouyi_output);
+    let user_message = build_compiler_user_message_from_context(context, ouyi_output);
 
     let openai_request = OpenAiChatRequest {
         model: model.clone(),
@@ -464,10 +431,13 @@ async fn compile_tool_decision_openai(
         }
 
         match parse_openai_tool_calls(tool_calls, &valid_tool_names) {
-            Ok(calls) if !calls.is_empty() => Ok(CompilerResult {
-                decision: CompilerDecision::ToolCalls(calls),
-                usage,
-            }),
+            Ok(calls) if !calls.is_empty() => {
+                let calls = materialize_compiled_calls(calls, &context.payloads)?;
+                Ok(CompilerResult {
+                    decision: CompilerDecision::ToolCalls(calls),
+                    usage,
+                })
+            }
             Ok(_) => Ok(CompilerResult {
                 decision: CompilerDecision::FinalAnswer,
                 usage,
@@ -479,6 +449,7 @@ async fn compile_tool_decision_openai(
                     config,
                     &openai_request,
                     &valid_tool_names,
+                    &context.payloads,
                 )
                 .await
             }
@@ -491,28 +462,31 @@ async fn compile_tool_decision_openai(
     }
 }
 
-async fn compile_tool_decision_anthropic(
+/// 为 Anthropic 端点编译工具决策，根据配置选择 provider
+async fn compile_for_anthropic_endpoint(
     http_client: reqwest::Client,
     config: &ToolRuntimeConfig,
-    req: &MessagesRequest,
+    context: &ToolRuntimeRequestContext,
     ouyi_output: &str,
 ) -> Result<CompilerResult, AppError> {
-    let tools = req
-        .tools
-        .as_ref()
-        .ok_or_else(|| AppError::BadRequest("compile_tool_decision 需要 tools 参数".to_string()))?;
-
-    if tools.is_empty() {
-        return Ok(CompilerResult {
-            decision: CompilerDecision::FinalAnswer,
-            usage: CompilerUsage {
-                prompt_tokens: 0,
-                completion_tokens: 0,
-            },
-        });
+    match config.provider {
+        ToolRuntimeProvider::OpenaiCompatible => {
+            compile_for_openai_endpoint(http_client, config, context, ouyi_output).await
+        }
+        ToolRuntimeProvider::Anthropic => {
+            compile_for_anthropic_provider(http_client, config, context, ouyi_output).await
+        }
     }
+}
 
-    let valid_tool_names: Vec<String> = tools.iter().map(|t| t.name.clone()).collect();
+/// 使用 Anthropic provider 编译工具决策
+async fn compile_for_anthropic_provider(
+    http_client: reqwest::Client,
+    config: &ToolRuntimeConfig,
+    context: &ToolRuntimeRequestContext,
+    ouyi_output: &str,
+) -> Result<CompilerResult, AppError> {
+    let valid_tool_names: Vec<String> = context.tools.iter().map(|t| t.name.clone()).collect();
     let model = config
         .model
         .as_ref()
@@ -525,16 +499,20 @@ async fn compile_tool_decision_anthropic(
     let base_url = base_url.strip_suffix("/v1").unwrap_or(base_url);
     let api_key = config.get_api_key()?;
 
+    let compiler_specs = crate::tool_runtime::schema::compiler_tool_specs(&context.tools);
+    let tools = convert_tool_specs_to_anthropic(&compiler_specs);
+    let tool_choice = convert_tool_choice_spec_to_anthropic(context.tool_choice.as_ref());
+
     let request = AnthropicCompilerRequest {
         model: model.clone(),
-        system: "你是工具调用编译器。你的唯一任务是将 Ouyi 主脑输出中的工具意图转换为结构化的 tool_use。如果 Ouyi 输出明确表示需要调用工具，你必须调用对应工具；如果 Ouyi 输出是最终回答或不需要工具，则不要调用工具。不要添加任何额外解释。".to_string(),
+        system: "你是 Claude Code 工具协议编译器。你的任务是把欧亿主脑已经表达出的工具意图转换为结构化 tool_use。报告正文、代码正文、文件正文必须来自欧亿 payload 引用；长文本字段使用 content_ref、old_string_ref、new_string_ref，不生成或改写正文。没有明确工具意图时不调用工具。不要添加解释。".to_string(),
         messages: vec![AnthropicCompilerMessage {
             role: "user".to_string(),
-            content: build_compiler_user_message(req, ouyi_output),
+            content: build_compiler_user_message_from_context(context, ouyi_output),
         }],
         max_tokens: 512,
-        tools: tools.clone(),
-        tool_choice: convert_anthropic_tool_choice_to_anthropic(req.tool_choice.as_ref()),
+        tools,
+        tool_choice,
     };
 
     let url = format!("{}/v1/messages", base_url);
@@ -579,11 +557,111 @@ async fn compile_tool_decision_anthropic(
             usage,
         })
     } else {
+        let calls = materialize_compiled_calls(calls, &context.payloads)?;
         Ok(CompilerResult {
             decision: CompilerDecision::ToolCalls(calls),
             usage,
         })
     }
+}
+
+/// 将 ToolSpec 转换为 OpenAI 工具格式
+fn convert_tool_specs_to_openai(specs: &[ToolSpec]) -> Vec<OpenAiTool> {
+    specs
+        .iter()
+        .map(|spec| OpenAiTool {
+            r#type: "function".to_string(),
+            function: OpenAiFunction {
+                name: spec.name.clone(),
+                description: spec.description.clone(),
+                parameters: spec.input_schema.clone(),
+            },
+        })
+        .collect()
+}
+
+/// 将 ToolSpec 转换为 Anthropic 工具格式
+fn convert_tool_specs_to_anthropic(specs: &[ToolSpec]) -> Vec<AnthropicTool> {
+    specs
+        .iter()
+        .map(|spec| AnthropicTool {
+            name: spec.name.clone(),
+            description: spec.description.clone(),
+            input_schema: spec.input_schema.clone(),
+        })
+        .collect()
+}
+
+/// 将 ToolChoiceSpec 转换为 OpenAI tool_choice
+fn convert_tool_choice_spec_to_openai(spec: &ToolChoiceSpec) -> OpenAiToolChoice {
+    match spec {
+        ToolChoiceSpec::Auto => OpenAiToolChoice::String("auto".to_string()),
+        ToolChoiceSpec::Required => OpenAiToolChoice::String("required".to_string()),
+        ToolChoiceSpec::Tool(name) => OpenAiToolChoice::Object {
+            r#type: "function".to_string(),
+            function: OpenAiToolChoiceFunction { name: name.clone() },
+        },
+    }
+}
+
+/// 将 ToolChoiceSpec 转换为 Anthropic tool_choice
+fn convert_tool_choice_spec_to_anthropic(
+    spec: Option<&ToolChoiceSpec>,
+) -> AnthropicCompilerToolChoice {
+    match spec {
+        Some(ToolChoiceSpec::Auto) | None => AnthropicCompilerToolChoice::Auto,
+        Some(ToolChoiceSpec::Required) => AnthropicCompilerToolChoice::Any,
+        Some(ToolChoiceSpec::Tool(name)) => {
+            AnthropicCompilerToolChoice::Tool { name: name.clone() }
+        }
+    }
+}
+
+/// 基于上下文构建编译器用户消息
+fn build_compiler_user_message_from_context(
+    context: &ToolRuntimeRequestContext,
+    ouyi_output: &str,
+) -> String {
+    let mut content = String::new();
+
+    content.push_str("以下是当前对话上下文：\n\n");
+
+    if let Some(user_text) = &context.latest_user_text {
+        content.push_str("用户最新消息：\n");
+        content.push_str(user_text);
+        content.push('\n');
+    }
+
+    if let Some(tool_result) = &context.latest_tool_result {
+        content.push_str("\n最近的工具返回结果：\n");
+        content.push_str(tool_result);
+        content.push('\n');
+    }
+
+    content.push_str("\nOuyi 主脑输出：\n");
+    content.push_str(ouyi_output);
+    content.push('\n');
+
+    content.push_str(concat!(
+        "\n请只输出工具调用，不要输出最终回答。",
+        "如果上述内容表达了工具意图，请选择最匹配的可用工具并生成合法参数。",
+        "如果没有可执行工具意图，请不要调用任何工具。"
+    ));
+
+    if !context.payloads.is_empty() {
+        content.push_str("\npayload 可用列表：\n");
+        for payload in &context.payloads {
+            content.push_str(&format!(
+                "- id: {}, bytes: {}\n",
+                payload.id, payload.byte_len
+            ));
+        }
+        content.push_str(
+            "长文本字段必须引用 payload id，例如 content_ref、old_string_ref、new_string_ref。\n",
+        );
+    }
+
+    content
 }
 
 /// 结构化重试：使用更明确的提示重新请求编译器
@@ -592,25 +670,9 @@ async fn retry_with_structured_prompt(
     config: &ToolRuntimeConfig,
     original_request: &OpenAiChatRequest,
     valid_tool_names: &[String],
+    payloads: &[crate::tool_runtime::payload::ToolPayload],
 ) -> Result<CompilerResult, AppError> {
-    let retry_request = OpenAiChatRequest {
-        model: original_request.model.clone(),
-        messages: vec![
-            OpenAiMessage {
-                role: "system".to_string(),
-                content: "你是工具调用编译器。你必须严格按照以下格式返回 tool_calls。每个 tool_calls 的 arguments 必须是有效的 JSON object。不要返回任何文本内容。".to_string(),
-            },
-            OpenAiMessage {
-                role: "user".to_string(),
-                content: format!(
-                    "请重新解析并返回 tool_calls。可用工具：{}。必须确保 arguments 是合法 JSON object。",
-                    valid_tool_names.join(", ")
-                ),
-            },
-        ],
-        tools: original_request.tools.clone(),
-        tool_choice: OpenAiToolChoice::String("auto".to_string()),
-    };
+    let retry_request = build_retry_request(original_request, valid_tool_names);
 
     let base_url = config
         .base_url
@@ -674,6 +736,7 @@ async fn retry_with_structured_prompt(
                 usage,
             })
         } else {
+            let compiled_calls = materialize_compiled_calls(compiled_calls, payloads)?;
             Ok(CompilerResult {
                 decision: CompilerDecision::ToolCalls(compiled_calls),
                 usage,
@@ -685,6 +748,38 @@ async fn retry_with_structured_prompt(
             usage,
         })
     }
+}
+
+fn build_retry_request(
+    original_request: &OpenAiChatRequest,
+    valid_tool_names: &[String],
+) -> OpenAiChatRequest {
+    let mut messages = original_request.messages.clone();
+    messages.push(OpenAiMessage {
+        role: "user".to_string(),
+        content: format!(
+            "上一次 tool_calls 参数无法解析。请基于前面的 Ouyi 主脑输出重新返回 tool_calls。可用工具：{}。arguments 必须是合法 JSON object；长文本字段继续使用已有 payload 引用。",
+            valid_tool_names.join(", ")
+        ),
+    });
+
+    OpenAiChatRequest {
+        model: original_request.model.clone(),
+        messages,
+        tools: original_request.tools.clone(),
+        tool_choice: original_request.tool_choice.clone(),
+    }
+}
+
+fn materialize_compiled_calls(
+    mut calls: Vec<CompiledToolCall>,
+    payloads: &[crate::tool_runtime::payload::ToolPayload],
+) -> Result<Vec<CompiledToolCall>, AppError> {
+    for call in &mut calls {
+        crate::tool_runtime::materialize::materialize_payload_refs(&mut call.input, payloads)
+            .map_err(|e| AppError::Upstream(format!("工具参数 payload 物化失败: {e}")))?;
+    }
+    Ok(calls)
 }
 
 #[cfg(test)]
@@ -702,60 +797,6 @@ mod tests {
                 },
                 "required": ["query"]
             }),
-        }
-    }
-
-    #[test]
-    fn test_convert_anthropic_tools_to_openai() {
-        let tools = vec![make_test_tool("Read"), make_test_tool("Write")];
-        let openai_tools = convert_anthropic_tools_to_openai(&tools);
-
-        assert_eq!(openai_tools.len(), 2);
-        assert_eq!(openai_tools[0].r#type, "function");
-        assert_eq!(openai_tools[0].function.name, "Read");
-        assert_eq!(openai_tools[1].function.name, "Write");
-    }
-
-    #[test]
-    fn test_convert_tool_choice_auto() {
-        let choice = ToolChoice::Auto;
-        let tools = vec![make_test_tool("Read")];
-        let openai_choice = convert_anthropic_tool_choice_to_openai(&choice, &tools);
-        assert_eq!(serde_json::to_string(&openai_choice).unwrap(), "\"auto\"");
-    }
-
-    #[test]
-    fn test_convert_tool_choice_any() {
-        let choice = ToolChoice::Any;
-        let tools = vec![make_test_tool("Read")];
-        let openai_choice = convert_anthropic_tool_choice_to_openai(&choice, &tools);
-        assert_eq!(
-            serde_json::to_string(&openai_choice).unwrap(),
-            "\"required\""
-        );
-    }
-
-    #[test]
-    fn test_convert_tool_choice_specific() {
-        let choice = ToolChoice::Tool {
-            name: "Read".to_string(),
-        };
-        let tools = vec![make_test_tool("Read")];
-        let openai_choice = convert_anthropic_tool_choice_to_openai(&choice, &tools);
-        let json = serde_json::to_string(&openai_choice).unwrap();
-        assert!(json.contains("function"));
-        assert!(json.contains("Read"));
-    }
-
-    #[test]
-    fn test_convert_anthropic_compiler_tool_choice_specific() {
-        let choice = ToolChoice::Tool {
-            name: "Read".to_string(),
-        };
-
-        match convert_anthropic_tool_choice_to_anthropic(Some(&choice)) {
-            AnthropicCompilerToolChoice::Tool { name } => assert_eq!(name, "Read"),
-            _ => panic!("expected specific Anthropic tool choice"),
         }
     }
 
@@ -852,32 +893,170 @@ mod tests {
         assert!(parse_anthropic_tool_uses(&content, &valid_names).is_err());
     }
 
-    fn make_request_with_tools() -> MessagesRequest {
-        MessagesRequest {
-            model: "claude-sonnet-4-5".to_string(),
-            messages: vec![crate::model::anthropic::AnthropicMessage {
-                role: "user".to_string(),
-                content: crate::model::anthropic::AnthropicContent::Text("test".to_string()),
-            }],
-            system: None,
-            max_tokens: 1024,
-            stream: Some(true),
-            tools: Some(vec![make_test_tool("Bash")]),
-            temperature: None,
-            top_p: None,
-            top_k: None,
-            stop_sequences: None,
-            thinking: None,
+    #[test]
+    fn test_compiler_user_message_lists_payload_refs_without_body() {
+        let context = crate::tool_runtime::protocol::ToolRuntimeRequestContext {
+            endpoint: crate::tool_runtime::protocol::ToolEndpointKind::Anthropic,
+            model: "claude-test".to_string(),
+            latest_user_text: Some("写报告".to_string()),
+            latest_tool_result: None,
             tool_choice: None,
-        }
+            tools: vec![],
+            payloads: vec![crate::tool_runtime::payload::ToolPayload {
+                id: "p1".to_string(),
+                body: "# 私有报告正文".to_string(),
+                byte_len: "# 私有报告正文".len(),
+            }],
+        };
+
+        let message = build_compiler_user_message_from_context(
+            &context,
+            "Ouyi 输出：<ouyi_payload_ref id=\"p1\" bytes=\"20\" />",
+        );
+
+        assert!(message.contains("payload 可用列表"));
+        assert!(message.contains("p1"));
+        assert!(message.contains("bytes"));
+        assert!(!message.contains("# 私有报告正文"));
     }
 
     #[test]
-    fn test_compiler_user_message_requires_tool_json_only() {
-        let req = make_request_with_tools();
-        let message = build_compiler_user_message(&req, "需要执行 pwd 查看当前目录。");
-        assert!(message.contains("只输出工具调用"));
-        assert!(message.contains("不要输出最终回答"));
-        assert!(!message.contains("工具详细信息列表"));
+    fn test_retry_request_preserves_original_compiler_context() {
+        let original = OpenAiChatRequest {
+            model: "tool-model".to_string(),
+            messages: vec![
+                OpenAiMessage {
+                    role: "system".to_string(),
+                    content: "协议编译器".to_string(),
+                },
+                OpenAiMessage {
+                    role: "user".to_string(),
+                    content: concat!(
+                        "Ouyi 主脑输出：<ouyi_payload_ref id=\"p1\" bytes=\"20\" />\n",
+                        "payload 可用列表：\n",
+                        "- id: p1, bytes: 20\n"
+                    )
+                    .to_string(),
+                },
+            ],
+            tools: vec![
+                convert_tool_specs_to_openai(&[ToolSpec {
+                    name: "Write".to_string(),
+                    description: "Write file".to_string(),
+                    input_schema: serde_json::json!({
+                        "type": "object",
+                        "properties": {
+                            "file_path": {"type": "string"},
+                            "content_ref": {"type": "string"}
+                        },
+                        "required": ["file_path", "content_ref"]
+                    }),
+                }])
+                .remove(0),
+            ],
+            tool_choice: OpenAiToolChoice::String("auto".to_string()),
+        };
+
+        let retry = build_retry_request(&original, &["Write".to_string()]);
+        let joined_messages = retry
+            .messages
+            .iter()
+            .map(|message| message.content.as_str())
+            .collect::<Vec<_>>()
+            .join("\n");
+
+        assert!(joined_messages.contains("Ouyi 主脑输出"));
+        assert!(joined_messages.contains("payload 可用列表"));
+        assert!(joined_messages.contains("p1"));
+        assert!(joined_messages.contains("Write"));
+    }
+
+    #[tokio::test]
+    async fn test_retry_materializes_payload_refs() {
+        use axum::{Json, Router, routing::post};
+        use tokio::net::TcpListener;
+
+        async fn handler() -> Json<serde_json::Value> {
+            Json(serde_json::json!({
+                "choices": [{
+                    "message": {
+                        "tool_calls": [{
+                            "id": "call_retry",
+                            "function": {
+                                "name": "Write",
+                                "arguments": "{\"file_path\":\"docs/report.md\",\"content_ref\":\"p1\"}"
+                            }
+                        }]
+                    }
+                }],
+                "usage": {"prompt_tokens": 1, "completion_tokens": 1}
+            }))
+        }
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            axum::serve(
+                listener,
+                Router::new().route("/chat/completions", post(handler)),
+            )
+            .await
+            .unwrap();
+        });
+
+        let original = OpenAiChatRequest {
+            model: "tool-model".to_string(),
+            messages: vec![OpenAiMessage {
+                role: "user".to_string(),
+                content: "Ouyi 主脑输出：<ouyi_payload_ref id=\"p1\" bytes=\"1500\" />".to_string(),
+            }],
+            tools: convert_tool_specs_to_openai(&[ToolSpec {
+                name: "Write".to_string(),
+                description: "Write file".to_string(),
+                input_schema: serde_json::json!({
+                    "type": "object",
+                    "properties": {
+                        "file_path": {"type": "string"},
+                        "content_ref": {"type": "string"}
+                    },
+                    "required": ["file_path", "content_ref"]
+                }),
+            }]),
+            tool_choice: OpenAiToolChoice::String("auto".to_string()),
+        };
+        let body = "x".repeat(1500);
+        let payloads = vec![crate::tool_runtime::payload::ToolPayload {
+            id: "p1".to_string(),
+            body: body.clone(),
+            byte_len: body.len(),
+        }];
+        let config = ToolRuntimeConfig {
+            enabled: true,
+            mode: crate::config::ToolRuntimeMode::Compiler,
+            provider: ToolRuntimeProvider::OpenaiCompatible,
+            base_url: Some(format!("http://{}", addr)),
+            api_key: Some("test-key".to_string()),
+            api_key_env: None,
+            model: Some("tool-model".to_string()),
+            timeout_secs: 5,
+        };
+
+        let result = retry_with_structured_prompt(
+            reqwest::Client::new(),
+            &config,
+            &original,
+            &["Write".to_string()],
+            &payloads,
+        )
+        .await
+        .unwrap();
+
+        match result.decision {
+            CompilerDecision::ToolCalls(calls) => {
+                assert_eq!(calls[0].input["content"], body);
+                assert!(calls[0].input.get("content_ref").is_none());
+            }
+            CompilerDecision::FinalAnswer => panic!("expected retry tool call"),
+        }
     }
 }

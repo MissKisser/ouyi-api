@@ -1,6 +1,6 @@
 {
   "version": "1.0.0",
-  "lastScanned": 1778298109215,
+  "lastScanned": 1778603349120,
   "projectRoot": "D:\\document\\Projects\\ouyi-api\\web",
   "techStack": {
     "languages": [
@@ -42,8 +42,8 @@
     "runtime": "Node.js 22"
   },
   "build": {
-    "buildCommand": "cd D:/document/Projects/ouyi-api/web && npm run build 2>&1",
-    "testCommand": null,
+    "buildCommand": "cd D:/document/Projects/ouyi-api/web && npx tsc --noEmit 2>&1 | head -30",
+    "testCommand": "cd /d/document/Projects/ouyi-api && cargo test handler::chat::tests:: 2>&1 | tail -40",
     "lintCommand": "npm run lint",
     "devCommand": "npm run dev",
     "scripts": {
@@ -73,9 +73,10 @@
     "dist": {
       "path": "dist",
       "purpose": "Distribution/build output",
-      "fileCount": 1,
-      "lastAccessed": 1778298109152,
+      "fileCount": 2,
+      "lastAccessed": 1778603349072,
       "keyFiles": [
+        "favicon.svg",
         "index.html"
       ]
     },
@@ -83,7 +84,7 @@
       "path": "public",
       "purpose": "Public files",
       "fileCount": 1,
-      "lastAccessed": 1778298109163,
+      "lastAccessed": 1778603349073,
       "keyFiles": [
         "favicon.svg"
       ]
@@ -92,19 +93,31 @@
       "path": "src",
       "purpose": "Source code",
       "fileCount": 3,
-      "lastAccessed": 1778298109164,
+      "lastAccessed": 1778603349089,
       "keyFiles": [
         "App.tsx",
         "index.css",
         "main.tsx"
       ]
     },
+    "dist\\assets": {
+      "path": "dist\\assets",
+      "purpose": "Static assets",
+      "fileCount": 5,
+      "lastAccessed": 1778603349090,
+      "keyFiles": [
+        "geist-cyrillic-wght-normal-CHSlOQsW.woff2",
+        "geist-latin-ext-wght-normal-DMtmJ5ZE.woff2",
+        "geist-latin-wght-normal-Dm3htQBi.woff2"
+      ]
+    },
     "src\\components": {
       "path": "src\\components",
       "purpose": "UI components",
-      "fileCount": 1,
-      "lastAccessed": 1778298109166,
+      "fileCount": 2,
+      "lastAccessed": 1778603349091,
       "keyFiles": [
+        "ErrorBoundary.tsx",
         "LanguageSwitcher.tsx"
       ]
     },
@@ -112,7 +125,7 @@
       "path": "src\\lib",
       "purpose": "Library code",
       "fileCount": 5,
-      "lastAccessed": 1778298109166,
+      "lastAccessed": 1778603349091,
       "keyFiles": [
         "api.ts",
         "auth-context.ts",
@@ -122,100 +135,15 @@
     "src\\pages": {
       "path": "src\\pages",
       "purpose": "Page components",
-      "fileCount": 6,
-      "lastAccessed": 1778298109167,
+      "fileCount": 7,
+      "lastAccessed": 1778603349092,
       "keyFiles": [
+        "ChatTestPage.tsx",
         "ConfigPage.tsx",
-        "DashboardPage.tsx",
-        "Layout.tsx"
+        "DashboardPage.tsx"
       ]
     }
   },
-  "hotPaths": [
-    {
-      "path": "src\\pages\\ChatTestPage.tsx",
-      "accessCount": 14,
-      "lastAccessed": 1778309506667,
-      "type": "file"
-    },
-    {
-      "path": "src\\components\\ui\\slider.tsx",
-      "accessCount": 4,
-      "lastAccessed": 1778304783120,
-      "type": "file"
-    },
-    {
-      "path": "src\\pages\\ModelsPage.tsx",
-      "accessCount": 4,
-      "lastAccessed": 1778309518401,
-      "type": "file"
-    },
-    {
-      "path": "vite.config.ts",
-      "accessCount": 3,
-      "lastAccessed": 1778309386429,
-      "type": "file"
-    },
-    {
-      "path": "src",
-      "accessCount": 2,
-      "lastAccessed": 1778307638236,
-      "type": "directory"
-    },
-    {
-      "path": "src\\locales\\zh\\common.json",
-      "accessCount": 2,
-      "lastAccessed": 1778307696976,
-      "type": "file"
-    },
-    {
-      "path": "src\\locales\\en\\common.json",
-      "accessCount": 2,
-      "lastAccessed": 1778307700053,
-      "type": "file"
-    },
-    {
-      "path": "src\\components\\ui\\select.tsx",
-      "accessCount": 2,
-      "lastAccessed": 1778309493896,
-      "type": "file"
-    },
-    {
-      "path": "src\\components\\ui\\textarea.tsx",
-      "accessCount": 1,
-      "lastAccessed": 1778304370392,
-      "type": "file"
-    },
-    {
-      "path": "src\\components\\ui\\switch.tsx",
-      "accessCount": 1,
-      "lastAccessed": 1778304443966,
-      "type": "file"
-    },
-    {
-      "path": "src\\components\\ui\\collapsible.tsx",
-      "accessCount": 1,
-      "lastAccessed": 1778304552731,
-      "type": "file"
-    },
-    {
-      "path": "C:\\Users\\missk\\AppData\\Local\\Temp\\claude\\D--document-Projects-ouyi-api\\1034d2c1-0870-4580-b50a-95d2052db79f\\tasks\\bsyp76c1v.output",
-      "accessCount": 1,
-      "lastAccessed": 1778308800962,
-      "type": "file"
-    },
-    {
-      "path": "C:\\Users\\missk\\AppData\\Local\\Temp\\claude\\D--document-Projects-ouyi-api\\1034d2c1-0870-4580-b50a-95d2052db79f\\tasks\\bz7i34ppv.output",
-      "accessCount": 1,
-      "lastAccessed": 1778308871333,
-      "type": "file"
-    },
-    {
-      "path": "C:\\Users\\missk\\.claude\\projects\\D--document-Projects-ouyi-api\\0e6c9524-d0ce-444a-afe4-8b8a8778c2cf\\tool-results\\hook-8fb2c44a-b916-49d0-8d40-3b5b44944af8-6-additionalContext.txt",
-      "accessCount": 1,
-      "lastAccessed": 1778309000556,
-      "type": "file"
-    }
-  ],
+  "hotPaths": [],
   "userDirectives": []
 }

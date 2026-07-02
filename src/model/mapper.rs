@@ -1,7 +1,9 @@
 use dashmap::DashMap;
 use serde::Serialize;
 
+use super::catalog::ModelCatalog;
 use super::ouyi::{TmplCapabilities, TmplModel, TmplResponse};
+use super::ouyi::{TmplData, TmplModelAttr, TmplProvider};
 
 /// 官网模型分类项（按 providerName 分组）
 #[derive(Debug, Clone, Serialize)]
@@ -145,27 +147,89 @@ impl ModelMapper {
         );
     }
 
+    pub fn load_from_catalog(&self, catalog: &ModelCatalog) {
+        if catalog.models.is_empty() {
+            tracing::warn!("模型目录为空，使用静态fallback");
+            self.load_fallback();
+            return;
+        }
+
+        let models = catalog
+            .models
+            .iter()
+            .map(|item| TmplModel {
+                label: item.label.clone(),
+                value: item.id.clone(),
+                attr: TmplModelAttr {
+                    capabilities: item.capabilities.clone(),
+                    provider_key: item.provider_key.clone(),
+                    provider_name: item.provider_name.clone(),
+                    integral: String::new(),
+                    model_type: String::new(),
+                },
+            })
+            .collect();
+
+        let resp = TmplResponse {
+            code: 0,
+            msg: String::new(),
+            data: Some(TmplData {
+                models,
+                providers: Vec::<TmplProvider>::new(),
+                def_model: String::new(),
+                default_chat: String::new(),
+                cm: false,
+                gen_line: 0,
+                gen_title: false,
+                m_file_count: 0,
+                m_file_size: 0,
+                mcp: Vec::new(),
+            }),
+        };
+
+        self.load_from_tmpl(&resp);
+    }
+
     pub fn load_fallback(&self) {
         tracing::warn!("使用静态fallback模型列表");
 
+        self.short_to_full.clear();
+        self.full_to_short.clear();
+        self.all_models.clear();
+
         for &(full, short, provider) in FALLBACK_MODELS {
+            let capabilities = TmplCapabilities {
+                image_input: false,
+                any_file: false,
+                tools: false,
+                stream: true,
+                system_role: true,
+                thinking: false,
+                auto_detect_thinking: false,
+            };
             let entry = ModelEntry {
                 full_value: full.to_string(),
                 short_name: short.to_string(),
                 provider_key: provider.to_string(),
-                capabilities: TmplCapabilities {
-                    image_input: false,
-                    any_file: false,
-                    tools: false,
-                    stream: true,
-                    system_role: true,
-                    thinking: false,
-                    auto_detect_thinking: false,
-                },
+                capabilities: capabilities.clone(),
             };
             self.short_to_full.insert(short.to_string(), entry);
             self.full_to_short
                 .insert(full.to_string(), short.to_string());
+            self.all_models.insert(
+                full.to_string(),
+                TmplModel {
+                    label: short.to_string(),
+                    value: full.to_string(),
+                    attr: TmplModelAttr {
+                        capabilities,
+                        provider_key: provider.to_string(),
+                        provider_name: provider_key_to_name(provider),
+                        integral: String::new(),
+                        model_type: String::new(),
+                    },
+                },
+            );
         }
     }
 
@@ -411,5 +475,34 @@ mod tests {
         mapper.load_fallback();
 
         assert_eq!(mapper.to_ouyi("nonexistent-model"), "nonexistent-model");
+    }
+
+    #[test]
+    fn test_load_from_catalog_maps_models() {
+        let mapper = ModelMapper::new();
+        let catalog = ModelCatalog {
+            platform: crate::platform::OuyiPlatform::Ouyi7,
+            models: vec![super::super::catalog::ModelCatalogItem {
+                id: "claude-sonnet-4-6".to_string(),
+                label: "Claude Sonnet 4.6".to_string(),
+                provider_key: "claude".to_string(),
+                provider_name: "Claude".to_string(),
+                capabilities: TmplCapabilities {
+                    stream: true,
+                    system_role: true,
+                    ..TmplCapabilities::default()
+                },
+                metadata: None,
+            }],
+        };
+
+        mapper.load_from_catalog(&catalog);
+
+        assert_eq!(mapper.to_ouyi("claude-sonnet-4-6"), "claude-sonnet-4-6");
+        assert_eq!(mapper.model_count(), 1);
+        assert_eq!(
+            mapper.get_provider_name("claude-sonnet-4-6").as_deref(),
+            Some("Claude")
+        );
     }
 }

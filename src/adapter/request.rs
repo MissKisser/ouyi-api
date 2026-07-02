@@ -217,6 +217,8 @@ mod tests {
             temperature: None,
             max_tokens: None,
             tools: None,
+            tool_choice: None,
+            parallel_tool_calls: None,
         }
     }
 
@@ -253,6 +255,8 @@ mod tests {
             temperature: None,
             max_tokens: None,
             tools: None,
+            tool_choice: None,
+            parallel_tool_calls: None,
         };
         let result = convert_request(&req, "test", false).unwrap();
         assert_eq!(result.system_prompt.as_deref(), Some("You are helpful"));
@@ -291,6 +295,8 @@ mod tests {
             temperature: None,
             max_tokens: None,
             tools: None,
+            tool_choice: None,
+            parallel_tool_calls: None,
         };
         let result = convert_request(&req, "test", false).unwrap();
         assert!(
@@ -325,6 +331,8 @@ mod tests {
                     })),
                 },
             }]),
+            tool_choice: None,
+            parallel_tool_calls: None,
         };
         let result = convert_request(&req, "test", false).unwrap();
         let sys = result.system_prompt.unwrap();
@@ -341,6 +349,8 @@ mod tests {
             temperature: None,
             max_tokens: None,
             tools: None,
+            tool_choice: None,
+            parallel_tool_calls: None,
         };
         assert!(convert_request(&req, "test", false).is_err());
     }

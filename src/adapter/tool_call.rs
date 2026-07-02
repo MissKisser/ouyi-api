@@ -151,7 +151,7 @@ fn repair_unquoted_keys(s: &str) -> String {
     out
 }
 
-fn repair_json(s: &str) -> Option<String> {
+pub fn repair_json(s: &str) -> Option<String> {
     let step0: String = s.chars().map(|c| if c == '\'' { '"' } else { c }).collect();
     if step0 != s && serde_json::from_str::<serde_json::Value>(&step0).is_ok() {
         return Some(step0);

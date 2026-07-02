@@ -1,6 +1,8 @@
 use serde::Deserialize;
 use std::path::Path;
 
+use crate::platform::OuyiPlatform;
+
 #[derive(Debug, Clone, Deserialize)]
 pub struct AppConfig {
     pub server: ServerConfig,
@@ -11,6 +13,11 @@ pub struct AppConfig {
     pub tool_call: ToolCallConfig,
     #[serde(default)]
     pub tool_runtime: Option<ToolRuntimeConfig>,
+    #[serde(default)]
+    pub openai_tool_runtime: Option<ToolRuntimeConfig>,
+    #[serde(default)]
+    pub platform: Option<PlatformConfig>,
+    pub ouyi_v7: Option<Ouyi7Config>,
 }
 
 #[derive(Debug, Clone, Deserialize, Default)]
@@ -23,6 +30,8 @@ pub struct ToolCallConfig {
 
 #[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
 pub struct ToolRuntimeConfig {
+    #[serde(default = "default_tool_runtime_enabled")]
+    pub enabled: bool,
     #[serde(default = "default_tool_runtime_mode")]
     pub mode: ToolRuntimeMode,
     pub provider: ToolRuntimeProvider,
@@ -36,6 +45,10 @@ pub struct ToolRuntimeConfig {
     pub model: Option<String>,
     #[serde(default = "default_tool_runtime_timeout_secs")]
     pub timeout_secs: u64,
+}
+
+fn default_tool_runtime_enabled() -> bool {
+    true
 }
 
 #[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
@@ -101,6 +114,59 @@ pub struct OuyiConfig {
 }
 
 #[derive(Debug, Clone, Deserialize)]
+pub struct PlatformConfig {
+    #[serde(default = "default_platform")]
+    pub default: OuyiPlatform,
+    #[serde(default = "default_prompt_on_start")]
+    pub prompt_on_start: bool,
+}
+
+fn default_platform() -> OuyiPlatform {
+    OuyiPlatform::Ouyi8
+}
+
+fn default_prompt_on_start() -> bool {
+    true
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct Ouyi7Config {
+    pub base_url: String,
+    #[serde(default = "default_ouyi_v7_chatapi_prefix")]
+    pub chatapi_prefix: String,
+    #[serde(default)]
+    pub jwt_token: String,
+    #[serde(default = "default_ouyi_v7_model")]
+    pub default_model: String,
+    #[serde(default = "default_model_refresh_interval_secs")]
+    pub model_refresh_interval_secs: u64,
+    #[serde(default = "default_ouyi_v7_max_history_messages")]
+    pub max_history_messages: usize,
+    #[serde(default = "default_ouyi_v7_stream_chunk_chars")]
+    pub simulated_stream_chunk_chars: usize,
+}
+
+fn default_ouyi_v7_chatapi_prefix() -> String {
+    "/chatapi".to_string()
+}
+
+fn default_ouyi_v7_model() -> String {
+    "ouyi-chat".to_string()
+}
+
+fn default_model_refresh_interval_secs() -> u64 {
+    3600
+}
+
+fn default_ouyi_v7_max_history_messages() -> usize {
+    20
+}
+
+fn default_ouyi_v7_stream_chunk_chars() -> usize {
+    80
+}
+
+#[derive(Debug, Clone, Deserialize)]
 pub struct LimitsConfig {
     pub request_timeout_secs: u64,
     pub no_data_timeout_secs: u64,
@@ -141,6 +207,170 @@ pub fn update_ouyi_jwt_token(path: &Path, jwt_token: &str) -> Result<(), crate::
         .map_err(|e| crate::error::AppError::Config(format!("写入配置失败: {}", e)))?;
 
     tracing::info!("Ouyi JWT Token 已更新");
+    Ok(())
+}
+
+pub fn update_ouyi_v7_jwt_token(
+    path: &Path,
+    jwt_token: &str,
+) -> Result<(), crate::error::AppError> {
+    let content = std::fs::read_to_string(path)
+        .map_err(|e| crate::error::AppError::Config(format!("读取配置失败: {}", e)))?;
+
+    let mut doc = content
+        .parse::<toml_edit::DocumentMut>()
+        .map_err(|e| crate::error::AppError::Config(format!("解析配置失败: {}", e)))?;
+
+    if !doc.contains_key("ouyi_v7") {
+        let mut table = toml_edit::Table::new();
+        table["base_url"] = toml_edit::value("https://api-8.rcouyi.com");
+        table["chatapi_prefix"] = toml_edit::value("/chatapi");
+        table["jwt_token"] = toml_edit::value(jwt_token);
+        table["default_model"] = toml_edit::value("ouyi-chat");
+        table["model_refresh_interval_secs"] = toml_edit::value(1800i64);
+        table["max_history_messages"] = toml_edit::value(20i64);
+        table["simulated_stream_chunk_chars"] = toml_edit::value(80i64);
+        doc["ouyi_v7"] = toml_edit::Item::Table(table);
+    } else {
+        doc["ouyi_v7"]["jwt_token"] = toml_edit::value(jwt_token);
+    }
+
+    std::fs::write(path, doc.to_string())
+        .map_err(|e| crate::error::AppError::Config(format!("写入配置失败: {}", e)))?;
+
+    tracing::info!("Ouyi V7 JWT Token 已更新");
+    Ok(())
+}
+
+pub fn write_admin_config(
+    path: &Path,
+    jwt_secret: &str,
+    password_hash: &str,
+) -> Result<(), crate::error::AppError> {
+    let content = std::fs::read_to_string(path)
+        .map_err(|e| crate::error::AppError::Config(format!("读取配置失败: {}", e)))?;
+
+    let mut doc = content
+        .parse::<toml_edit::DocumentMut>()
+        .map_err(|e| crate::error::AppError::Config(format!("解析配置失败: {}", e)))?;
+
+    if !doc.contains_key("admin") {
+        doc["admin"] = toml_edit::Item::Table(toml_edit::Table::new());
+    }
+    doc["admin"]["jwt_secret"] = toml_edit::value(jwt_secret);
+    doc["admin"]["password_hash"] = toml_edit::value(password_hash);
+
+    std::fs::write(path, doc.to_string())
+        .map_err(|e| crate::error::AppError::Config(format!("写入配置失败: {}", e)))?;
+
+    tracing::info!("Admin 配置已更新");
+    Ok(())
+}
+
+pub fn write_ouyi_config(path: &Path, config: &OuyiConfig) -> Result<(), crate::error::AppError> {
+    let content = std::fs::read_to_string(path)
+        .map_err(|e| crate::error::AppError::Config(format!("读取配置失败: {}", e)))?;
+
+    let mut doc = content
+        .parse::<toml_edit::DocumentMut>()
+        .map_err(|e| crate::error::AppError::Config(format!("解析配置失败: {}", e)))?;
+
+    if !doc.contains_key("ouyi") {
+        doc["ouyi"] = toml_edit::Item::Table(toml_edit::Table::new());
+    }
+    doc["ouyi"]["base_url"] = toml_edit::value(config.base_url.as_str());
+    doc["ouyi"]["jwt_token"] = toml_edit::value(config.jwt_token.as_str());
+    doc["ouyi"]["app_version"] = toml_edit::value(config.app_version.as_str());
+    doc["ouyi"]["model_refresh_interval_secs"] =
+        toml_edit::value(config.model_refresh_interval_secs as i64);
+
+    std::fs::write(path, doc.to_string())
+        .map_err(|e| crate::error::AppError::Config(format!("写入配置失败: {}", e)))?;
+
+    tracing::info!("Ouyi 配置已更新");
+    Ok(())
+}
+
+pub fn write_ouyi_v7_config(
+    path: &Path,
+    config: &Ouyi7Config,
+) -> Result<(), crate::error::AppError> {
+    let content = std::fs::read_to_string(path)
+        .map_err(|e| crate::error::AppError::Config(format!("读取配置失败: {}", e)))?;
+
+    let mut doc = content
+        .parse::<toml_edit::DocumentMut>()
+        .map_err(|e| crate::error::AppError::Config(format!("解析配置失败: {}", e)))?;
+
+    if !doc.contains_key("ouyi_v7") {
+        doc["ouyi_v7"] = toml_edit::Item::Table(toml_edit::Table::new());
+    }
+    doc["ouyi_v7"]["base_url"] = toml_edit::value(config.base_url.as_str());
+    doc["ouyi_v7"]["chatapi_prefix"] = toml_edit::value(config.chatapi_prefix.as_str());
+    doc["ouyi_v7"]["jwt_token"] = toml_edit::value(config.jwt_token.as_str());
+    doc["ouyi_v7"]["default_model"] = toml_edit::value(config.default_model.as_str());
+    doc["ouyi_v7"]["model_refresh_interval_secs"] =
+        toml_edit::value(config.model_refresh_interval_secs as i64);
+    doc["ouyi_v7"]["max_history_messages"] = toml_edit::value(config.max_history_messages as i64);
+    doc["ouyi_v7"]["simulated_stream_chunk_chars"] =
+        toml_edit::value(config.simulated_stream_chunk_chars as i64);
+
+    std::fs::write(path, doc.to_string())
+        .map_err(|e| crate::error::AppError::Config(format!("写入配置失败: {}", e)))?;
+
+    tracing::info!("Ouyi V7 配置已更新");
+    Ok(())
+}
+
+pub fn write_server_config(
+    path: &Path,
+    config: &ServerConfig,
+) -> Result<(), crate::error::AppError> {
+    let content = std::fs::read_to_string(path)
+        .map_err(|e| crate::error::AppError::Config(format!("读取配置失败: {}", e)))?;
+
+    let mut doc = content
+        .parse::<toml_edit::DocumentMut>()
+        .map_err(|e| crate::error::AppError::Config(format!("解析配置失败: {}", e)))?;
+
+    if !doc.contains_key("server") {
+        doc["server"] = toml_edit::Item::Table(toml_edit::Table::new());
+    }
+    doc["server"]["host"] = toml_edit::value(config.host.as_str());
+    doc["server"]["port"] = toml_edit::value(config.port as i64);
+
+    std::fs::write(path, doc.to_string())
+        .map_err(|e| crate::error::AppError::Config(format!("写入配置失败: {}", e)))?;
+
+    tracing::info!("Server 配置已更新");
+    Ok(())
+}
+
+pub fn write_platform_config(
+    path: &Path,
+    config: &PlatformConfig,
+) -> Result<(), crate::error::AppError> {
+    let content = std::fs::read_to_string(path)
+        .map_err(|e| crate::error::AppError::Config(format!("读取配置失败: {}", e)))?;
+
+    let mut doc = content
+        .parse::<toml_edit::DocumentMut>()
+        .map_err(|e| crate::error::AppError::Config(format!("解析配置失败: {}", e)))?;
+
+    if !doc.contains_key("platform") {
+        doc["platform"] = toml_edit::Item::Table(toml_edit::Table::new());
+    }
+    let platform = match config.default {
+        OuyiPlatform::Ouyi7 => "ouyi7",
+        OuyiPlatform::Ouyi8 => "ouyi8",
+    };
+    doc["platform"]["default"] = toml_edit::value(platform);
+    doc["platform"]["prompt_on_start"] = toml_edit::value(config.prompt_on_start);
+
+    std::fs::write(path, doc.to_string())
+        .map_err(|e| crate::error::AppError::Config(format!("写入配置失败: {}", e)))?;
+
+    tracing::info!("平台配置已更新");
     Ok(())
 }
 
@@ -196,9 +426,102 @@ pub fn remove_tool_runtime_config(path: &Path) -> Result<(), crate::error::AppEr
     Ok(())
 }
 
+pub fn write_openai_tool_runtime_config(
+    path: &Path,
+    config: &ToolRuntimeConfig,
+) -> Result<(), crate::error::AppError> {
+    let content = std::fs::read_to_string(path)
+        .map_err(|e| crate::error::AppError::Config(format!("读取配置失败: {}", e)))?;
+
+    let mut doc = content
+        .parse::<toml_edit::DocumentMut>()
+        .map_err(|e| crate::error::AppError::Config(format!("解析配置失败: {}", e)))?;
+
+    let mut table = toml_edit::Table::new();
+    table["enabled"] = toml_edit::value(config.enabled);
+    table["provider"] = toml_edit::value("openai-compatible");
+    if let Some(base_url) = &config.base_url {
+        table["base_url"] = toml_edit::value(base_url.as_str());
+    }
+    if let Some(api_key) = &config.api_key {
+        table["api_key"] = toml_edit::value(api_key.as_str());
+    }
+    if let Some(api_key_env) = &config.api_key_env {
+        table["api_key_env"] = toml_edit::value(api_key_env.as_str());
+    }
+    if let Some(model) = &config.model {
+        table["model"] = toml_edit::value(model.as_str());
+    }
+    table["timeout_secs"] = toml_edit::value(config.timeout_secs as i64);
+    doc["openai_tool_runtime"] = toml_edit::Item::Table(table);
+
+    std::fs::write(path, doc.to_string())
+        .map_err(|e| crate::error::AppError::Config(format!("写入配置失败: {}", e)))?;
+
+    Ok(())
+}
+
+pub fn remove_openai_tool_runtime_config(path: &Path) -> Result<(), crate::error::AppError> {
+    let content = std::fs::read_to_string(path)
+        .map_err(|e| crate::error::AppError::Config(format!("读取配置失败: {}", e)))?;
+
+    let mut doc = content
+        .parse::<toml_edit::DocumentMut>()
+        .map_err(|e| crate::error::AppError::Config(format!("解析配置失败: {}", e)))?;
+    doc.remove("openai_tool_runtime");
+
+    std::fs::write(path, doc.to_string())
+        .map_err(|e| crate::error::AppError::Config(format!("写入配置失败: {}", e)))?;
+
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_openai_tool_runtime_config() {
+        let config: AppConfig = toml::from_str(
+            r#"
+[server]
+host = "127.0.0.1"
+port = 3000
+
+[ouyi]
+base_url = "https://example.com"
+jwt_token = ""
+app_version = "3.0.3"
+model_refresh_interval_secs = 3600
+
+[limits]
+request_timeout_secs = 30
+no_data_timeout_secs = 30
+max_response_bytes = 1048576
+max_messages_bytes = 1048576
+
+[openai_tool_runtime]
+enabled = true
+provider = "openai-compatible"
+base_url = "https://tool.example.com/v1"
+api_key = "sk-test"
+model = "tool-model"
+timeout_secs = 90
+"#,
+        )
+        .unwrap();
+
+        let runtime = config.openai_tool_runtime.unwrap();
+        assert!(runtime.enabled);
+        assert_eq!(runtime.provider, ToolRuntimeProvider::OpenaiCompatible);
+        assert_eq!(
+            runtime.base_url.as_deref(),
+            Some("https://tool.example.com/v1")
+        );
+        assert_eq!(runtime.api_key.as_deref(), Some("sk-test"));
+        assert_eq!(runtime.model.as_deref(), Some("tool-model"));
+        assert_eq!(runtime.timeout_secs, 90);
+    }
 
     #[test]
     fn test_tool_runtime_defaults_to_disabled() {
@@ -477,6 +800,7 @@ max_messages_bytes = 1048576
         .unwrap();
 
         let runtime = ToolRuntimeConfig {
+            enabled: true,
             mode: ToolRuntimeMode::Compiler,
             provider: ToolRuntimeProvider::OpenaiCompatible,
             base_url: Some("https://api.example.com/v1".to_string()),
@@ -493,6 +817,436 @@ max_messages_bytes = 1048576
         remove_tool_runtime_config(&path).unwrap();
         let config: AppConfig = toml::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
         assert!(config.tool_runtime.is_none());
+
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn test_write_admin_config_creates_section() {
+        let path = std::env::temp_dir().join(format!(
+            "ouyi-admin-config-test-{}.toml",
+            uuid::Uuid::new_v4()
+        ));
+        std::fs::write(
+            &path,
+            r#"
+[server]
+host = "127.0.0.1"
+port = 3000
+
+[ouyi]
+base_url = "https://example.com"
+jwt_token = ""
+app_version = "3.0.3"
+model_refresh_interval_secs = 3600
+
+[limits]
+request_timeout_secs = 30
+no_data_timeout_secs = 30
+max_response_bytes = 1048576
+max_messages_bytes = 1048576
+"#,
+        )
+        .unwrap();
+
+        write_admin_config(&path, "secret-value", "bcrypt-hash").unwrap();
+
+        let content = std::fs::read_to_string(&path).unwrap();
+        let config: AppConfig = toml::from_str(&content).unwrap();
+        let admin = config.admin.unwrap();
+        assert_eq!(admin.jwt_secret.as_deref(), Some("secret-value"));
+        assert_eq!(admin.password_hash.as_deref(), Some("bcrypt-hash"));
+
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn test_write_ouyi_config_updates_existing_section() {
+        let path = std::env::temp_dir().join(format!(
+            "ouyi-config-write-test-{}.toml",
+            uuid::Uuid::new_v4()
+        ));
+        std::fs::write(
+            &path,
+            r#"
+[server]
+host = "127.0.0.1"
+port = 3000
+
+[ouyi]
+base_url = "https://old.example.com"
+jwt_token = "old-token"
+app_version = "3.0.3"
+model_refresh_interval_secs = 3600
+
+[limits]
+request_timeout_secs = 30
+no_data_timeout_secs = 30
+max_response_bytes = 1048576
+max_messages_bytes = 1048576
+"#,
+        )
+        .unwrap();
+
+        write_ouyi_config(
+            &path,
+            &OuyiConfig {
+                base_url: "https://new.example.com".to_string(),
+                jwt_token: "new-token".to_string(),
+                app_version: "3.1.0".to_string(),
+                model_refresh_interval_secs: 1800,
+            },
+        )
+        .unwrap();
+
+        let config: AppConfig = toml::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        assert_eq!(config.ouyi.base_url, "https://new.example.com");
+        assert_eq!(config.ouyi.jwt_token, "new-token");
+        assert_eq!(config.ouyi.app_version, "3.1.0");
+        assert_eq!(config.ouyi.model_refresh_interval_secs, 1800);
+
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn test_write_ouyi_v7_config_creates_section() {
+        let path = std::env::temp_dir().join(format!(
+            "ouyi-v7-config-write-test-{}.toml",
+            uuid::Uuid::new_v4()
+        ));
+        std::fs::write(
+            &path,
+            r#"
+[server]
+host = "127.0.0.1"
+port = 3000
+
+[ouyi]
+base_url = "https://example.com"
+jwt_token = ""
+app_version = "3.0.3"
+model_refresh_interval_secs = 3600
+
+[limits]
+request_timeout_secs = 30
+no_data_timeout_secs = 30
+max_response_bytes = 1048576
+max_messages_bytes = 1048576
+"#,
+        )
+        .unwrap();
+
+        write_ouyi_v7_config(
+            &path,
+            &Ouyi7Config {
+                base_url: "https://api-8.rcouyi.com".to_string(),
+                chatapi_prefix: "/chatapi".to_string(),
+                jwt_token: "v7-token".to_string(),
+                default_model: "ouyi-chat".to_string(),
+                model_refresh_interval_secs: 900,
+                max_history_messages: 12,
+                simulated_stream_chunk_chars: 64,
+            },
+        )
+        .unwrap();
+
+        let config: AppConfig = toml::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        let v7 = config.ouyi_v7.unwrap();
+        assert_eq!(v7.jwt_token, "v7-token");
+        assert_eq!(v7.model_refresh_interval_secs, 900);
+        assert_eq!(v7.max_history_messages, 12);
+        assert_eq!(v7.simulated_stream_chunk_chars, 64);
+
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn test_ouyi_v7_config_all_fields() {
+        let config: AppConfig = toml::from_str(
+            r#"
+[server]
+host = "127.0.0.1"
+port = 3000
+
+[ouyi]
+base_url = "https://example.com"
+jwt_token = ""
+app_version = "3.0.3"
+model_refresh_interval_secs = 3600
+
+[limits]
+request_timeout_secs = 30
+no_data_timeout_secs = 30
+max_response_bytes = 1048576
+max_messages_bytes = 1048576
+
+[ouyi_v7]
+base_url = "https://api-8.rcouyi.com"
+chatapi_prefix = "/chatapi"
+jwt_token = "test-v7-token"
+default_model = "ouyi-chat"
+model_refresh_interval_secs = 1800
+max_history_messages = 30
+simulated_stream_chunk_chars = 100
+"#,
+        )
+        .unwrap();
+
+        let v7 = config.ouyi_v7.unwrap();
+        assert_eq!(v7.base_url, "https://api-8.rcouyi.com");
+        assert_eq!(v7.chatapi_prefix, "/chatapi");
+        assert_eq!(v7.jwt_token, "test-v7-token");
+        assert_eq!(v7.default_model, "ouyi-chat");
+        assert_eq!(v7.model_refresh_interval_secs, 1800);
+        assert_eq!(v7.max_history_messages, 30);
+        assert_eq!(v7.simulated_stream_chunk_chars, 100);
+    }
+
+    #[test]
+    fn test_ouyi_v7_config_defaults() {
+        let config: AppConfig = toml::from_str(
+            r#"
+[server]
+host = "127.0.0.1"
+port = 3000
+
+[ouyi]
+base_url = "https://example.com"
+jwt_token = ""
+app_version = "3.0.3"
+model_refresh_interval_secs = 3600
+
+[limits]
+request_timeout_secs = 30
+no_data_timeout_secs = 30
+max_response_bytes = 1048576
+max_messages_bytes = 1048576
+
+[ouyi_v7]
+base_url = "https://api-8.rcouyi.com"
+"#,
+        )
+        .unwrap();
+
+        let v7 = config.ouyi_v7.unwrap();
+        assert_eq!(v7.chatapi_prefix, "/chatapi");
+        assert_eq!(v7.jwt_token, "");
+        assert_eq!(v7.default_model, "ouyi-chat");
+        assert_eq!(v7.model_refresh_interval_secs, 3600);
+        assert_eq!(v7.max_history_messages, 20);
+        assert_eq!(v7.simulated_stream_chunk_chars, 80);
+    }
+
+    #[test]
+    fn test_platform_config_default_ouyi7() {
+        let config: AppConfig = toml::from_str(
+            r#"
+[server]
+host = "127.0.0.1"
+port = 3000
+
+[ouyi]
+base_url = "https://example.com"
+jwt_token = ""
+app_version = "3.0.3"
+model_refresh_interval_secs = 3600
+
+[limits]
+request_timeout_secs = 30
+no_data_timeout_secs = 30
+max_response_bytes = 1048576
+max_messages_bytes = 1048576
+
+[platform]
+default = "ouyi7"
+prompt_on_start = true
+"#,
+        )
+        .unwrap();
+
+        let platform = config.platform.unwrap();
+        assert_eq!(platform.default, crate::platform::OuyiPlatform::Ouyi7);
+        assert!(platform.prompt_on_start);
+    }
+
+    #[test]
+    fn test_platform_config_default_ouyi8() {
+        let config: AppConfig = toml::from_str(
+            r#"
+[server]
+host = "127.0.0.1"
+port = 3000
+
+[ouyi]
+base_url = "https://example.com"
+jwt_token = ""
+app_version = "3.0.3"
+model_refresh_interval_secs = 3600
+
+[limits]
+request_timeout_secs = 30
+no_data_timeout_secs = 30
+max_response_bytes = 1048576
+max_messages_bytes = 1048576
+
+[platform]
+default = "ouyi8"
+"#,
+        )
+        .unwrap();
+
+        let platform = config.platform.unwrap();
+        assert_eq!(platform.default, crate::platform::OuyiPlatform::Ouyi8);
+        assert!(platform.prompt_on_start);
+    }
+
+    #[test]
+    fn test_platform_config_missing_defaults_to_ouyi8() {
+        let config: AppConfig = toml::from_str(
+            r#"
+[server]
+host = "127.0.0.1"
+port = 3000
+
+[ouyi]
+base_url = "https://example.com"
+jwt_token = ""
+app_version = "3.0.3"
+model_refresh_interval_secs = 3600
+
+[limits]
+request_timeout_secs = 30
+no_data_timeout_secs = 30
+max_response_bytes = 1048576
+max_messages_bytes = 1048576
+"#,
+        )
+        .unwrap();
+
+        assert!(config.platform.is_none());
+    }
+
+    #[test]
+    fn test_update_ouyi_v7_jwt_token_only_updates_v7() {
+        let path =
+            std::env::temp_dir().join(format!("ouyi-v7-jwt-test-{}.toml", uuid::Uuid::new_v4()));
+        std::fs::write(
+            &path,
+            r#"
+[server]
+host = "127.0.0.1"
+port = 3000
+
+[ouyi]
+base_url = "https://example.com"
+jwt_token = "original-v8-token"
+app_version = "3.0.3"
+model_refresh_interval_secs = 3600
+
+[limits]
+request_timeout_secs = 30
+no_data_timeout_secs = 30
+max_response_bytes = 1048576
+max_messages_bytes = 1048576
+
+[ouyi_v7]
+base_url = "https://api-8.rcouyi.com"
+jwt_token = "original-v7-token"
+"#,
+        )
+        .unwrap();
+
+        update_ouyi_v7_jwt_token(&path, "new-v7-token").unwrap();
+
+        let content = std::fs::read_to_string(&path).unwrap();
+        let config: AppConfig = toml::from_str(&content).unwrap();
+
+        assert_eq!(config.ouyi.jwt_token, "original-v8-token");
+        assert_eq!(config.ouyi_v7.unwrap().jwt_token, "new-v7-token");
+
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn test_update_ouyi_jwt_token_preserves_v7() {
+        let path = std::env::temp_dir().join(format!(
+            "ouyi-jwt-preserve-v7-test-{}.toml",
+            uuid::Uuid::new_v4()
+        ));
+        std::fs::write(
+            &path,
+            r#"
+[server]
+host = "127.0.0.1"
+port = 3000
+
+[ouyi]
+base_url = "https://example.com"
+jwt_token = "original-v8-token"
+app_version = "3.0.3"
+model_refresh_interval_secs = 3600
+
+[limits]
+request_timeout_secs = 30
+no_data_timeout_secs = 30
+max_response_bytes = 1048576
+max_messages_bytes = 1048576
+
+[ouyi_v7]
+base_url = "https://api-8.rcouyi.com"
+jwt_token = "original-v7-token"
+"#,
+        )
+        .unwrap();
+
+        update_ouyi_jwt_token(&path, "new-v8-token").unwrap();
+
+        let content = std::fs::read_to_string(&path).unwrap();
+        let config: AppConfig = toml::from_str(&content).unwrap();
+
+        assert_eq!(config.ouyi.jwt_token, "new-v8-token");
+        assert_eq!(config.ouyi_v7.unwrap().jwt_token, "original-v7-token");
+
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn test_update_ouyi_v7_jwt_token_creates_section_when_missing() {
+        let path = std::env::temp_dir().join(format!(
+            "ouyi-v7-create-section-test-{}.toml",
+            uuid::Uuid::new_v4()
+        ));
+        std::fs::write(
+            &path,
+            r#"
+[server]
+host = "127.0.0.1"
+port = 3000
+
+[ouyi]
+base_url = "https://example.com"
+jwt_token = "original-v8-token"
+app_version = "3.0.3"
+model_refresh_interval_secs = 3600
+
+[limits]
+request_timeout_secs = 30
+no_data_timeout_secs = 30
+max_response_bytes = 1048576
+max_messages_bytes = 1048576
+"#,
+        )
+        .unwrap();
+
+        update_ouyi_v7_jwt_token(&path, "newly-created-v7-token").unwrap();
+
+        let content = std::fs::read_to_string(&path).unwrap();
+        let config: AppConfig = toml::from_str(&content).unwrap();
+
+        let v7 = config.ouyi_v7.unwrap();
+        assert_eq!(v7.base_url, "https://api-8.rcouyi.com");
+        assert_eq!(v7.jwt_token, "newly-created-v7-token");
+        assert_eq!(config.ouyi.jwt_token, "original-v8-token");
 
         let _ = std::fs::remove_file(path);
     }

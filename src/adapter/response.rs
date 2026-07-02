@@ -209,6 +209,10 @@ impl SseCollector {
         }
     }
 
+    pub fn text_content(&self) -> String {
+        self.content_parts.join("")
+    }
+
     pub fn build_response(mut self) -> ChatCompletionResponse {
         let full_text: String = self.content_parts.join("");
         let parsed = self.tool_parser.process_chunk(&full_text);

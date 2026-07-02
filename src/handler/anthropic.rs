@@ -18,7 +18,10 @@ use crate::client::sse::{SseLineBuffer, parse_sse_line};
 use crate::config::AppConfig;
 use crate::error::AppError;
 use crate::model::anthropic::{AnthropicContent, ContentBlock, MessagesRequest};
+use crate::platform::OuyiPlatform;
 use crate::tool_runtime;
+
+const TOOL_RESULT_CONTENT_MAX_BYTES: usize = 64 * 1024;
 
 /// 工具运行时路由决策
 #[derive(Debug, Clone)]
@@ -37,7 +40,10 @@ struct ModelRouting {
 }
 
 /// 根据请求模型名和模型映射器解析路由信息
-fn resolve_model_routing(req_model: &str, mapper: &crate::model::mapper::ModelMapper) -> ModelRouting {
+fn resolve_model_routing(
+    req_model: &str,
+    mapper: &crate::model::mapper::ModelMapper,
+) -> ModelRouting {
     let client_model = req_model.to_string();
     let effective_model = req_model.to_string();
     let ouyi_model = mapper.to_ouyi(&effective_model);
@@ -235,7 +241,10 @@ fn format_tool_results_for_reuse(req: &MessagesRequest) -> String {
                         .get(tool_use_id.as_str())
                         .map(|s| s.as_str())
                         .unwrap_or(tool_use_id.as_str());
-                    let display_content = truncate_utf8_by_byte_limit_with_notice(content, 2000);
+                    let display_content = truncate_utf8_by_byte_limit_with_notice(
+                        content,
+                        TOOL_RESULT_CONTENT_MAX_BYTES,
+                    );
                     parts.push(format!(
                         "工具 {} 的执行结果：\n{}",
                         tool_name, display_content
@@ -248,7 +257,7 @@ fn format_tool_results_for_reuse(req: &MessagesRequest) -> String {
         return String::new();
     }
     parts.push(
-        "请根据以上工具执行结果继续。如果需要再次调用工具，请直接输出工具调用标记。".to_string(),
+        "请根据以上工具执行结果继续。如果需要再次调用工具，请表达工具意图；长文本继续使用 ouyi_payload。".to_string(),
     );
     parts.join("\n\n")
 }
@@ -317,7 +326,10 @@ fn maybe_build_long_task_poll_response(
     let Some((tool_use_id, content)) = latest_tool_result_content(req) else {
         return Ok(None);
     };
-    let Some(task) = state.tool_ledger.long_task_for_tool_use(&tool_use_id, &req.model) else {
+    let Some(task) = state
+        .tool_ledger
+        .long_task_for_tool_use(&tool_use_id, &req.model)
+    else {
         return Ok(None);
     };
 
@@ -349,7 +361,12 @@ fn maybe_build_long_task_poll_response(
             };
             let call = crate::tool_runtime::broker::build_poll_call(
                 &plan,
-                req.tools.as_deref().unwrap_or(&[]),
+                &req.tools
+                    .as_ref()
+                    .map(|tools| {
+                        crate::tool_runtime::protocol::anthropic_tools_to_specs(tools.as_slice())
+                    })
+                    .unwrap_or_default(),
             )
             .map_err(AppError::BadRequest)?;
             let poll_key = format!("{}:{}", req.model, call.id);
@@ -546,13 +563,33 @@ pub async fn messages(
         }
     }
 
-    match route {
-        RuntimeRoute::OriginalOuyi => {
-            handle_original_ouyi_message(state, req, routing).await
-        }
-        RuntimeRoute::Compiler => handle_compiler_tool_runtime_message(state, req, routing).await,
-        RuntimeRoute::ConfigError(msg) => Err(AppError::Config(msg)),
+    // 按平台分派
+    let platform = *state.platform.read().await;
+    match platform {
+        OuyiPlatform::Ouyi7 => handle_ouyi7_message(state, req, routing).await,
+        OuyiPlatform::Ouyi8 => match route {
+            RuntimeRoute::OriginalOuyi => handle_original_ouyi_message(state, req, routing).await,
+            RuntimeRoute::Compiler => {
+                handle_compiler_tool_runtime_message(state, req, routing).await
+            }
+            RuntimeRoute::ConfigError(msg) => Err(AppError::Config(msg)),
+        },
     }
+}
+
+fn record_anthropic_error(
+    state: &AppState,
+    start_time: std::time::Instant,
+    model: &str,
+    error: &AppError,
+    platform: &str,
+) {
+    state.stats.record_error(
+        start_time.elapsed().as_millis() as u64,
+        model,
+        &error.to_string(),
+        platform,
+    );
 }
 
 /// 原 Ouyi 链路处理（无工具或未配置工具运行时）
@@ -583,8 +620,14 @@ async fn handle_original_ouyi_message(
     state.stats.record_start();
     let start_time = std::time::Instant::now();
 
-    let ouyi_req = convert_anthropic_request(&req, &model_full, should_thinking)
-        .map_err(|e| AppError::BadRequest(e))?;
+    let ouyi_req = match convert_anthropic_request(&req, &model_full, should_thinking) {
+        Ok(req) => req,
+        Err(e) => {
+            let err = AppError::BadRequest(e);
+            record_anthropic_error(&state, start_time, &model_full, &err, "ouyi8");
+            return Err(err);
+        }
+    };
 
     // 判断是否为工具回传请求，尝试复用缓存会话
     let tool_use_id = extract_last_tool_use_id(&req);
@@ -601,9 +644,10 @@ async fn handle_original_ouyi_message(
                     None => config.ouyi.jwt_token.clone(),
                 };
                 if jwt_token.is_empty() {
-                    return Err(AppError::BadRequest(
-                        "未配置 JWT token 且无可用账号 token".to_string(),
-                    ));
+                    let err =
+                        AppError::BadRequest("未配置 JWT token 且无可用账号 token".to_string());
+                    record_anthropic_error(&state, start_time, &model_full, &err, "ouyi8");
+                    return Err(err);
                 }
                 let client = OuyiHttpClient::new(
                     state.http_client.clone(),
@@ -620,9 +664,10 @@ async fn handle_original_ouyi_message(
                     None => config.ouyi.jwt_token.clone(),
                 };
                 if jwt_token.is_empty() {
-                    return Err(AppError::BadRequest(
-                        "未配置 JWT token 且无可用账号 token".to_string(),
-                    ));
+                    let err =
+                        AppError::BadRequest("未配置 JWT token 且无可用账号 token".to_string());
+                    record_anthropic_error(&state, start_time, &model_full, &err, "ouyi8");
+                    return Err(err);
                 }
                 let client = OuyiHttpClient::new(
                     state.http_client.clone(),
@@ -638,6 +683,7 @@ async fn handle_original_ouyi_message(
                             start_time.elapsed().as_millis() as u64,
                             &model_full,
                             &msg,
+                            "ouyi8",
                         );
                         return Err(AppError::Upstream(msg));
                     }
@@ -651,9 +697,9 @@ async fn handle_original_ouyi_message(
             None => config.ouyi.jwt_token.clone(),
         };
         if jwt_token.is_empty() {
-            return Err(AppError::BadRequest(
-                "未配置 JWT token 且无可用账号 token".to_string(),
-            ));
+            let err = AppError::BadRequest("未配置 JWT token 且无可用账号 token".to_string());
+            record_anthropic_error(&state, start_time, &model_full, &err, "ouyi8");
+            return Err(err);
         }
         let client = OuyiHttpClient::new(
             state.http_client.clone(),
@@ -669,6 +715,7 @@ async fn handle_original_ouyi_message(
                     start_time.elapsed().as_millis() as u64,
                     &model_full,
                     &msg,
+                    "ouyi8",
                 );
                 return Err(AppError::Upstream(msg));
             }
@@ -696,9 +743,13 @@ async fn handle_original_ouyi_message(
         Err(e) => {
             state.active_sessions.remove(&session_id);
             let msg = format!("聊天请求失败: {}", e);
-            state
-                .stats
-                .record_error(start_time.elapsed().as_millis() as u64, &model_full, &msg);
+            state.stats.record_error(
+                start_time.elapsed().as_millis() as u64,
+                &model_full,
+                &msg,
+                "ouyi8",
+            );
+            spawn_session_cleanup(client, session_id);
             return Err(AppError::Upstream(msg));
         }
     };
@@ -729,6 +780,170 @@ async fn handle_original_ouyi_message(
         )
         .await
     }
+}
+
+/// 7.0 平台消息处理
+async fn handle_ouyi7_message(
+    state: Arc<AppState>,
+    req: MessagesRequest,
+    routing: ModelRouting,
+) -> Result<axum::response::Response, AppError> {
+    let config = state.config.read().await.clone();
+
+    let v7_config = config
+        .ouyi_v7
+        .as_ref()
+        .ok_or_else(|| AppError::Config("未配置 7.0 平台".to_string()))?;
+
+    let model_full = routing.ouyi_model.clone();
+    let short_model = routing.client_model.clone();
+    let max_history = v7_config.max_history_messages;
+
+    let has_tools = req.tools.as_ref().is_some_and(|tools| !tools.is_empty());
+
+    state.stats.record_start();
+    let start_time = std::time::Instant::now();
+
+    // 请求转换
+    let ouyi_input = match crate::adapter::ouyi_v7_request::from_anthropic_messages(
+        &req,
+        model_full.clone(),
+        max_history,
+    ) {
+        Ok(input) => input,
+        Err(e) => {
+            record_anthropic_error(
+                &state,
+                start_time,
+                &model_full,
+                &e,
+                state.platform.read().await.config_key(),
+            );
+            return Err(e);
+        }
+    };
+
+    let client = {
+        let ouyi_client = state.ouyi_client.read().await;
+        match &*ouyi_client {
+            crate::client::OuyiClient::V7(client) => client.clone(),
+            crate::client::OuyiClient::V8(_) => {
+                let err = AppError::Internal("当前运行客户端不是 7.0".to_string());
+                record_anthropic_error(
+                    &state,
+                    start_time,
+                    &model_full,
+                    &err,
+                    state.platform.read().await.config_key(),
+                );
+                return Err(err);
+            }
+        }
+    };
+
+    let text = match client.chat_once(&ouyi_input).await {
+        Ok(text) => text,
+        Err(e) => {
+            let msg = format!("7.0 聊天请求失败: {}", e);
+            state.stats.record_error(
+                start_time.elapsed().as_millis() as u64,
+                &model_full,
+                &msg,
+                state.platform.read().await.config_key(),
+            );
+            return Err(AppError::Upstream(msg));
+        }
+    };
+
+    let elapsed = start_time.elapsed().as_millis() as u64;
+    let platform_key = state.platform.read().await.config_key();
+
+    if has_tools {
+        handle_anthropic_tools_plain_output(
+            state,
+            req,
+            routing,
+            text,
+            0,
+            0,
+            start_time,
+            platform_key,
+            None,
+        )
+        .await
+    } else if req.stream.unwrap_or(false) {
+        handle_v7_anthropic_stream(&text, &short_model, model_full, state, start_time).await
+    } else {
+        handle_v7_anthropic_non_stream(
+            &text,
+            &short_model,
+            model_full,
+            state,
+            elapsed,
+            &platform_key,
+        )
+        .await
+    }
+}
+
+async fn handle_v7_anthropic_stream(
+    text: &str,
+    model: &str,
+    model_full: String,
+    state: Arc<AppState>,
+    start_time: std::time::Instant,
+) -> Result<axum::response::Response, AppError> {
+    use crate::adapter::ouyi_v7_response::build_anthropic_stream_from_plain;
+
+    let config = state.config.read().await;
+    let chunk_chars = config
+        .ouyi_v7
+        .as_ref()
+        .map(|v| v.simulated_stream_chunk_chars)
+        .unwrap_or(80);
+
+    let task_id = format!("msg_{}", uuid_short());
+    let response = match build_anthropic_stream_from_plain(model, &task_id, text, chunk_chars) {
+        Ok(response) => response,
+        Err(e) => {
+            let platform_key = state.platform.read().await.config_key();
+            record_anthropic_error(&state, start_time, &model_full, &e, &platform_key);
+            return Err(e);
+        }
+    };
+
+    let stream_elapsed = start_time.elapsed().as_millis() as u64;
+    let platform_key = state.platform.read().await.config_key();
+    state
+        .stats
+        .record_success(stream_elapsed, 0, 0, &model_full, &platform_key);
+
+    Ok(response)
+}
+
+async fn handle_v7_anthropic_non_stream(
+    text: &str,
+    model: &str,
+    model_full: String,
+    state: Arc<AppState>,
+    elapsed: u64,
+    platform_key: &str,
+) -> Result<axum::response::Response, AppError> {
+    use crate::adapter::ouyi_v7_response::build_anthropic_message_from_plain;
+
+    let task_id = format!("msg_{}", uuid_short());
+    let response = build_anthropic_message_from_plain(model, &task_id, text);
+
+    state
+        .stats
+        .record_success(elapsed, 0, 0, &model_full, platform_key);
+
+    let mut resp = Json(response).into_response();
+    resp.headers_mut()
+        .insert("anthropic-version", "2023-06-01".parse().unwrap());
+    resp.headers_mut()
+        .insert("x-request-id", task_id.parse().unwrap());
+    Ok(resp)
 }
 
 /// 工具模型编译器处理（Ouyi 主脑 + 第三方工具模型）
@@ -764,9 +979,9 @@ async fn handle_compiler_tool_runtime_message(
         None => app_config.ouyi.jwt_token.clone(),
     };
     if jwt_token.is_empty() {
-        return Err(AppError::BadRequest(
-            "未配置 JWT token 且无可用账号 token".to_string(),
-        ));
+        let err = AppError::BadRequest("未配置 JWT token 且无可用账号 token".to_string());
+        record_anthropic_error(&state, start_time, &model_full, &err, "ouyi8");
+        return Err(err);
     }
 
     let client = OuyiHttpClient::new(
@@ -797,6 +1012,7 @@ async fn handle_compiler_tool_runtime_message(
                             start_time.elapsed().as_millis() as u64,
                             &model_full,
                             &msg,
+                            "ouyi8",
                         );
                         return Err(AppError::Upstream(msg));
                     }
@@ -813,6 +1029,7 @@ async fn handle_compiler_tool_runtime_message(
                     start_time.elapsed().as_millis() as u64,
                     &model_full,
                     &msg,
+                    "ouyi8",
                 );
                 return Err(AppError::Upstream(msg));
             }
@@ -838,15 +1055,32 @@ async fn handle_compiler_tool_runtime_message(
         Err(e) => {
             state.active_sessions.remove(&session_id);
             let msg = format!("聊天请求失败: {}", e);
-            state
-                .stats
-                .record_error(start_time.elapsed().as_millis() as u64, &model_full, &msg);
+            state.stats.record_error(
+                start_time.elapsed().as_millis() as u64,
+                &model_full,
+                &msg,
+                "ouyi8",
+            );
+            spawn_session_cleanup(client, session_id);
             return Err(AppError::Upstream(msg));
         }
     };
 
     // 收集完整 Ouyi 输出
-    let (ouyi_output, prompt_tokens, completion_tokens) = collect_ouyi_output(resp).await?;
+    let (ouyi_output, prompt_tokens, completion_tokens) = match collect_ouyi_output(resp).await {
+        Ok(output) => output,
+        Err(e) => {
+            state.stats.record_error(
+                start_time.elapsed().as_millis() as u64,
+                &model_full,
+                &e.to_string(),
+                "ouyi8",
+            );
+            state.active_sessions.remove(&session_id);
+            spawn_session_cleanup(client, session_id);
+            return Err(e);
+        }
+    };
 
     tracing::debug!(
         ouyi_output_len = ouyi_output.len(),
@@ -894,6 +1128,7 @@ async fn handle_compiler_tool_runtime_message(
         Err(e) => {
             state.stats.record_tool_runtime_error(
                 &format!("msg_{}", uuid_short()),
+                "anthropic",
                 broker_mode.clone(),
                 broker_provider,
                 &broker_model,
@@ -905,14 +1140,8 @@ async fn handle_compiler_tool_runtime_message(
                 broker_started.elapsed().as_millis() as u64,
                 &e.to_string(),
             );
-            state.stats.record_error(
-                start_time.elapsed().as_millis() as u64,
-                &model_full,
-                &e.to_string(),
-            );
-            state.active_sessions.remove(&session_id);
-            spawn_session_cleanup(client, session_id);
-            return Err(e);
+            tracing::warn!(error = %e, "工具决策异常，返回主脑文本");
+            BrokerDecision::FinalAnswer { usage: None }
         }
     };
 
@@ -947,9 +1176,13 @@ async fn handle_compiler_tool_runtime_message(
             // 记录工具调用到 ledger
             for call in &compiled_calls {
                 let key = format!("{}:{}", req.model, call.id);
-                state
+                if let Err(e) = state
                     .tool_ledger
-                    .record_tool_use(&key, &call.id, &call.name)?;
+                    .record_tool_use(&key, &call.id, &call.name)
+                {
+                    record_anthropic_error(&state, start_time, &model_full, &e, "ouyi8");
+                    return Err(e);
+                }
 
                 // 检测长时任务并附加状态
                 let broker_call = crate::tool_runtime::broker::BrokerToolCall {
@@ -958,12 +1191,15 @@ async fn handle_compiler_tool_runtime_message(
                     input: call.input.clone(),
                 };
                 if let Some(plan) = crate::tool_runtime::broker::detect_long_task(&broker_call) {
-                    state.tool_ledger.attach_long_task(
+                    if let Err(e) = state.tool_ledger.attach_long_task(
                         &key,
                         plan.file_path,
                         plan.done_marker,
                         plan.max_polls,
-                    )?;
+                    ) {
+                        record_anthropic_error(&state, start_time, &model_full, &e, "ouyi8");
+                        return Err(e);
+                    }
                 }
             }
 
@@ -972,9 +1208,11 @@ async fn handle_compiler_tool_runtime_message(
                 prompt_tokens,
                 completion_tokens,
                 &short_model,
+                "ouyi8",
             );
             state.stats.record_tool_runtime_success(
                 &task_id,
+                "anthropic",
                 broker_mode.clone(),
                 broker_provider,
                 &broker_model,
@@ -1026,6 +1264,7 @@ async fn handle_compiler_tool_runtime_message(
                                     start_time.elapsed().as_millis() as u64,
                                     &model_full,
                                     &e.to_string(),
+                                    "ouyi8",
                                 );
                                 state.active_sessions.remove(&session_id);
                                 spawn_session_cleanup(client.clone(), session_id);
@@ -1044,6 +1283,7 @@ async fn handle_compiler_tool_runtime_message(
                 final_prompt_tokens,
                 final_completion_tokens,
                 &short_model,
+                "ouyi8",
             );
             let (compiler_prompt, compiler_completion) = match &usage {
                 Some(u) => (u.prompt_tokens, u.completion_tokens),
@@ -1051,6 +1291,7 @@ async fn handle_compiler_tool_runtime_message(
             };
             state.stats.record_tool_runtime_success(
                 &task_id,
+                "anthropic",
                 broker_mode.clone(),
                 broker_provider,
                 &broker_model,
@@ -1067,6 +1308,271 @@ async fn handle_compiler_tool_runtime_message(
             spawn_session_cleanup(client, session_id);
 
             // 合成 Anthropic text 响应
+            let stream = req.stream.unwrap_or(false);
+            if stream {
+                build_text_stream_response(
+                    &short_model,
+                    &task_id,
+                    &response_text,
+                    final_prompt_tokens,
+                    final_completion_tokens,
+                )
+            } else {
+                build_text_response(
+                    &short_model,
+                    &task_id,
+                    &response_text,
+                    final_prompt_tokens,
+                    final_completion_tokens,
+                )
+            }
+        }
+    }
+}
+
+/// 处理纯文本输出后的 Anthropic 工具决策响应
+async fn handle_anthropic_tools_plain_output(
+    state: Arc<AppState>,
+    req: MessagesRequest,
+    routing: ModelRouting,
+    ouyi_output: String,
+    prompt_tokens: u64,
+    completion_tokens: u64,
+    start_time: std::time::Instant,
+    platform_key: &'static str,
+    reusable_session: Option<(OuyiHttpClient, i64)>,
+) -> Result<axum::response::Response, AppError> {
+    use crate::tool_runtime::broker::BrokerDecision;
+
+    let app_config = state.config.read().await.clone();
+    let tool_runtime_config = app_config.tool_runtime.as_ref();
+
+    let short_model = routing.client_model.clone();
+    let model_full = routing.ouyi_model.clone();
+
+    let broker_started = std::time::Instant::now();
+    let (broker_mode, broker_model, broker_provider, broker_base_url) = match tool_runtime_config {
+        Some(cfg) => {
+            let mode = StatsToolRuntimeMode::Broker;
+            let model = cfg.model.clone().unwrap_or_else(|| "unknown".to_string());
+            let base_url = cfg.base_url.clone().unwrap_or_default();
+            let provider = match cfg.provider {
+                crate::config::ToolRuntimeProvider::Anthropic => "anthropic",
+                crate::config::ToolRuntimeProvider::OpenaiCompatible => "openai-compatible",
+            };
+            (mode, model, provider, base_url)
+        }
+        None => {
+            let mode = StatsToolRuntimeMode::Broker;
+            let model = "rule-based".to_string();
+            let provider = "rule-based";
+            let base_url = String::new();
+            (mode, model, provider, base_url)
+        }
+    };
+
+    let broker_result = match tool_runtime::broker::decide_with_broker(
+        state.http_client.clone(),
+        tool_runtime_config,
+        &req,
+        &ouyi_output,
+    )
+    .await
+    {
+        Ok(result) => result,
+        Err(e) => {
+            state.stats.record_tool_runtime_error(
+                &format!("msg_{}", uuid_short()),
+                "anthropic",
+                broker_mode.clone(),
+                broker_provider,
+                &broker_model,
+                &broker_base_url,
+                ToolRuntimeDecision::FinalAnswer,
+                Vec::new(),
+                0,
+                0,
+                broker_started.elapsed().as_millis() as u64,
+                &e.to_string(),
+            );
+            tracing::warn!(error = %e, "工具决策异常，返回主脑文本");
+            BrokerDecision::FinalAnswer { usage: None }
+        }
+    };
+
+    let task_id = format!("msg_{}", uuid_short());
+    let elapsed = start_time.elapsed().as_millis() as u64;
+
+    match broker_result {
+        BrokerDecision::ToolCalls(calls) => {
+            let compiled_calls = calls
+                .iter()
+                .map(|c| crate::tool_runtime::openai_compiler::CompiledToolCall {
+                    id: c.id.clone(),
+                    name: c.name.clone(),
+                    input: c.input.clone(),
+                })
+                .collect::<Vec<_>>();
+
+            // 只有 8.0 才缓存会话用于后续 tool_result，不清理 session
+            if let Some((_, session_id)) = reusable_session {
+                for call in &compiled_calls {
+                    insert_cached_tool_session(
+                        &state,
+                        &model_full,
+                        &short_model,
+                        &call.id,
+                        session_id,
+                    );
+                }
+            }
+
+            // 记录工具调用到 ledger
+            for call in &compiled_calls {
+                let key = format!("{}:{}", req.model, call.id);
+                if let Err(e) = state
+                    .tool_ledger
+                    .record_tool_use(&key, &call.id, &call.name)
+                {
+                    record_anthropic_error(&state, start_time, &model_full, &e, platform_key);
+                    return Err(e);
+                }
+
+                let broker_call = crate::tool_runtime::broker::BrokerToolCall {
+                    id: call.id.clone(),
+                    name: call.name.clone(),
+                    input: call.input.clone(),
+                };
+                if let Some(plan) = crate::tool_runtime::broker::detect_long_task(&broker_call) {
+                    if let Err(e) = state.tool_ledger.attach_long_task(
+                        &key,
+                        plan.file_path,
+                        plan.done_marker,
+                        plan.max_polls,
+                    ) {
+                        record_anthropic_error(&state, start_time, &model_full, &e, platform_key);
+                        return Err(e);
+                    }
+                }
+            }
+
+            state.stats.record_success(
+                elapsed,
+                prompt_tokens,
+                completion_tokens,
+                &short_model,
+                &platform_key,
+            );
+            state.stats.record_tool_runtime_success(
+                &task_id,
+                "anthropic",
+                broker_mode.clone(),
+                broker_provider,
+                &broker_model,
+                &broker_base_url,
+                ToolRuntimeDecision::ToolCalls,
+                compiled_calls.iter().map(|c| c.name.clone()).collect(),
+                0,
+                0,
+                broker_started.elapsed().as_millis() as u64,
+            );
+
+            let stream = req.stream.unwrap_or(false);
+            if stream {
+                build_tool_use_stream_response(
+                    &short_model,
+                    &task_id,
+                    compiled_calls,
+                    prompt_tokens,
+                    completion_tokens,
+                )
+            } else {
+                build_tool_use_response(
+                    &short_model,
+                    &task_id,
+                    compiled_calls,
+                    prompt_tokens,
+                    completion_tokens,
+                )
+            }
+        }
+        BrokerDecision::FinalAnswer { usage } => {
+            let latest_user_text = latest_user_plain_text(&req);
+
+            // 判断是否需要补全请求
+            let display_text =
+                normalize_ouyi_display_text(&ouyi_output, latest_user_text.as_deref());
+            let need_supplement = display_text.is_empty() && reusable_session.is_some();
+
+            let (response_text, final_prompt_tokens, final_completion_tokens) = if need_supplement {
+                // 补全请求：移动 reusable_session，补全后清理
+                let (client, session_id) = reusable_session.unwrap();
+                tracing::debug!("主脑展示文本为空，请求 Ouyi 补全最终回答");
+                let result =
+                    request_final_answer_after_suppressed_tool_intent(&client, session_id, false)
+                        .await;
+                match result {
+                    Ok((final_output, answer_prompt_tokens, answer_completion_tokens)) => {
+                        // 补全成功，清理 session
+                        state.active_sessions.remove(&session_id);
+                        spawn_session_cleanup(client, session_id);
+                        (
+                            normalize_plain_text(&final_output, latest_user_text.as_deref()),
+                            prompt_tokens + answer_prompt_tokens,
+                            completion_tokens + answer_completion_tokens,
+                        )
+                    }
+                    Err(e) => {
+                        // 补全失败，清理 session 并返回错误
+                        state.stats.record_error(
+                            elapsed,
+                            &model_full,
+                            &e.to_string(),
+                            &platform_key,
+                        );
+                        state.active_sessions.remove(&session_id);
+                        spawn_session_cleanup(client, session_id);
+                        return Err(e);
+                    }
+                }
+            } else {
+                // 不需要补全：如果有 session 则清理
+                if let Some((client, session_id)) = reusable_session {
+                    state.active_sessions.remove(&session_id);
+                    spawn_session_cleanup(client, session_id);
+                }
+                if display_text.is_empty() {
+                    (ouyi_output.clone(), prompt_tokens, completion_tokens)
+                } else {
+                    (display_text, prompt_tokens, completion_tokens)
+                }
+            };
+
+            state.stats.record_success(
+                elapsed,
+                final_prompt_tokens,
+                final_completion_tokens,
+                &short_model,
+                &platform_key,
+            );
+            let (compiler_prompt, compiler_completion) = match &usage {
+                Some(u) => (u.prompt_tokens, u.completion_tokens),
+                None => (0, 0),
+            };
+            state.stats.record_tool_runtime_success(
+                &task_id,
+                "anthropic",
+                broker_mode.clone(),
+                broker_provider,
+                &broker_model,
+                &broker_base_url,
+                ToolRuntimeDecision::FinalAnswer,
+                Vec::new(),
+                compiler_prompt,
+                compiler_completion,
+                broker_started.elapsed().as_millis() as u64,
+            );
+
             let stream = req.stream.unwrap_or(false);
             if stream {
                 build_text_stream_response(
@@ -1106,8 +1612,9 @@ async fn collect_ouyi_output(resp: reqwest::Response) -> Result<(String, u64, u6
         let chunk = match chunk_result {
             Ok(bytes) => bytes,
             Err(e) => {
-                tracing::warn!("Ouyi 流读取错误: {}", e);
-                break;
+                let msg = format!("Ouyi 流读取错误: {}", e);
+                tracing::warn!("{}", msg);
+                return Err(AppError::SseStream(msg));
             }
         };
 
@@ -1227,6 +1734,7 @@ fn build_tool_use_stream_response(
             content_block: ContentBlockStart::ToolUse {
                 id: call.id,
                 name: call.name,
+                input: serde_json::json!({}),
             },
         }));
         events.push(serialize_stream_event(&StreamEvent::ContentBlockDelta {
@@ -1402,6 +1910,8 @@ async fn handle_anthropic_stream(
         let mut converter = AnthropicStreamConverter::new(model_for_task, task_id_for_task);
         let mut sse_buffer = SseLineBuffer::new();
         let mut partial = Vec::new();
+        let mut stream_error: Option<String> = None;
+        let mut downstream_closed = false;
 
         futures::pin_mut!(guarded);
 
@@ -1413,11 +1923,13 @@ async fn handle_anthropic_stream(
         }
 
         let mut chunk_count = 0u64;
-        while let Some(chunk_result) = guarded.next().await {
+        'read_loop: while let Some(chunk_result) = guarded.next().await {
             let chunk = match chunk_result {
                 Ok(bytes) => bytes,
-                Err(_) => {
-                    tracing::warn!("上游字节流读取错误");
+                Err(e) => {
+                    let msg = format!("上游字节流读取错误: {}", e);
+                    tracing::warn!("{}", msg);
+                    stream_error = Some(msg);
                     break;
                 }
             };
@@ -1472,12 +1984,38 @@ async fn handle_anthropic_stream(
                         tracing::debug!(preview = %preview, "发送 Anthropic SSE 事件");
                         if tx.send(evt).await.is_err() {
                             tracing::warn!("发送 SSE 事件失败，channel 已关闭");
-                            return;
+                            downstream_closed = true;
+                            break 'read_loop;
                         }
                     }
                 }
             }
             chunk_count += 1;
+        }
+
+        if downstream_closed {
+            state_for_stream.active_sessions.remove(&session_id);
+            return;
+        }
+
+        if let Some(msg) = stream_error {
+            state_for_stream.stats.record_error(
+                start_time.elapsed().as_millis() as u64,
+                &model_for_stats,
+                &msg,
+                "ouyi8",
+            );
+            state_for_stream.active_sessions.remove(&session_id);
+            let error = serde_json::json!({
+                "type": "error",
+                "error": {
+                    "type": "stream_error",
+                    "message": msg
+                }
+            });
+            let payload = format!("event: error\ndata: {}\n\n", error);
+            let _ = tx.send(Bytes::from(payload)).await;
+            return;
         }
 
         if !converter.done_processed {
@@ -1505,6 +2043,7 @@ async fn handle_anthropic_stream(
             input_tokens,
             output_tokens,
             &model_for_stats,
+            "ouyi8",
         );
 
         if has_tool_use {
@@ -1579,15 +2118,22 @@ async fn handle_anthropic_non_stream(
     let mut total_bytes: usize = 0;
     let max_bytes = state.config.read().await.limits.max_response_bytes;
     let mut partial = Vec::new();
+    let mut stream_error: Option<String> = None;
 
     while let Some(chunk_result) = guarded.next().await {
         let chunk = match chunk_result {
             Ok(bytes) => bytes,
-            Err(_) => break,
+            Err(e) => {
+                let msg = format!("SSE字节流读取错误: {}", e);
+                tracing::error!(error = %e, "SSE字节流读取错误");
+                stream_error = Some(msg);
+                break;
+            }
         };
 
         total_bytes += chunk.len();
         if total_bytes > max_bytes {
+            stream_error = Some(format!("响应超过大小限制: {} > {}", total_bytes, max_bytes));
             break;
         }
 
@@ -1619,16 +2165,28 @@ async fn handle_anthropic_non_stream(
         collector.push_event(&event);
     }
 
+    if let Some(msg) = stream_error {
+        guarded.as_mut().skip_cleanup();
+        spawn_session_cleanup(client, session_id);
+        state.active_sessions.remove(&session_id);
+        if let Some(key) = &cache_key {
+            state.tool_sessions.remove(key);
+        }
+        state.stats.record_error(elapsed, &model, &msg, "ouyi8");
+        return Err(AppError::SseStream(msg));
+    }
+
     let (prompt, completion) = collector.tokens();
     let response = collector.build_response();
 
     state
         .stats
-        .record_success(elapsed, prompt, completion, &model);
+        .record_success(elapsed, prompt, completion, &model, "ouyi8");
 
     // 根据 stop_reason 决定缓存或清理会话
     let has_tool_use = response.stop_reason == "tool_use";
     if has_tool_use {
+        guarded.as_mut().skip_cleanup();
         // 从响应中提取最后一个 tool_use 的 id 作为缓存 key
         let last_tool_id = response.content.iter().rev().find_map(|b| {
             if let crate::model::anthropic::ResponseContentBlock::ToolUse { id, .. } = b {
@@ -1650,6 +2208,7 @@ async fn handle_anthropic_non_stream(
         }
         // 不删除会话，保留给下一轮
     } else {
+        guarded.as_mut().skip_cleanup();
         spawn_session_cleanup(client, session_id);
         state.active_sessions.remove(&session_id);
         if let Some(key) = &cache_key {
@@ -1690,8 +2249,8 @@ mod tests {
     use crate::admin::{AccountStore, auth::AdminStore};
     use crate::client::http::OuyiHttpClient;
     use crate::config::{
-        AdminConfig, AppConfig, LimitsConfig, OuyiConfig, ServerConfig, ToolCallConfig,
-        ToolRuntimeConfig, ToolRuntimeMode, ToolRuntimeProvider,
+        AdminConfig, AppConfig, LimitsConfig, Ouyi7Config, OuyiConfig, PlatformConfig,
+        ServerConfig, ToolCallConfig, ToolRuntimeConfig, ToolRuntimeMode, ToolRuntimeProvider,
     };
     use crate::model::anthropic::{
         AnthropicContent, AnthropicMessage, AnthropicTool, ContentBlock,
@@ -1735,6 +2294,7 @@ mod tests {
         assert!(result.contains("file1.rs"));
         assert!(result.contains("file2.rs"));
         assert!(result.contains("请根据以上工具执行结果继续"));
+        assert!(!result.contains("直接输出工具调用标记"));
         // 不应包含工具指令
         assert!(!result.contains("You have access to the following tools"));
         assert!(!result.contains("[System]"));
@@ -1765,27 +2325,40 @@ mod tests {
     }
 
     #[test]
-    fn test_format_tool_results_for_reuse_truncation() {
+    fn test_format_tool_results_for_reuse_preserves_typical_file_output() {
         let long_content = "x".repeat(3000);
         let tool_result = make_tool_result_msg("call_0", &long_content);
         let req = make_messages_request(vec![tool_result]);
 
         let result = format_tool_results_for_reuse(&req);
-        assert!(result.contains("截断"));
-        assert!(result.contains("3000"));
-        assert!(result.len() < long_content.len() + 200); // 应远小于原始大小
+        assert!(!result.contains("截断"));
+        assert!(result.contains(&long_content));
     }
 
     #[test]
-    fn test_format_tool_results_for_reuse_truncation_handles_multibyte_text() {
+    fn test_format_tool_results_for_reuse_preserves_typical_multibyte_file_output() {
         let long_content = "方".repeat(1000);
         let tool_result = make_tool_result_msg("call_0", &long_content);
         let req = make_messages_request(vec![tool_result]);
 
         let result = format_tool_results_for_reuse(&req);
 
-        assert!(result.contains("截断"));
-        assert!(result.contains("1000"));
+        assert!(!result.contains("截断"));
+        assert!(result.contains(&long_content));
+    }
+
+    #[test]
+    fn test_format_tool_results_for_reuse_truncates_extreme_output_with_notice() {
+        let long_content = "x".repeat(TOOL_RESULT_CONTENT_MAX_BYTES + 1);
+        let tool_result = make_tool_result_msg("call_0", &long_content);
+        let req = make_messages_request(vec![tool_result]);
+
+        let result = format_tool_results_for_reuse(&req);
+
+        assert!(result.contains(&format!(
+            "内容截断，共 {} 字符",
+            TOOL_RESULT_CONTENT_MAX_BYTES + 1
+        )));
     }
 
     #[test]
@@ -1933,12 +2506,20 @@ mod tests {
             .unwrap();
         let mapper = ModelMapper::new();
         mapper.load_fallback();
+        let platform = config
+            .platform
+            .as_ref()
+            .map(|p| p.default)
+            .unwrap_or(crate::platform::OuyiPlatform::Ouyi8);
+        let base_url = config.ouyi.base_url.clone();
         Arc::new(AppState {
-            ouyi_client: tokio::sync::RwLock::new(OuyiHttpClient::new(
-                http_client.clone(),
-                config.ouyi.base_url.clone(),
-                config.ouyi.jwt_token.clone(),
-                config.ouyi.app_version.clone(),
+            ouyi_client: tokio::sync::RwLock::new(crate::client::OuyiClient::V8(
+                OuyiHttpClient::new(
+                    http_client.clone(),
+                    config.ouyi.base_url.clone(),
+                    config.ouyi.jwt_token.clone(),
+                    config.ouyi.app_version.clone(),
+                ),
             )),
             config: tokio::sync::RwLock::new(config),
             http_client,
@@ -1952,6 +2533,91 @@ mod tests {
             )),
             account_store: AccountStore::new(),
             stats: StatsCollector::new(),
+            platform: tokio::sync::RwLock::new(platform),
+            platform_status: tokio::sync::RwLock::new(crate::platform::PlatformStatus::new(
+                platform, base_url,
+            )),
+        })
+    }
+
+    fn make_v7_test_state(
+        ouyi_base_url: String,
+        tool_runtime: Option<ToolRuntimeConfig>,
+    ) -> Arc<AppState> {
+        use crate::client::ouyi_v7::Ouyi7HttpClient;
+
+        let http_client = reqwest::Client::builder()
+            .timeout(std::time::Duration::from_secs(5))
+            .build()
+            .unwrap();
+        let mapper = ModelMapper::new();
+        mapper.load_fallback();
+        let platform = OuyiPlatform::Ouyi7;
+        let config = AppConfig {
+            server: ServerConfig {
+                host: "127.0.0.1".to_string(),
+                port: 0,
+            },
+            ouyi: OuyiConfig {
+                base_url: ouyi_base_url.clone(),
+                jwt_token: "test-jwt".to_string(),
+                app_version: "3.0.3".to_string(),
+                model_refresh_interval_secs: 3600,
+            },
+            limits: LimitsConfig {
+                request_timeout_secs: 5,
+                no_data_timeout_secs: 5,
+                max_response_bytes: 1024 * 1024,
+                max_messages_bytes: 1024 * 1024,
+            },
+            admin: Some(AdminConfig {
+                jwt_secret: Some("test-secret".to_string()),
+                password_hash: None,
+            }),
+            tool_call: ToolCallConfig::default(),
+            tool_runtime,
+            openai_tool_runtime: None,
+            platform: Some(PlatformConfig {
+                default: platform,
+                prompt_on_start: false,
+            }),
+            ouyi_v7: Some(Ouyi7Config {
+                base_url: ouyi_base_url.clone(),
+                chatapi_prefix: "/chatapi".to_string(),
+                jwt_token: "test-v7-jwt".to_string(),
+                default_model: "ouyi-chat".to_string(),
+                model_refresh_interval_secs: 3600,
+                max_history_messages: 20,
+                simulated_stream_chunk_chars: 80,
+            }),
+        };
+
+        Arc::new(AppState {
+            ouyi_client: tokio::sync::RwLock::new(crate::client::OuyiClient::V7(
+                Ouyi7HttpClient::new(
+                    http_client.clone(),
+                    ouyi_base_url.clone(),
+                    "/chatapi".to_string(),
+                    "test-v7-jwt".to_string(),
+                ),
+            )),
+            config: tokio::sync::RwLock::new(config),
+            http_client,
+            active_sessions: dashmap::DashMap::new(),
+            tool_sessions: dashmap::DashMap::new(),
+            tool_ledger: crate::tool_runtime::ToolLedger::new(),
+            model_mapper: mapper,
+            admin_store: tokio::sync::RwLock::new(AdminStore::new(
+                "test-secret".to_string(),
+                String::new(),
+            )),
+            account_store: AccountStore::new(),
+            stats: StatsCollector::new(),
+            platform: tokio::sync::RwLock::new(platform),
+            platform_status: tokio::sync::RwLock::new(crate::platform::PlatformStatus::new(
+                platform,
+                ouyi_base_url,
+            )),
         })
     }
 
@@ -1978,7 +2644,9 @@ mod tests {
                 password_hash: None,
             }),
             tool_call: ToolCallConfig::default(),
+            openai_tool_runtime: None,
             tool_runtime: Some(ToolRuntimeConfig {
+                enabled: true,
                 mode: ToolRuntimeMode::Compiler,
                 provider: ToolRuntimeProvider::OpenaiCompatible,
                 base_url: Some(tool_base_url),
@@ -1987,6 +2655,8 @@ mod tests {
                 model: Some("tool-model".to_string()),
                 timeout_secs: 5,
             }),
+            platform: None,
+            ouyi_v7: None,
         }
     }
 
@@ -2075,6 +2745,48 @@ mod tests {
         }
     }
 
+    async fn ouyi7_mock_router_with_reply(reply: &'static str) -> Router {
+        async fn save_handler() -> axum::Json<serde_json::Value> {
+            axum::Json(json!({
+                "code": 200,
+                "result": {
+                    "id": 12345
+                }
+            }))
+        }
+
+        async fn message_handler() -> axum::Json<serde_json::Value> {
+            axum::Json(json!({
+                "code": 200,
+                "result": [11111, 22222]
+            }))
+        }
+
+        async fn message_response_handler(
+            State(reply): State<&'static str>,
+        ) -> axum::response::Response {
+            axum::response::Response::builder()
+                .status(StatusCode::OK)
+                .header(axum::http::header::CONTENT_TYPE, "text/plain")
+                .body(Body::from(reply))
+                .unwrap()
+        }
+
+        async fn delete_handler() -> axum::Json<serde_json::Value> {
+            axum::Json(json!({
+                "code": 200,
+                "result": true
+            }))
+        }
+
+        Router::new()
+            .route("/chatapi/chat/save", post(save_handler))
+            .route("/chatapi/chat/message", post(message_handler))
+            .route("/chatapi/chat/message/{id}", post(message_response_handler))
+            .route("/chatapi/chat/delete", post(delete_handler))
+            .with_state(reply)
+    }
+
     async fn tool_compiler_handler(
         State(counter): State<Arc<AtomicUsize>>,
     ) -> axum::Json<serde_json::Value> {
@@ -2114,6 +2826,101 @@ mod tests {
                 "completion_tokens": 2
             }
         }))
+    }
+
+    #[tokio::test]
+    async fn test_ouyi7_anthropic_messages_supports_tools() {
+        let mock_router = ouyi7_mock_router_with_reply(concat!(
+            "<|tool▁calls▁begin|>",
+            "[{\"name\":\"Bash\",\"arguments\":{\"command\":\"pwd\"}}]",
+            "<|tool▁calls▁end|>"
+        ))
+        .await;
+        let base_url = spawn_mock_router(mock_router).await;
+        let state = make_v7_test_state(base_url, None);
+
+        let mut req = make_request_with_tools();
+        req.stream = Some(false);
+        req.tools = Some(vec![bash_tool()]);
+        let routing = resolve_model_routing(&req.model, &state.model_mapper);
+
+        let response = handle_ouyi7_message(state, req, routing).await.unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        let value: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(value["stop_reason"], "tool_use");
+        assert_eq!(value["content"][0]["type"], "tool_use");
+        assert_eq!(value["content"][0]["name"], "Bash");
+        assert_eq!(value["usage"]["input_tokens"], 0);
+        assert_eq!(value["usage"]["output_tokens"], 0);
+    }
+
+    #[tokio::test]
+    async fn test_ouyi7_anthropic_tools_final_answer_without_compiler_config() {
+        let mock_router = ouyi7_mock_router_with_reply("你好！有什么我可以帮你的吗？").await;
+        let base_url = spawn_mock_router(mock_router).await;
+        let state = make_v7_test_state(base_url, None);
+
+        let mut req = make_request_with_tools();
+        req.stream = Some(false);
+        req.tools = Some(vec![bash_tool()]);
+        let routing = resolve_model_routing(&req.model, &state.model_mapper);
+
+        let response = handle_ouyi7_message(state, req, routing).await.unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        let value: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(value["stop_reason"], "end_turn");
+        assert_eq!(value["content"][0]["type"], "text");
+        assert!(
+            value["content"][0]["text"]
+                .as_str()
+                .unwrap()
+                .contains("你好")
+        );
+        assert_eq!(value["usage"]["input_tokens"], 0);
+        assert_eq!(value["usage"]["output_tokens"], 0);
+    }
+
+    #[tokio::test]
+    async fn test_ouyi7_anthropic_tool_result_continues_to_final_text() {
+        let mock_router = ouyi7_mock_router_with_reply("目录里有 Cargo.toml。").await;
+        let base_url = spawn_mock_router(mock_router).await;
+        let state = make_v7_test_state(base_url, None);
+
+        let mut req = make_request_with_tools();
+        req.stream = Some(false);
+        req.tools = Some(vec![bash_tool()]);
+        req.messages.push(AnthropicMessage {
+            role: "assistant".to_string(),
+            content: AnthropicContent::Blocks(vec![ContentBlock::ToolUse {
+                id: "toolu_1".to_string(),
+                name: "Bash".to_string(),
+                input: json!({"command": "pwd"}),
+            }]),
+        });
+        req.messages.push(make_tool_result_msg(
+            "toolu_1",
+            "D:\\document\\Projects\\ouyi-api",
+        ));
+        let routing = resolve_model_routing(&req.model, &state.model_mapper);
+
+        let response = handle_ouyi7_message(state, req, routing).await.unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        let value: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(value["stop_reason"], "end_turn");
+        assert!(
+            value["content"][0]["text"]
+                .as_str()
+                .unwrap()
+                .contains("Cargo.toml")
+        );
+        assert_eq!(value["usage"]["input_tokens"], 0);
+        assert_eq!(value["usage"]["output_tokens"], 0);
     }
 
     #[tokio::test]
@@ -2194,7 +3001,10 @@ mod tests {
         let ouyi_base_url = spawn_mock_router(
             Router::new()
                 .route("/api/chat/session", post(ouyi_session_handler))
-                .route("/api/chat/completions", post(ouyi_plain_tool_intent_handler)),
+                .route(
+                    "/api/chat/completions",
+                    post(ouyi_plain_tool_intent_handler),
+                ),
         )
         .await;
         let tool_base_url = spawn_mock_router(
@@ -2210,7 +3020,9 @@ mod tests {
         req.tools = Some(vec![bash_tool()]);
         let routing = resolve_model_routing(&req.model, &state.model_mapper);
 
-        let response = handle_compiler_tool_runtime_message(state, req, routing).await.unwrap();
+        let response = handle_compiler_tool_runtime_message(state, req, routing)
+            .await
+            .unwrap();
         assert_eq!(response.status(), StatusCode::OK);
         assert_eq!(tool_requests.load(Ordering::SeqCst), 1);
 
@@ -2295,10 +3107,7 @@ mod tests {
 
         assert_eq!(ouyi_requests.load(Ordering::SeqCst), 1);
         assert_eq!(tool_requests.load(Ordering::SeqCst), 0);
-        assert_eq!(
-            value["content"][0]["type"],
-            "tool_use"
-        );
+        assert_eq!(value["content"][0]["type"], "tool_use");
     }
 
     #[tokio::test]
@@ -2476,6 +3285,7 @@ mod tests {
 
     fn make_anthropic_config() -> crate::config::ToolRuntimeConfig {
         crate::config::ToolRuntimeConfig {
+            enabled: true,
             mode: crate::config::ToolRuntimeMode::Compiler,
             provider: crate::config::ToolRuntimeProvider::Anthropic,
             base_url: Some("https://api.anthropic.com".to_string()),
@@ -2488,6 +3298,7 @@ mod tests {
 
     fn make_compiler_config() -> crate::config::ToolRuntimeConfig {
         crate::config::ToolRuntimeConfig {
+            enabled: true,
             mode: crate::config::ToolRuntimeMode::Compiler,
             provider: crate::config::ToolRuntimeProvider::OpenaiCompatible,
             base_url: Some("https://api.openai.com/v1".to_string()),
@@ -2496,6 +3307,26 @@ mod tests {
             model: Some("gpt-4".to_string()),
             timeout_secs: 120,
         }
+    }
+
+    #[tokio::test]
+    async fn test_anthropic_compiler_missing_jwt_records_error_and_clears_active_request() {
+        let mut config = test_config(
+            "http://127.0.0.1:1".to_string(),
+            "http://127.0.0.1:2".to_string(),
+        );
+        config.ouyi.jwt_token.clear();
+        let state = make_test_state(config);
+        let req = make_request_with_tools();
+        let routing = resolve_model_routing(&req.model, &state.model_mapper);
+
+        let err = handle_compiler_tool_runtime_message(state.clone(), req, routing)
+            .await
+            .unwrap_err();
+
+        assert!(matches!(err, AppError::BadRequest(_)));
+        assert_eq!(state.stats.stats.active_requests.load(Ordering::Relaxed), 0);
+        assert_eq!(state.stats.stats.failed_requests.load(Ordering::Relaxed), 1);
     }
 
     #[test]
@@ -2532,6 +3363,7 @@ mod tests {
     fn test_runtime_route_legacy_native_openai_still_uses_compiler() {
         let req = make_request_with_tools();
         let config = crate::config::ToolRuntimeConfig {
+            enabled: true,
             mode: crate::config::ToolRuntimeMode::Native,
             provider: crate::config::ToolRuntimeProvider::OpenaiCompatible,
             base_url: None,
@@ -2548,6 +3380,7 @@ mod tests {
     fn test_runtime_route_compiler_anthropic_uses_compiler() {
         let req = make_request_with_tools();
         let config = crate::config::ToolRuntimeConfig {
+            enabled: true,
             mode: crate::config::ToolRuntimeMode::Compiler,
             provider: crate::config::ToolRuntimeProvider::Anthropic,
             base_url: None,
@@ -2570,7 +3403,10 @@ mod tests {
 
         assert_eq!(routing.client_model, "claude-sonnet-4-5");
         assert_eq!(routing.effective_model, "claude-sonnet-4-5");
-        assert_eq!(routing.ouyi_model, "claude_chat::claude-sonnet-4-5-20250929-vip");
+        assert_eq!(
+            routing.ouyi_model,
+            "claude_chat::claude-sonnet-4-5-20250929-vip"
+        );
     }
 
     #[test]
@@ -2583,5 +3419,146 @@ mod tests {
         assert_eq!(routing.client_model, "unknown-model-xyz");
         assert_eq!(routing.effective_model, "unknown-model-xyz");
         assert_eq!(routing.ouyi_model, "unknown-model-xyz");
+    }
+
+    fn write_tool() -> AnthropicTool {
+        AnthropicTool {
+            name: "Write".to_string(),
+            description: "Write a file".to_string(),
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "file_path": {"type": "string"},
+                    "content": {"type": "string"}
+                },
+                "required": ["file_path", "content"]
+            }),
+        }
+    }
+
+    async fn ouyi_payload_write_handler() -> axum::response::Response {
+        ouyi_sse_response(concat!(
+            "准备将报告写入文件。\n",
+            "<ouyi_payload id=\"p1\">\n",
+            "# 报告\n",
+            "\"quote\"\n",
+            "</ouyi_payload>\n",
+            "将 payload p1 写入 docs/report.md。"
+        ))
+    }
+
+    async fn tool_compiler_write_payload_handler(
+        State(counter): State<Arc<AtomicUsize>>,
+    ) -> axum::Json<serde_json::Value> {
+        counter.fetch_add(1, Ordering::SeqCst);
+        axum::Json(json!({
+            "choices": [{
+                "message": {
+                    "tool_calls": [{
+                        "id": "call_from_tool_model",
+                        "type": "function",
+                        "function": {
+                            "name": "Write",
+                            "arguments": "{\"file_path\":\"docs/report.md\",\"content_ref\":\"p1\"}"
+                        }
+                    }]
+                }
+            }],
+            "usage": {
+                "prompt_tokens": 10,
+                "completion_tokens": 5
+            }
+        }))
+    }
+
+    async fn tool_compiler_bad_arguments_handler(
+        State(counter): State<Arc<AtomicUsize>>,
+    ) -> axum::Json<serde_json::Value> {
+        counter.fetch_add(1, Ordering::SeqCst);
+        axum::Json(json!({
+            "choices": [{
+                "message": {
+                    "tool_calls": [{
+                        "id": "call_bad",
+                        "type": "function",
+                        "function": {
+                            "name": "Write",
+                            "arguments": "{\"file_path\":\"docs/report.md\",\"content\":\""
+                        }
+                    }]
+                }
+            }]
+        }))
+    }
+
+    #[tokio::test]
+    async fn test_payload_write_tool_use_preserves_ouyi_content() {
+        let tool_requests = Arc::new(AtomicUsize::new(0));
+        let ouyi_base_url = spawn_mock_router(
+            Router::new()
+                .route("/api/chat/session", post(ouyi_session_handler))
+                .route("/api/chat/completions", post(ouyi_payload_write_handler)),
+        )
+        .await;
+        let tool_base_url = spawn_mock_router(
+            Router::new()
+                .route(
+                    "/chat/completions",
+                    post(tool_compiler_write_payload_handler),
+                )
+                .with_state(tool_requests.clone()),
+        )
+        .await;
+
+        let state = make_test_state(test_config(ouyi_base_url, tool_base_url));
+        let mut req = make_request_with_tools();
+        req.stream = Some(false);
+        req.tools = Some(vec![write_tool()]);
+        let routing = resolve_model_routing(&req.model, &state.model_mapper);
+
+        let response = handle_compiler_tool_runtime_message(state, req, routing)
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(tool_requests.load(Ordering::SeqCst), 1);
+
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        let value: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(value["stop_reason"], "tool_use");
+        assert_eq!(value["content"][0]["type"], "tool_use");
+        assert_eq!(value["content"][0]["name"], "Write");
+        assert_eq!(value["content"][0]["input"]["content"], "# 报告\n\"quote\"");
+        assert_eq!(value["content"][0]["input"]["file_path"], "docs/report.md");
+    }
+
+    #[tokio::test]
+    async fn test_tool_compiler_bad_arguments_does_not_return_400() {
+        let tool_requests = Arc::new(AtomicUsize::new(0));
+        let ouyi_base_url = spawn_mock_router(
+            Router::new()
+                .route("/api/chat/session", post(ouyi_session_handler))
+                .route("/api/chat/completions", post(ouyi_payload_write_handler)),
+        )
+        .await;
+        let tool_base_url = spawn_mock_router(
+            Router::new()
+                .route(
+                    "/chat/completions",
+                    post(tool_compiler_bad_arguments_handler),
+                )
+                .with_state(tool_requests.clone()),
+        )
+        .await;
+
+        let state = make_test_state(test_config(ouyi_base_url, tool_base_url));
+        let mut req = make_request_with_tools();
+        req.stream = Some(false);
+        req.tools = Some(vec![write_tool()]);
+        let routing = resolve_model_routing(&req.model, &state.model_mapper);
+
+        let response = handle_compiler_tool_runtime_message(state, req, routing)
+            .await
+            .unwrap();
+        assert_ne!(response.status(), axum::http::StatusCode::BAD_REQUEST);
     }
 }

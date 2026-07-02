@@ -108,6 +108,7 @@ export interface RuntimeLogsResponse {
 export interface ToolRuntimeLog {
   timestamp: string;
   request_id: string;
+  endpoint: string;
   mode: string;
   provider: string;
   model: string;
@@ -148,6 +149,17 @@ export interface AccountStatus {
   error_count: number;
 }
 
+export type OuyiPlatform = 'ouyi7' | 'ouyi8';
+
+export interface PlatformStatus {
+  platform: OuyiPlatform;
+  label: string;
+  base_url: string;
+  model_count: number;
+  token_valid: boolean;
+  last_selected_at?: string;
+}
+
 export interface AdminStatusResponse {
   accounts: AccountStatus[];
   total: number;
@@ -155,6 +167,7 @@ export interface AdminStatusResponse {
   busy: number;
   error: number;
   invalid: number;
+  platform: PlatformStatus;
 }
 
 export interface StatsSnapshot {
@@ -251,6 +264,26 @@ export interface ApiKeyEntry {
   description: string;
 }
 
+export interface CategorizedModelsResponse {
+  platform: OuyiPlatform;
+  categories: CategorizedModelGroup[];
+}
+
+export interface Ouyi7Config {
+  base_url: string;
+  chatapi_prefix: string;
+  jwt_token: string;
+  default_model: string;
+  model_refresh_interval_secs: number;
+  max_history_messages: number;
+  simulated_stream_chunk_chars: number;
+}
+
+export interface PlatformConfig {
+  default: OuyiPlatform;
+  prompt_on_start: boolean;
+}
+
 export interface FullConfig {
   server: ServerConfig;
   deepseek: DeepSeekConfig;
@@ -259,6 +292,9 @@ export interface FullConfig {
   accounts: AccountEntry[];
   api_keys: ApiKeyEntry[];
   tool_runtime: ToolRuntimeConfig;
+  openai_tool_runtime: ToolRuntimeConfig;
+  platform: PlatformConfig | null;
+  ouyi_v7: Ouyi7Config | null;
 }
 
 // ── Config API ────────────────────────────────────────────────────────────
@@ -276,6 +312,13 @@ export async function apiSaveConfig(config: Record<string, unknown>): Promise<{ 
 
 export async function apiTestToolRuntime(config: ToolRuntimeConfig): Promise<ToolRuntimeTestResponse> {
   return apiFetch<ToolRuntimeTestResponse>('/admin/api/tool-runtime/test', {
+    method: 'POST',
+    body: JSON.stringify(config),
+  });
+}
+
+export async function apiTestOpenAiToolRuntime(config: ToolRuntimeConfig): Promise<ToolRuntimeTestResponse> {
+  return apiFetch<ToolRuntimeTestResponse>('/admin/api/openai-tool-runtime/test', {
     method: 'POST',
     body: JSON.stringify(config),
   });
@@ -310,8 +353,8 @@ export async function apiFetchModels(): Promise<ModelListResponse> {
   return apiFetch<ModelListResponse>('/admin/api/models');
 }
 
-export async function apiFetchCategorizedModels(): Promise<CategorizedModelGroup[]> {
-  return apiFetch<CategorizedModelGroup[]>('/admin/api/models/categorized');
+export async function apiFetchCategorizedModels(): Promise<CategorizedModelsResponse> {
+  return apiFetch<CategorizedModelsResponse>('/admin/api/models/categorized');
 }
 
 export async function apiFetchModelsOpenAI(): Promise<ModelListResponse> {

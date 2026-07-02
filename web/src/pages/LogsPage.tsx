@@ -290,6 +290,7 @@ function ToolRuntimeLogsTab() {
           <TableHeader>
             <TableRow>
               <TableHead>{t('logs.requestLogs.time')}</TableHead>
+              <TableHead>{t('logs.toolRuntimeLogs.endpoint', { defaultValue: 'Endpoint' })}</TableHead>
               <TableHead>{t('logs.toolRuntimeLogs.provider', { defaultValue: 'Provider' })}</TableHead>
               <TableHead>{t('logs.requestLogs.model')}</TableHead>
               <TableHead>{t('logs.toolRuntimeLogs.decision')}</TableHead>
@@ -305,6 +306,18 @@ function ToolRuntimeLogsTab() {
               <TableRow key={i}>
                 <TableCell className="text-xs text-muted-foreground whitespace-nowrap">
                   {log.timestamp}
+                </TableCell>
+                <TableCell>
+                  <Badge
+                    variant="outline"
+                    className={`text-xs ${
+                      log.endpoint === 'openai'
+                        ? 'bg-purple-500/15 text-purple-700 border-purple-200'
+                        : 'bg-orange-500/15 text-orange-700 border-orange-200'
+                    }`}
+                  >
+                    {log.endpoint}
+                  </Badge>
                 </TableCell>
                 <TableCell className="text-xs font-mono">{log.provider}</TableCell>
                 <TableCell className="text-xs font-mono">{log.model}</TableCell>
@@ -341,14 +354,14 @@ function ToolRuntimeLogsTab() {
             ))}
             {isLoading && (
               <TableRow>
-                <TableCell colSpan={9} className="text-center text-muted-foreground py-8">
+                <TableCell colSpan={10} className="text-center text-muted-foreground py-8">
                   {t('logs.requestLogs.loading')}
                 </TableCell>
               </TableRow>
             )}
             {logs && logs.length === 0 && (
               <TableRow>
-                <TableCell colSpan={9} className="text-center text-muted-foreground py-8">
+                <TableCell colSpan={10} className="text-center text-muted-foreground py-8">
                   {t('logs.toolRuntimeLogs.empty', { defaultValue: 'No tool runtime logs' })}
                 </TableCell>
               </TableRow>

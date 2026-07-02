@@ -1,8 +1,10 @@
 use serde::{Deserialize, Serialize};
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Deserialize, Default)]
 pub struct TmplResponse {
+    #[serde(default)]
     pub code: i32,
+    #[serde(default)]
     pub msg: String,
     pub data: Option<TmplData>,
 }

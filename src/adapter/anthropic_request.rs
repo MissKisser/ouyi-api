@@ -9,43 +9,25 @@ pub struct OuyiRequest {
 }
 
 const TOOL_CALL_FORMAT: &str = concat!(
-    "## 工具调用（必须严格遵守）\n\n",
-    "当用户的任务需要使用工具才能完成时，你必须调用工具。禁止猜测你不知道的信息、直接回答需要实时数据的问题、或假装已有答案。\n\n",
-    "### 格式\n",
+    "## 工具协作协议\n\n",
+    "你是主脑模型，负责判断任务、生成报告、代码、方案和文件正文。系统会在服务端将你的工具意图转换为 Claude Code 工具调用。\n\n",
+    "### 长文本 payload\n",
+    "当你需要通过 Write、Edit、MultiEdit 等工具提交长文本字段时，正文写在 payload 块中：\n",
     "```text\n",
-    "<|tool▁calls▁begin|>\n",
-    "[{\"name\": \"工具名\", \"arguments\": {\"参数名\": \"值\"}}]\n",
-    "<|tool▁calls▁end|>\n",
+    "<ouyi_payload id=\"p1\">\n",
+    "这里写入完整正文，包含换行、引号、代码块均可。\n",
+    "</ouyi_payload>\n",
     "```\n\n",
-    "单个工具用单个 JSON 对象，多个工具用 JSON 数组。\n\n",
-    "### 规则\n",
-    "1. 标记之间只能包含 JSON 对象或 JSON 数组\n",
-    "2. 单次回复只能有一个标记块，多工具以数组形式放在同一块内\n",
-    "3. 标记之前你可以先思考要调用哪个工具以及参数（<think>...</think>），然后直接输出工具调用标记\n",
-    "4. 不能包裹在 markdown 代码块（```json 等）中——标记内的 JSON 必须裸写\n",
-    "5. JSON 必须包含 \"name\"（字符串）和 \"arguments\"（JSON 对象）字段\n",
-    "6. arguments 键名必须用双引号，值必须是合法 JSON 类型\n",
-    "7. 不允许注释或尾部逗号\n",
-    "8. 工具调用之后不要附带任何解释文字\n",
-    "9. 如果你确信不需要调用工具即可完整回答，正常回复即可（但涉及文件系统、网络、外部命令时必须调用工具）\n",
-    "10. 永远不要编造 <tool_result> 标签——工具结果由系统自动注入\n",
-    "11. arguments 的值必须是纯文本，禁止 markdown/LaTeX\n\n",
-    "### 工具动作意图\n",
-    "如果你无法稳定输出 JSON 标记，也必须用自然语言明确表达工具动作，例如：\n",
-    "- 需要执行命令时：\"执行命令：你的命令\"\n",
-    "- 需要读取文件时：\"读取文件 路径\"\n",
-    "系统会解析这些自然语言意图并转换为对应的工具调用。\n\n",
-    "### 长时任务协议\n",
-    "如果命令需要长时间运行（如 sleep、Start-Sleep 等），请在命令末尾添加信号：\n",
-    "```text\n",
-    "<|tool▁calls▁begin|>[{\"name\": \"Bash\", \"arguments\": {\"command\": \"你的命令 && echo DONE > 标记文件.txt\", \"description\": \"长时任务描述\"}}]<|tool▁calls▁end|>\n",
-    "```\n",
-    "系统会自动轮询标记文件，检测 \"DONE\" 信号以判断任务是否完成。\n",
+    "随后用自然语言说明工具意图，例如：将 payload p1 写入 docs/report.md。\n\n",
+    "### 短工具意图\n",
+    "需要执行命令时，可以写：执行命令：你的命令\n",
+    "需要读取文件时，可以写：读取文件 路径\n\n",
+    "### 工具协议层\n",
+    "工具模型只会编译工具调用协议，不会生成或改写 payload 正文。长文本字段会以 content_ref、old_string_ref、new_string_ref 引用 payload id。\n"
 );
 
-const TOOL_CALL_REMINDER: &str = concat!(
-    "\n\n【工具调用提醒】如果你无法仅凭已有知识完成当前任务，请思考需要调用哪个工具，然后直接输出工具调用标记。不要犹豫，直接行动。",
-);
+const TOOL_CALL_REMINDER: &str = "\n\n【工具调用提醒】如果需要使用工具，请表达工具意图；长文本放入 ouyi_payload，服务端会转换为 Claude Code 工具调用。";
+const TOOL_RESULT_CONTENT_MAX_BYTES: usize = 64 * 1024;
 
 fn truncate_utf8_by_byte_limit_with_notice(content: &str, max_bytes: usize) -> String {
     if content.len() <= max_bytes {
@@ -81,9 +63,14 @@ fn build_tool_instruction_block(tools: &[AnthropicTool]) -> String {
 
 fn format_tool(tool: &AnthropicTool) -> String {
     let params = format_tool_params(tool);
+    let example = if matches!(tool.name.as_str(), "Write" | "Edit" | "MultiEdit") {
+        "长文本字段使用 <ouyi_payload id=\"p1\">...</ouyi_payload>，工具协议层使用 content_ref 或 *_ref 引用。".to_string()
+    } else {
+        format!("参数示例: {}", params)
+    };
     format!(
-        "- **{}** (function)\n  - 调用示例: `<|tool▁calls▁begin|>[{{\"name\": \"{}\", \"arguments\": {}}}]<|tool▁calls▁end|>`\n  - 说明:\n~~~markdown\n{}\n~~~\n  - 参数:\n{}",
-        tool.name, tool.name, params, tool.description, params
+        "- **{}** (function)\n  - 说明:\n~~~markdown\n{}\n~~~\n  - {}\n",
+        tool.name, tool.description, example
     )
 }
 
@@ -237,8 +224,10 @@ pub fn convert_anthropic_request(
                                 .get(tool_use_id)
                                 .map(|s| s.as_str())
                                 .unwrap_or(tool_use_id);
-                            let display_content =
-                                truncate_utf8_by_byte_limit_with_notice(content, 2000);
+                            let display_content = truncate_utf8_by_byte_limit_with_notice(
+                                content,
+                                TOOL_RESULT_CONTENT_MAX_BYTES,
+                            );
                             role_texts.push(format!(
                                 "[Tool Result for {}]:\n<tool_result name=\"{}\">\n{}\n</tool_result>\n[End of tool result for {}. Continue.]",
                                 tool_name, tool_name, display_content, tool_name
@@ -274,8 +263,7 @@ pub fn convert_anthropic_request(
                 "\n\n[System]: 你必须使用工具来完成当前任务。只能回复工具调用，不能回复文字。",
             );
         }
-        // 借鉴 ds-free-api: 末尾注入不闭合的 <think> 块，让工具格式紧邻模型生成位置
-        text.push_str("\n\n<think>\n现在开始分析任务。如果需要使用工具，我必须按照以下格式输出：\n\n<|tool\u{2581}calls\u{2581}begin|>\n[{\"name\": \"工具名\", \"arguments\": {\"参数名\": \"值\"}}]\n<|tool\u{2581}calls\u{2581}end|>\n\n");
+        text.push_str("\n\n<think>\n现在开始分析任务。需要工具时，请表达工具意图；长文本工具字段使用 ouyi_payload 块承载正文。\n\n");
     }
 
     let thinking = should_thinking || model_full.contains("-thinking");
@@ -360,7 +348,7 @@ mod tests {
     }
 
     #[test]
-    fn test_tool_result_truncation_handles_multibyte_text() {
+    fn test_tool_result_preserves_typical_multibyte_file_output() {
         let req = make_req(AnthropicContent::Blocks(vec![ContentBlock::ToolResult {
             tool_use_id: "tool_1".to_string(),
             content: "方".repeat(1000),
@@ -368,7 +356,23 @@ mod tests {
 
         let result = convert_anthropic_request(&req, "test", false).unwrap();
 
-        assert!(result.text.contains("[...内容截断，共 1000 字符...]"));
+        assert!(!result.text.contains("内容截断"));
+        assert!(result.text.contains(&"方".repeat(1000)));
+    }
+
+    #[test]
+    fn test_tool_result_truncates_extreme_output_with_notice() {
+        let req = make_req(AnthropicContent::Blocks(vec![ContentBlock::ToolResult {
+            tool_use_id: "tool_1".to_string(),
+            content: "x".repeat(TOOL_RESULT_CONTENT_MAX_BYTES + 1),
+        }]));
+
+        let result = convert_anthropic_request(&req, "test", false).unwrap();
+
+        assert!(result.text.contains(&format!(
+            "内容截断，共 {} 字符",
+            TOOL_RESULT_CONTENT_MAX_BYTES + 1
+        )));
     }
 
     #[test]
@@ -411,15 +415,33 @@ mod tests {
             }),
         }];
         let block = build_tool_instruction_block(&tools);
-        assert!(block.contains("工具调用"));
-        assert!(block.contains("tool\u{2581}calls\u{2581}begin"));
+        assert!(block.contains("工具协作协议"));
+        assert!(block.contains("ouyi_payload"));
         assert!(block.contains("bash"));
         assert!(block.contains("Execute a command"));
         assert!(block.contains("必填"));
-        assert!(block.contains("工具动作意图"));
-        assert!(block.contains("执行命令"));
-        assert!(block.contains("长时任务协议"));
-        assert!(block.contains("echo DONE"));
+        assert!(block.contains("短工具意图"));
+    }
+
+    #[test]
+    fn test_tool_instruction_uses_payload_protocol() {
+        let tools = vec![AnthropicTool {
+            name: "Write".to_string(),
+            description: "Write file".to_string(),
+            input_schema: serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "file_path": {"type": "string"},
+                    "content": {"type": "string"}
+                },
+                "required": ["file_path", "content"]
+            }),
+        }];
+        let block = build_tool_instruction_block(&tools);
+        assert!(block.contains("<ouyi_payload id=\"p1\">"));
+        assert!(block.contains("content_ref"));
+        assert!(!block.contains("直接输出工具调用标记"));
+        assert!(!block.contains("<|tool\u{2581}calls\u{2581}begin|>[{\"name\": \"Write\""));
     }
 
     #[test]

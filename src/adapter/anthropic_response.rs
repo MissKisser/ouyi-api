@@ -410,6 +410,7 @@ impl AnthropicStreamConverter {
                     content_block: ContentBlockStart::ToolUse {
                         id: id.to_string(),
                         name: name.to_string(),
+                        input: serde_json::json!({}),
                     },
                 }));
                 self.current_block_type = Some(BlockType::ToolUse);
@@ -742,6 +743,11 @@ mod tests {
             "应包含 tool_use 块: {}",
             joined
         );
+        assert!(
+            joined.contains(r#""input":{}"#),
+            "tool_use 起始块应包含空 input: {}",
+            joined
+        );
         assert!(joined.contains("get_weather"), "应包含工具名: {}", joined);
         assert!(
             joined.contains("partial_json"),
@@ -768,7 +774,7 @@ mod tests {
         );
     }
 
-    /// 验证 has_tool_use 为 true 后，后续文本被忽略（防止混杂输出）
+    /// 验证 has_tool_use 为 true 后，后续文本被忽略。
     #[test]
     fn test_stream_converter_ignores_text_after_tool_use() {
         let mut conv = AnthropicStreamConverter::new("test-model".into(), "msg_1".into());

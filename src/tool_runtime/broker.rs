@@ -1,11 +1,33 @@
-use crate::adapter::tool_call::ToolCallParser;
+use crate::adapter::tool_call::{ToolCallParser, repair_json};
 use crate::config::ToolRuntimeConfig;
 use crate::error::AppError;
-use crate::model::anthropic::AnthropicTool;
 use crate::model::anthropic::MessagesRequest;
+use crate::tool_runtime::protocol::ToolSpec;
 
 fn broker_id() -> String {
     format!("call_broker_{}", uuid::Uuid::new_v4().simple())
+}
+
+fn parse_arguments_json(arguments: &str, tool_name: &str) -> Option<serde_json::Value> {
+    if let Ok(v) = serde_json::from_str(arguments) {
+        return Some(v);
+    }
+    let repaired = repair_json(arguments)?;
+    match serde_json::from_str(&repaired) {
+        Ok(v) => {
+            tracing::info!(%tool_name, "工具参数 JSON 已自动整理");
+            Some(v)
+        }
+        Err(e) => {
+            tracing::warn!(
+                %tool_name,
+                arguments_len = arguments.len(),
+                %e,
+                "工具参数 JSON 解析失败，跳过该工具调用"
+            );
+            None
+        }
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -27,13 +49,13 @@ pub struct BrokerToolCall {
     pub input: serde_json::Value,
 }
 
-pub fn find_tool<'a>(tools: &'a [AnthropicTool], name: &str) -> Option<&'a AnthropicTool> {
+pub fn find_tool<'a>(tools: &'a [ToolSpec], name: &str) -> Option<&'a ToolSpec> {
     tools.iter().find(|tool| tool.name == name)
 }
 
 pub fn parse_marked_tool_calls(
     ouyi_output: &str,
-    tools: &[AnthropicTool],
+    tools: &[ToolSpec],
 ) -> Result<Vec<BrokerToolCall>, String> {
     let mut parser = ToolCallParser::new();
     let parsed = parser.process_chunk(ouyi_output);
@@ -48,13 +70,14 @@ pub fn parse_marked_tool_calls(
             .filter(|name| !name.is_empty())
             .ok_or_else(|| "工具调用缺少 name".to_string())?;
         if find_tool(tools, &name).is_none() {
-            return Err(format!("未知工具: {}", name));
+            tracing::warn!(%name, "主模型输出未知工具，已跳过");
+            continue;
         }
-        let arguments = func
-            .arguments
-            .unwrap_or_else(|| "{}".to_string());
-        let input: serde_json::Value = serde_json::from_str(&arguments)
-            .map_err(|e| format!("工具参数不是合法 JSON: {}", e))?;
+        let arguments = func.arguments.unwrap_or_else(|| "{}".to_string());
+        let input = match parse_arguments_json(&arguments, &name) {
+            Some(v) => v,
+            None => continue,
+        };
         calls.push(BrokerToolCall {
             id: broker_id(),
             name,
@@ -72,7 +95,8 @@ fn extract_explicit_command(raw: &str) -> Option<String> {
     let text = raw.trim();
     if let Some(start) = text.find("```") {
         let after = &text[start + 3..];
-        let after = after.strip_prefix("powershell\n")
+        let after = after
+            .strip_prefix("powershell\n")
             .or_else(|| after.strip_prefix("bash\n"))
             .or_else(|| after.strip_prefix("sh\n"))
             .or_else(|| after.strip_prefix("powershell\r\n"))
@@ -89,17 +113,26 @@ fn extract_explicit_command(raw: &str) -> Option<String> {
         return None;
     }
     let command = text.trim_matches('`').trim();
-    if command.is_empty() { None } else { Some(command.to_string()) }
+    if command.is_empty() {
+        None
+    } else {
+        Some(command.to_string())
+    }
 }
 
 pub fn parse_rule_tool_intent(
     ouyi_output: &str,
-    tools: &[AnthropicTool],
+    tools: &[ToolSpec],
 ) -> Result<Vec<BrokerToolCall>, String> {
     let text = ouyi_output.trim();
 
     if find_tool(tools, "Bash").is_some() {
-        for marker in ["执行命令：", "执行命令:", "Bash 执行命令：", "Bash 执行命令:"] {
+        for marker in [
+            "执行命令：",
+            "执行命令:",
+            "Bash 执行命令：",
+            "Bash 执行命令:",
+        ] {
             if let Some((_, after_marker)) = text.rsplit_once(marker) {
                 if let Some(command) = extract_explicit_command(after_marker) {
                     return Ok(vec![BrokerToolCall {
@@ -170,22 +203,29 @@ fn detect_powershell_set_content(command: &str) -> Option<(String, String)> {
         .or_else(|| after.split("-Path").nth(1))
         .and_then(|tail| {
             let trimmed = tail.trim();
-            let end = trimmed
-                .find(" -")
-                .unwrap_or(trimmed.len());
-            Some(trimmed[..end].trim().trim_matches('"').trim_matches('\'').to_string())
+            let end = trimmed.find(" -").unwrap_or(trimmed.len());
+            Some(
+                trimmed[..end]
+                    .trim()
+                    .trim_matches('"')
+                    .trim_matches('\'')
+                    .to_string(),
+            )
         })?;
 
-    let marker = after
-        .split("-Value")
-        .nth(1)
-        .and_then(|tail| {
-            let trimmed = tail.trim();
-            let end = trimmed
-                .find(" -")
-                .unwrap_or(trimmed.find(';').unwrap_or(trimmed.len()));
-            Some(trimmed[..end].trim().trim_matches('"').trim_matches('\'').to_string())
-        })?;
+    let marker = after.split("-Value").nth(1).and_then(|tail| {
+        let trimmed = tail.trim();
+        let end = trimmed
+            .find(" -")
+            .unwrap_or(trimmed.find(';').unwrap_or(trimmed.len()));
+        Some(
+            trimmed[..end]
+                .trim()
+                .trim_matches('"')
+                .trim_matches('\'')
+                .to_string(),
+        )
+    })?;
 
     if !path.is_empty() && !marker.is_empty() {
         Some((path, marker))
@@ -228,10 +268,7 @@ pub fn detect_long_task(call: &BrokerToolCall) -> Option<LongTaskPlan> {
     None
 }
 
-pub fn build_poll_call(
-    plan: &LongTaskPlan,
-    tools: &[AnthropicTool],
-) -> Result<BrokerToolCall, String> {
+pub fn build_poll_call(plan: &LongTaskPlan, tools: &[ToolSpec]) -> Result<BrokerToolCall, String> {
     if find_tool(tools, "Bash").is_none() {
         return Err("长时任务轮询需要 Bash 工具".to_string());
     }
@@ -239,11 +276,7 @@ pub fn build_poll_call(
     let marker = plan.done_marker.replace('\'', "'\\''");
     let command = format!(
         "sleep {}; if test -f '{}' && grep -q '{}' '{}'; then cat '{}'; else echo PENDING; fi",
-        plan.interval_secs,
-        escaped_path,
-        marker,
-        escaped_path,
-        escaped_path
+        plan.interval_secs, escaped_path, marker, escaped_path, escaped_path
     );
     Ok(BrokerToolCall {
         id: broker_id(),
@@ -264,6 +297,8 @@ pub enum LongTaskResult {
 pub fn classify_long_task_result(content: &str, done_marker: &str) -> LongTaskResult {
     if content.contains(done_marker) {
         LongTaskResult::Done
+    } else if let Some(message) = content.trim().strip_prefix("FAILED:") {
+        LongTaskResult::Failed(message.trim().to_string())
     } else if content.contains("PENDING") || content.trim().is_empty() {
         LongTaskResult::Pending
     } else {
@@ -277,33 +312,47 @@ pub async fn decide_with_broker(
     req: &MessagesRequest,
     ouyi_output: &str,
 ) -> Result<BrokerDecision, AppError> {
-    let tools = req.tools.as_deref().unwrap_or(&[]);
+    let tool_specs: Vec<ToolSpec> = req
+        .tools
+        .as_ref()
+        .map(|tools| crate::tool_runtime::protocol::anthropic_tools_to_specs(tools.as_slice()))
+        .unwrap_or_default();
 
-    let marked = parse_marked_tool_calls(ouyi_output, tools)
-        .map_err(AppError::BadRequest)?;
+    let payload_extraction = crate::tool_runtime::payload::extract_payloads(ouyi_output);
+    let decision_text = payload_extraction.sanitized_text.as_str();
+
+    let marked =
+        parse_marked_tool_calls(decision_text, &tool_specs).map_err(AppError::BadRequest)?;
     if !marked.is_empty() {
         return Ok(BrokerDecision::ToolCalls(marked));
     }
 
-    let rule_calls = parse_rule_tool_intent(ouyi_output, tools)
-        .map_err(AppError::BadRequest)?;
+    let rule_calls =
+        parse_rule_tool_intent(decision_text, &tool_specs).map_err(AppError::BadRequest)?;
     if !rule_calls.is_empty() {
         return Ok(BrokerDecision::ToolCalls(rule_calls));
     }
 
     let Some(config) = tool_runtime_config else {
-        return Err(AppError::Config(
-            "无法解析工具意图且未配置工具编译器".to_string(),
-        ));
+        return Ok(BrokerDecision::FinalAnswer { usage: None });
     };
 
-    let compiled = crate::tool_runtime::openai_compiler::compile_tool_decision_with_usage(
-        http_client,
-        config,
-        req,
-        ouyi_output,
-    )
-    .await?;
+    let compiled =
+        match crate::tool_runtime::openai_compiler::compile_tool_decision_with_usage_and_payloads(
+            http_client,
+            config,
+            req,
+            decision_text,
+            payload_extraction.payloads,
+        )
+        .await
+        {
+            Ok(compiled) => compiled,
+            Err(e) => {
+                tracing::warn!(error = %e, "工具协议编译失败，降级为主脑文本");
+                return Ok(BrokerDecision::FinalAnswer { usage: None });
+            }
+        };
 
     match compiled.decision {
         crate::tool_runtime::openai_compiler::CompilerDecision::ToolCalls(calls) => {
@@ -333,8 +382,8 @@ pub async fn decide_with_broker(
 mod tests {
     use super::*;
 
-    fn bash_tool() -> AnthropicTool {
-        AnthropicTool {
+    fn bash_spec() -> ToolSpec {
+        ToolSpec {
             name: "Bash".to_string(),
             description: "Run shell command".to_string(),
             input_schema: serde_json::json!({
@@ -350,7 +399,7 @@ mod tests {
 
     #[test]
     fn test_find_tool_by_name_is_case_sensitive() {
-        let tools = vec![bash_tool()];
+        let tools = vec![bash_spec()];
         let found = find_tool(&tools, "Bash").unwrap();
         assert_eq!(found.name, "Bash");
         assert!(find_tool(&tools, "bash").is_none());
@@ -358,7 +407,7 @@ mod tests {
 
     #[test]
     fn test_parse_marked_ouyi_tool_call() {
-        let tools = vec![bash_tool()];
+        let tools = vec![bash_spec()];
         let output = concat!(
             "<|tool▁calls▁begin|>",
             "[{\"name\":\"Bash\",\"arguments\":{\"command\":\"pwd\",\"description\":\"print cwd\"}}]",
@@ -373,21 +422,22 @@ mod tests {
     }
 
     #[test]
-    fn test_parse_marked_tool_call_rejects_unknown_tool() {
-        let tools = vec![bash_tool()];
+    fn test_parse_marked_tool_call_skips_unknown_tool() {
+        let tools = vec![bash_spec()];
         let output = concat!(
             "<|tool▁calls▁begin|>",
             "[{\"name\":\"Nope\",\"arguments\":{\"command\":\"pwd\"}}]",
             "<|tool▁calls▁end|>"
         );
 
-        let err = parse_marked_tool_calls(output, &tools).unwrap_err();
-        assert!(err.contains("未知工具"));
+        let calls = parse_marked_tool_calls(output, &tools).unwrap();
+
+        assert!(calls.is_empty());
     }
 
     #[test]
     fn test_rule_parse_bash_intent() {
-        let tools = vec![bash_tool()];
+        let tools = vec![bash_spec()];
         let output = "需要使用 Bash 执行命令：pwd";
 
         let calls = parse_rule_tool_intent(output, &tools).unwrap();
@@ -398,7 +448,7 @@ mod tests {
 
     #[test]
     fn test_rule_parse_read_intent() {
-        let tools = vec![AnthropicTool {
+        let tools = vec![ToolSpec {
             name: "Read".to_string(),
             description: "Read file".to_string(),
             input_schema: serde_json::json!({
@@ -417,17 +467,16 @@ mod tests {
 
     #[test]
     fn test_rule_parse_bash_rejects_multiline_natural_language() {
-        let tools = vec![bash_tool()];
-        let calls = parse_rule_tool_intent(
-            "需要执行命令：pwd\n然后读取 probe.txt 分析结果",
-            &tools,
-        ).unwrap();
+        let tools = vec![bash_spec()];
+        let calls =
+            parse_rule_tool_intent("需要执行命令：pwd\n然后读取 probe.txt 分析结果", &tools)
+                .unwrap();
         assert!(calls.is_empty());
     }
 
     #[test]
     fn test_rule_parse_bash_accepts_single_line_command() {
-        let tools = vec![bash_tool()];
+        let tools = vec![bash_spec()];
         let calls = parse_rule_tool_intent("执行命令：pwd", &tools).unwrap();
         assert_eq!(calls.len(), 1);
         assert_eq!(calls[0].name, "Bash");
@@ -436,8 +485,9 @@ mod tests {
 
     #[test]
     fn test_rule_parse_bash_accepts_fenced_command() {
-        let tools = vec![bash_tool()];
-        let calls = parse_rule_tool_intent("执行命令：```powershell\nGet-Location\n```", &tools).unwrap();
+        let tools = vec![bash_spec()];
+        let calls =
+            parse_rule_tool_intent("执行命令：```powershell\nGet-Location\n```", &tools).unwrap();
         assert_eq!(calls.len(), 1);
         assert_eq!(calls[0].name, "Bash");
         assert_eq!(calls[0].input["command"], "Get-Location");
@@ -460,7 +510,7 @@ mod tests {
 
     #[test]
     fn test_build_poll_call_checks_done_marker() {
-        let tools = vec![bash_tool()];
+        let tools = vec![bash_spec()];
         let plan = LongTaskPlan {
             file_path: "longtask.txt".to_string(),
             done_marker: "DONE_MARKER".to_string(),
@@ -492,7 +542,7 @@ mod tests {
 
     #[test]
     fn test_build_poll_call_reads_expected_file() {
-        let tools = vec![bash_tool()];
+        let tools = vec![bash_spec()];
         let plan = LongTaskPlan {
             file_path: "longtask.txt".to_string(),
             done_marker: "DONE".to_string(),
@@ -502,13 +552,27 @@ mod tests {
 
         let call = build_poll_call(&plan, &tools).unwrap();
         assert_eq!(call.name, "Bash");
-        assert!(call.input["command"].as_str().unwrap().contains("longtask.txt"));
+        assert!(
+            call.input["command"]
+                .as_str()
+                .unwrap()
+                .contains("longtask.txt")
+        );
     }
 
     #[test]
     fn test_classify_long_task_result() {
-        assert!(matches!(classify_long_task_result("PENDING", "DONE"), LongTaskResult::Pending));
-        assert!(matches!(classify_long_task_result("DONE", "DONE"), LongTaskResult::Done));
-        assert!(matches!(classify_long_task_result("some error output", "DONE"), LongTaskResult::Pending));
+        assert!(matches!(
+            classify_long_task_result("PENDING", "DONE"),
+            LongTaskResult::Pending
+        ));
+        assert!(matches!(
+            classify_long_task_result("DONE", "DONE"),
+            LongTaskResult::Done
+        ));
+        assert!(matches!(
+            classify_long_task_result("some error output", "DONE"),
+            LongTaskResult::Pending
+        ));
     }
 }

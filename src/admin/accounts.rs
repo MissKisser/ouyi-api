@@ -114,13 +114,14 @@ impl AccountStore {
             };
 
             let should_use = match rt.state {
-                AccountState::Idle => true,
-                AccountState::Error { count } if count < 3 => true,
-                _ => false,
+                AccountState::Invalid => false,
+                AccountState::Error { count } if count >= 3 => false,
+                _ => true,
             };
 
             if should_use {
-                rt.state = AccountState::Busy;
+                rt.request_count += 1;
+                rt.last_used_at = Some(std::time::SystemTime::now());
                 return Some(token.clone());
             }
         }
@@ -201,4 +202,35 @@ pub struct PoolStats {
     pub busy: usize,
     pub error: usize,
     pub invalid: usize,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn account(email: &str, token: &str) -> AccountEntry {
+        AccountEntry {
+            email: email.to_string(),
+            mobile: String::new(),
+            area_code: String::new(),
+            password: String::new(),
+            token: Some(token.to_string()),
+            enabled: true,
+        }
+    }
+
+    #[tokio::test]
+    async fn get_next_token_keeps_jwt_account_reusable() {
+        let store = AccountStore::new();
+        store
+            .set_accounts(vec![account("a@example.com", "jwt-a")])
+            .await;
+
+        assert_eq!(store.get_next_token().await.as_deref(), Some("jwt-a"));
+        assert_eq!(store.get_next_token().await.as_deref(), Some("jwt-a"));
+
+        let stats = store.pool_stats().await;
+        assert_eq!(stats.idle, 1);
+        assert_eq!(stats.busy, 0);
+    }
 }
