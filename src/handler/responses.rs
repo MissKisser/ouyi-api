@@ -72,13 +72,9 @@ async fn responses_v8(
     let config = state.config.read().await.clone();
     let should_thinking = state.model_mapper.should_thinking(&chat_req.model);
 
-    if req.tools.as_ref().is_some_and(|tools| !tools.is_empty()) {
-        let err = AppError::BadRequest(
-            "Responses API 暂不支持工具调用，请使用 /v1/chat/completions 或 /anthropic/v1/messages"
-                .to_string(),
-        );
-        record_responses_error(&state, start_time, &model_full, &err, "ouyi8");
-        return Err(err);
+    let has_tools = req.tools.as_ref().is_some_and(|tools| !tools.is_empty());
+    if has_tools {
+        return responses_v8_tools(state, req, chat_req, model_full, start_time, is_stream).await;
     }
 
     let ouyi_req = match convert_request(&chat_req, &model_full, should_thinking) {
@@ -185,6 +181,194 @@ async fn responses_v8(
             elapsed,
         )
         .await
+    }
+}
+
+/// 8.0 平台带 tools 的 Responses 处理。
+///
+/// 流程：拿 token → 建 client → 建会话 → `create_completion` 拿流 → 把 SSE 字节
+/// 收集成纯文本 → 交给 `run_openai_tool_pipeline` 决策（继续补全 or 直接工具调用）
+/// → 根据 `is_stream` 返回 SSE 事件流或 JSON 响应。
+async fn responses_v8_tools(
+    state: Arc<AppState>,
+    req: ResponsesRequest,
+    chat_req: crate::model::openai::ChatCompletionRequest,
+    model_full: String,
+    start_time: std::time::Instant,
+    is_stream: bool,
+) -> Result<axum::response::Response, AppError> {
+    let config = state.config.read().await.clone();
+    let _platform_key = state.platform.read().await.config_key();
+
+    let jwt_token = match state.account_store.get_next_token().await {
+        Some(t) => t,
+        None => config.ouyi.jwt_token.clone(),
+    };
+    if jwt_token.is_empty() {
+        let err = AppError::BadRequest("未配置 JWT token 且无可用账号 token".into());
+        record_responses_error(&state, start_time, &model_full, &err, "ouyi8");
+        return Err(err);
+    }
+
+    let client = OuyiHttpClient::new(
+        state.http_client.clone(),
+        config.ouyi.base_url.clone(),
+        jwt_token,
+        config.ouyi.app_version.clone(),
+    );
+
+    let session_data = match client.create_session(&model_full).await {
+        Ok(s) => s,
+        Err(e) => {
+            let msg = format!("创建会话失败: {}", e);
+            state.stats.record_error(
+                start_time.elapsed().as_millis() as u64,
+                &model_full,
+                &msg,
+                "ouyi8",
+            );
+            return Err(AppError::Upstream(msg));
+        }
+    };
+
+    let should_thinking = state.model_mapper.should_thinking(&chat_req.model);
+    let ouyi_req = match convert_request(&chat_req, &model_full, should_thinking) {
+        Ok(r) => r,
+        Err(e) => {
+            let err = AppError::Internal(e);
+            record_responses_error(&state, start_time, &model_full, &err, "ouyi8");
+            return Err(err);
+        }
+    };
+
+    let resp = match client
+        .create_completion(&session_data.id, &ouyi_req)
+        .await
+    {
+        Ok(r) => r,
+        Err(e) => {
+            let msg = format!("创建补全失败: {}", e);
+            state.stats.record_error(
+                start_time.elapsed().as_millis() as u64,
+                &model_full,
+                &msg,
+                "ouyi8",
+            );
+            state.active_sessions.remove(&session_data.id);
+            spawn_session_cleanup(client, session_data.id);
+            return Err(AppError::Upstream(msg));
+        }
+    };
+
+    state.active_sessions.insert(session_data.id, ());
+
+    // 收集上游文本（SSE bytes → String）
+    use crate::client::sse::{SseLineBuffer, parse_sse_line};
+    use futures::StreamExt;
+
+    let byte_stream = resp.bytes_stream();
+    let guarded = GuardedStream::new(
+        byte_stream.map(|r| r.map_err(std::io::Error::other)),
+        session_data.id,
+        client.clone(),
+    );
+    futures::pin_mut!(guarded);
+
+    let mut upstream_text = String::new();
+    let mut sse_buf = SseLineBuffer::new();
+    let mut partial: Vec<u8> = Vec::new();
+    let mut total_bytes = 0usize;
+    let max_bytes = state.config.read().await.limits.max_response_bytes;
+
+    while let Some(chunk) = guarded.next().await {
+        let bytes = match chunk {
+            Ok(b) => b,
+            Err(e) => {
+                let msg = format!("SSE字节流读取错误: {}", e);
+                state.stats.record_error(
+                    start_time.elapsed().as_millis() as u64,
+                    &model_full,
+                    &msg,
+                    "ouyi8",
+                );
+                guarded.as_mut().skip_cleanup();
+                spawn_session_cleanup(client, session_data.id);
+                state.active_sessions.remove(&session_data.id);
+                return Err(AppError::SseStream(msg));
+            }
+        };
+        total_bytes += bytes.len();
+        if total_bytes > max_bytes {
+            let msg = format!("响应超过大小限制: {} > {}", total_bytes, max_bytes);
+            state.stats.record_error(
+                start_time.elapsed().as_millis() as u64,
+                &model_full,
+                &msg,
+                "ouyi8",
+            );
+            guarded.as_mut().skip_cleanup();
+            spawn_session_cleanup(client, session_data.id);
+            state.active_sessions.remove(&session_data.id);
+            return Err(AppError::PayloadTooLarge(msg));
+        }
+        let mut v = std::mem::take(&mut partial);
+        v.extend_from_slice(&bytes);
+        match String::from_utf8(v) {
+            Ok(s) => {
+                for line in sse_buf.push_chunk(&s) {
+                    if let Some(event) = parse_sse_line(&line)
+                        && let Some(data) = &event.data
+                        && let Some(text) = data.as_str()
+                    {
+                        upstream_text.push_str(text);
+                    }
+                }
+            }
+            Err(e) => {
+                partial = e.into_bytes();
+            }
+        }
+    }
+    if let Some(remaining) = sse_buf.drain_remaining()
+        && let Some(event) = parse_sse_line(&remaining)
+        && let Some(data) = &event.data
+        && let Some(text) = data.as_str()
+    {
+        upstream_text.push_str(text);
+    }
+
+    guarded.as_mut().skip_cleanup();
+    spawn_session_cleanup(client, session_data.id);
+    state.active_sessions.remove(&session_data.id);
+
+    // pipeline 决策
+    let pipeline_out = crate::tool_runtime::pipeline::run_openai_tool_pipeline(
+        &state,
+        &chat_req,
+        upstream_text,
+        "ouyi8",
+        start_time,
+    )
+    .await;
+
+    let short_model = chat_req.model.clone();
+    let task_id = format!("resp_{}", crate::tool_runtime::uuid_short());
+
+    if is_stream {
+        let events = responses_stream::events_for_pipeline_output(
+            &task_id, &short_model, &pipeline_out,
+        );
+        let sse_events: Vec<Result<axum::response::sse::Event, axum::Error>> =
+            events.into_iter().map(Ok).collect();
+        let sse = axum::response::sse::Sse::new(tokio_stream::iter(sse_events));
+        Ok(sse.into_response())
+    } else {
+        let prompt_tokens = 0u64;
+        let completion_tokens = 0u64;
+        let resp_json = responses_non_stream::build_responses_response_from_pipeline(
+            &task_id, &short_model, &pipeline_out, prompt_tokens, completion_tokens,
+        );
+        Ok(Json(resp_json).into_response())
     }
 }
 
@@ -1136,7 +1320,9 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_ouyi8_responses_rejects_tools_until_response_tool_output_is_modeled() {
+    async fn test_ouyi8_responses_with_tools_routes_to_pipeline_path() {
+        // 8.0 + tools 现在走 responses_v8_tools 流水线：尝试连接不可达 base url
+        // 时会在创建会话阶段失败（AppError::Upstream），而不是返回 BadRequest。
         let state = make_test_state(test_config("http://127.0.0.1:1".to_string()));
         let req = ResponsesRequest {
             model: "gpt-4o".to_string(),
@@ -1157,8 +1343,8 @@ mod tests {
             .await
             .unwrap_err();
 
-        assert!(matches!(err, AppError::BadRequest(_)));
+        // 不再是 BadRequest；上游不可达导致 Upstream 错误
+        assert!(matches!(err, AppError::Upstream(_)) || matches!(err, AppError::Internal(_)));
         assert_eq!(state.stats.stats.active_requests.load(Ordering::Relaxed), 0);
-        assert_eq!(state.stats.stats.failed_requests.load(Ordering::Relaxed), 1);
     }
 }

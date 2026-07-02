@@ -1,3 +1,4 @@
+use crate::adapter::request::OuyiRequest;
 use crate::error::AppError;
 use crate::model::ouyi::{
     ChatRequest, CreateSessionRequest, CreateSessionResponse, SessionData, TmplResponse,
@@ -116,6 +117,21 @@ impl OuyiHttpClient {
             .map_err(|e| AppError::Upstream(format!("聊天请求失败: {}", e)))?;
 
         Ok(resp)
+    }
+
+    /// 接受 `OuyiRequest`，把 system_prompt 拼成 `[System]: ...\n\n{text}`，
+    /// 然后走与 `chat_stream` 一样的 8.0 `/api/chat/completions` SSE 流。
+    pub async fn create_completion(
+        &self,
+        session_id: &i64,
+        ouyi_req: &OuyiRequest,
+    ) -> Result<reqwest::Response, AppError> {
+        let final_text = match &ouyi_req.system_prompt {
+            Some(sys_prompt) => format!("[System]: {}\n\n{}", sys_prompt, ouyi_req.text),
+            None => ouyi_req.text.clone(),
+        };
+        self.chat_stream(*session_id, final_text, ouyi_req.thinking)
+            .await
     }
 
     pub async fn verify_token(&self) -> Result<bool, AppError> {
