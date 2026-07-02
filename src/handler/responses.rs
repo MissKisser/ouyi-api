@@ -394,11 +394,9 @@ async fn responses_v7(
 
     let max_history = v7_config.max_history_messages;
 
-    // 7.0 不支持工具
-    if req.tools.is_some() {
-        let err = AppError::BadRequest("7.0 平台暂不支持工具调用".to_string());
-        record_responses_error(&state, start_time, &model_full, &err, platform_key);
-        return Err(err);
+    let has_tools = req.tools.as_ref().is_some_and(|tools| !tools.is_empty());
+    if has_tools {
+        return responses_v7_tools(state, req, chat_req, model_full, start_time).await;
     }
 
     let ouyi_input = match crate::adapter::ouyi_v7_request::from_openai_chat(
@@ -460,6 +458,88 @@ async fn responses_v7(
             platform_key,
         )
         .await
+    }
+}
+
+/// 7.0 平台带 tools 的 Responses 处理。
+async fn responses_v7_tools(
+    state: Arc<AppState>,
+    req: ResponsesRequest,
+    chat_req: ChatCompletionRequest,
+    model_full: String,
+    start_time: std::time::Instant,
+) -> Result<axum::response::Response, AppError> {
+    let config = state.config.read().await.clone();
+    let v7_config = config
+        .ouyi_v7
+        .clone()
+        .ok_or_else(|| AppError::Internal("未配置 ouyi_v7".to_string()))?;
+    let platform_key = state.platform.read().await.config_key();
+
+    let ouyi_input = match crate::adapter::ouyi_v7_request::from_openai_chat(
+        &chat_req,
+        model_full.clone(),
+        v7_config.max_history_messages,
+    ) {
+        Ok(i) => i,
+        Err(e) => {
+            record_responses_error(&state, start_time, &model_full, &e, platform_key);
+            return Err(e);
+        }
+    };
+
+    let client = {
+        let ouyi_client = state.ouyi_client.read().await;
+        match &*ouyi_client {
+            crate::client::OuyiClient::V7(c) => c.clone(),
+            crate::client::OuyiClient::V8(_) => {
+                let err = AppError::Internal("当前运行客户端不是 7.0".to_string());
+                record_responses_error(&state, start_time, &model_full, &err, platform_key);
+                return Err(err);
+            }
+        }
+    };
+
+    let text = match client.chat_once(&ouyi_input).await {
+        Ok(t) => t,
+        Err(e) => {
+            let msg = format!("7.0 聊天请求失败: {}", e);
+            state.stats.record_error(
+                start_time.elapsed().as_millis() as u64,
+                &model_full,
+                &msg,
+                platform_key,
+            );
+            return Err(AppError::Upstream(msg));
+        }
+    };
+
+    let pipeline_out = crate::tool_runtime::pipeline::run_openai_tool_pipeline(
+        &state,
+        &chat_req,
+        text,
+        "ouyi7",
+        start_time,
+    )
+    .await;
+
+    let short_model = chat_req.model.clone();
+    let task_id = format!("resp_{}", crate::tool_runtime::uuid_short());
+    let is_stream = req.stream;
+
+    if is_stream {
+        let events = responses_stream::events_for_pipeline_output(
+            &task_id, &short_model, &pipeline_out,
+        );
+        let sse_events: Vec<Result<axum::response::sse::Event, axum::Error>> =
+            events.into_iter().map(Ok).collect();
+        let sse = axum::response::sse::Sse::new(tokio_stream::iter(sse_events));
+        Ok(sse.into_response())
+    } else {
+        let resp_json = responses_non_stream::build_responses_response_from_pipeline(
+            &task_id, &short_model, &pipeline_out, 0, 0,
+        );
+        Ok(Json(resp_json).into_response())
     }
 }
 
