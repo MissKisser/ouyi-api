@@ -15,17 +15,13 @@ use crate::adapter::openai_tool_response::{
 };
 use crate::adapter::request::convert_request;
 use crate::adapter::response::{SseCollector, StreamConverter};
-use crate::admin::stats::{ToolRuntimeDecision, ToolRuntimeMode as StatsToolRuntimeMode};
 use crate::client::http::OuyiHttpClient;
 use crate::client::session::{GuardedStream, spawn_session_cleanup};
 use crate::client::sse::{SseLineBuffer, parse_sse_line};
 use crate::error::AppError;
 use crate::model::openai::ChatCompletionRequest;
 use crate::platform::OuyiPlatform;
-use crate::tool_runtime::broker::{
-    self, BrokerToolCall, LongTaskResult, classify_long_task_result, detect_long_task,
-};
-use crate::tool_runtime::decision::{ToolDecisionMode, ToolTextDecision};
+use crate::tool_runtime::broker::{self, LongTaskResult, classify_long_task_result};
 use crate::tool_runtime::openai_compiler::CompiledToolCall;
 use crate::tool_runtime::protocol::openai_tools_to_specs;
 
@@ -864,85 +860,24 @@ async fn handle_openai_tools_plain_output(
     let task_id = format!("chatcmpl-{}", uuid_short());
     let elapsed = start_time.elapsed().as_millis() as u64;
 
-    let config = state.config.read().await.openai_tool_runtime.clone();
-    let runtime_started = std::time::Instant::now();
-
-    let decision = match crate::tool_runtime::decision::decide_openai_tools_from_text(
-        state.http_client.clone(),
-        config.as_ref(),
+    let pipeline_out = crate::tool_runtime::pipeline::run_openai_tool_pipeline(
+        &state,
         &req,
-        &ouyi_output,
+        ouyi_output,
+        platform_key,
+        start_time,
     )
-    .await
-    {
-        Ok(decision) => decision,
-        Err(e) => {
-            record_chat_error(&state, start_time, &short_model, &e, platform_key);
-            return Err(e);
-        }
-    };
+    .await;
 
-    match decision {
-        ToolTextDecision::ToolCalls { calls, meta } => {
-            for call in &calls {
-                let call_key = format!("{}:{}", short_model, call.id);
-                if let Err(e) = state
-                    .tool_ledger
-                    .record_tool_use(&call_key, &call.id, &call.name)
-                {
-                    record_chat_error(&state, start_time, &short_model, &e, platform_key);
-                    return Err(e);
-                }
-
-                let broker_call = BrokerToolCall {
-                    id: call.id.clone(),
-                    name: call.name.clone(),
-                    input: call.input.clone(),
-                };
-                if let Some(plan) = detect_long_task(&broker_call) {
-                    if let Err(e) = state.tool_ledger.attach_long_task(
-                        &call_key,
-                        plan.file_path,
-                        plan.done_marker,
-                        plan.max_polls,
-                    ) {
-                        record_chat_error(&state, start_time, &short_model, &e, platform_key);
-                        return Err(e);
-                    }
-                }
-            }
-
-            if meta.mode != ToolDecisionMode::None {
-                let mode = match meta.mode {
-                    ToolDecisionMode::Broker => StatsToolRuntimeMode::Broker,
-                    ToolDecisionMode::Compiler => StatsToolRuntimeMode::Compiler,
-                    ToolDecisionMode::None => unreachable!(),
-                };
-                let decision_type = ToolRuntimeDecision::ToolCalls;
-                let tool_names: Vec<String> = calls.iter().map(|c| c.name.clone()).collect();
-                state.stats.record_tool_runtime_success(
-                    &task_id,
-                    "openai",
-                    mode,
-                    &meta.provider,
-                    &meta.model,
-                    &meta.base_url,
-                    decision_type,
-                    tool_names,
-                    meta.usage.prompt_tokens,
-                    meta.usage.completion_tokens,
-                    runtime_started.elapsed().as_millis() as u64,
-                );
-            }
-
+    match pipeline_out {
+        crate::tool_runtime::pipeline::PipelineOutput::ToolCalls { calls, meta: _ } => {
             state.stats.record_success(
                 elapsed,
                 prompt_tokens,
                 completion_tokens,
                 &short_model,
-                &platform_key,
+                platform_key,
             );
-
             if req.stream {
                 build_openai_tool_call_stream_response(&short_model, &task_id, calls)
             } else {
@@ -956,40 +891,14 @@ async fn handle_openai_tools_plain_output(
                 Ok(Json(response).into_response())
             }
         }
-        ToolTextDecision::FinalAnswer { meta } => {
-            if meta.mode == ToolDecisionMode::Compiler {
-                let mode = StatsToolRuntimeMode::Compiler;
-                let decision_type = ToolRuntimeDecision::FinalAnswer;
-                state.stats.record_tool_runtime_success(
-                    &task_id,
-                    "openai",
-                    mode,
-                    &meta.provider,
-                    &meta.model,
-                    &meta.base_url,
-                    decision_type,
-                    Vec::new(),
-                    meta.usage.prompt_tokens,
-                    meta.usage.completion_tokens,
-                    runtime_started.elapsed().as_millis() as u64,
-                );
-            }
-
-            state.stats.record_success(
-                elapsed,
-                prompt_tokens,
-                completion_tokens,
-                &short_model,
-                &platform_key,
-            );
-
+        crate::tool_runtime::pipeline::PipelineOutput::FinalAnswer { text, meta: _ } => {
             if req.stream {
-                build_openai_text_stream_response(&short_model, &task_id, &ouyi_output)
+                build_openai_text_stream_response(&short_model, &task_id, &text)
             } else {
                 let response = build_openai_text_response(
                     &short_model,
                     &task_id,
-                    &ouyi_output,
+                    &text,
                     prompt_tokens,
                     completion_tokens,
                 );
