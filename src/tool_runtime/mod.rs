@@ -15,7 +15,7 @@ pub mod payload;
 pub mod protocol;
 pub mod schema;
 
-fn uuid_short() -> String {
+pub(crate) fn uuid_short() -> String {
     use std::time::{SystemTime, UNIX_EPOCH};
     let ts = SystemTime::now()
         .duration_since(UNIX_EPOCH)
