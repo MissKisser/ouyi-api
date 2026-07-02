@@ -8,12 +8,13 @@ use crate::tool_runtime::openai_compiler::CompiledToolCall;
 use crate::tool_runtime::pipeline::PipelineOutput;
 
 /// 从 pipeline 输出构造非流式 Responses 响应。
+/// `usage_override` 在调用方已知 Ouyi 上游 token 计数时传入；
+/// 传 `None` 时使用 pipeline meta 中的工具模型 usage 作为兜底。
 pub fn build_responses_response_from_pipeline(
     task_id: &str,
     model: &str,
     output: &PipelineOutput,
-    prompt_tokens: u64,
-    completion_tokens: u64,
+    usage_override: Option<(u64, u64)>,
 ) -> ResponsesResponse {
     let created_at = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -25,6 +26,13 @@ pub fn build_responses_response_from_pipeline(
         PipelineOutput::FinalAnswer { text, .. } => build_message_item(text),
     };
 
+    let (input_tokens, output_tokens) = usage_override.unwrap_or_else(|| {
+        let meta = match output {
+            PipelineOutput::ToolCalls { meta, .. } | PipelineOutput::FinalAnswer { meta, .. } => meta,
+        };
+        (meta.prompt_tokens, meta.completion_tokens)
+    });
+
     ResponsesResponse {
         id: task_id.to_string(),
         object: "response".to_string(),
@@ -32,9 +40,9 @@ pub fn build_responses_response_from_pipeline(
         model: model.to_string(),
         output: items,
         usage: ResponseUsage {
-            input_tokens: prompt_tokens,
-            output_tokens: completion_tokens,
-            total_tokens: prompt_tokens + completion_tokens,
+            input_tokens,
+            output_tokens,
+            total_tokens: input_tokens + output_tokens,
         },
     }
 }
@@ -95,7 +103,7 @@ mod tests {
             text: "hello".into(),
             meta: meta_dummy(),
         };
-        let resp = build_responses_response_from_pipeline("resp_1", "gpt-test", &out, 5, 2);
+        let resp = build_responses_response_from_pipeline("resp_1", "gpt-test", &out, Some((5, 2)));
         assert_eq!(resp.output.len(), 1);
         assert_eq!(resp.output[0].item_type, "message");
         assert_eq!(resp.output[0].content[0].text, "hello");
@@ -122,7 +130,7 @@ mod tests {
             calls,
             meta: meta_dummy(),
         };
-        let resp = build_responses_response_from_pipeline("resp_1", "gpt-test", &out, 10, 5);
+        let resp = build_responses_response_from_pipeline("resp_1", "gpt-test", &out, Some((10, 5)));
         assert_eq!(resp.output.len(), 2);
         for item in &resp.output {
             assert_eq!(item.item_type, "function_call");
@@ -139,15 +147,43 @@ mod tests {
     }
 
     #[test]
-    fn usage_tokens_round_trip_into_response_usage() {
+    fn usage_override_takes_precedence_over_meta() {
         let out = PipelineOutput::FinalAnswer {
             text: "x".into(),
-            meta: meta_dummy(),
+            meta: PipelineMeta {
+                provider: "x".into(),
+                model: "y".into(),
+                base_url: None,
+                prompt_tokens: 0,
+                completion_tokens: 0,
+                platform_key: "ouyi8".into(),
+                short_model: "gpt-test".into(),
+            },
         };
-        let resp = build_responses_response_from_pipeline("r", "m", &out, 7, 3);
+        let resp = build_responses_response_from_pipeline("r", "m", &out, Some((7, 3)));
         assert_eq!(resp.usage.input_tokens, 7);
         assert_eq!(resp.usage.output_tokens, 3);
         assert_eq!(resp.usage.total_tokens, 10);
+    }
+
+    #[test]
+    fn usage_falls_back_to_meta_when_no_override() {
+        let out = PipelineOutput::FinalAnswer {
+            text: "x".into(),
+            meta: PipelineMeta {
+                provider: "x".into(),
+                model: "y".into(),
+                base_url: None,
+                prompt_tokens: 11,
+                completion_tokens: 4,
+                platform_key: "ouyi8".into(),
+                short_model: "gpt-test".into(),
+            },
+        };
+        let resp = build_responses_response_from_pipeline("r", "m", &out, None);
+        assert_eq!(resp.usage.input_tokens, 11);
+        assert_eq!(resp.usage.output_tokens, 4);
+        assert_eq!(resp.usage.total_tokens, 15);
     }
 
     #[test]
@@ -156,7 +192,7 @@ mod tests {
             text: "x".into(),
             meta: meta_dummy(),
         };
-        let resp = build_responses_response_from_pipeline("resp_xyz", "claude-test", &out, 0, 0);
+        let resp = build_responses_response_from_pipeline("resp_xyz", "claude-test", &out, None);
         assert_eq!(resp.id, "resp_xyz");
         assert_eq!(resp.model, "claude-test");
         assert_eq!(resp.object, "response");

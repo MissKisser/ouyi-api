@@ -7,14 +7,24 @@ use crate::AppState;
 use crate::model::openai::ChatCompletionRequest;
 use crate::tool_runtime::openai_compiler::CompiledToolCall;
 
+/// 工具流水线的可观测元数据。
+/// 设计为公共 API 表面，调用方（聊天 / 响应处理器）可在响应体或日志中透出。
+/// 当前仅 `prompt_tokens` / `completion_tokens` 被消费，其它字段预留供后续：
+/// - `provider` / `model` / `base_url`：工具模型来源（用于调试日志与统计页）
+/// - `platform_key` / `short_model`：客户端 → Ouyi 模型的映射
 #[derive(Debug, Clone)]
 pub struct PipelineMeta {
+    #[allow(dead_code)] // reserved for telemetry/debug
     pub provider: String,
+    #[allow(dead_code)] // reserved for telemetry/debug
     pub model: String,
+    #[allow(dead_code)] // reserved for telemetry/debug
     pub base_url: Option<String>,
     pub prompt_tokens: u64,
     pub completion_tokens: u64,
+    #[allow(dead_code)] // reserved for telemetry/debug
     pub platform_key: String,
+    #[allow(dead_code)] // reserved for telemetry/debug
     pub short_model: String,
 }
 
@@ -149,12 +159,47 @@ pub async fn run_openai_tool_pipeline(
                     runtime_started.elapsed().as_millis() as u64,
                 );
             }
+            tracing::info!(
+                provider = %dmeta.provider,
+                model = %dmeta.model,
+                base_url = %dmeta.base_url,
+                platform_key = platform_key,
+                short_model = %short_model,
+                call_count = calls.len(),
+                "openai tool pipeline: tool calls"
+            );
             PipelineOutput::ToolCalls {
                 calls,
                 meta: PipelineMeta::from_decision(&dmeta, platform_key, &short_model),
             }
         }
         ToolTextDecision::FinalAnswer { meta: dmeta } => {
+            tracing::info!(
+                provider = %dmeta.provider,
+                model = %dmeta.model,
+                base_url = %dmeta.base_url,
+                platform_key = platform_key,
+                short_model = %short_model,
+                "openai tool pipeline: final answer"
+            );
+            // 复刻 chat 路径原行为：Compiler 模式下额外记一次 tool_runtime stats
+            if dmeta.mode == ToolDecisionMode::Compiler {
+                use crate::admin::stats::{ToolRuntimeDecision, ToolRuntimeMode as StatsToolRuntimeMode};
+                let runtime_started = Instant::now();
+                state.stats.record_tool_runtime_success(
+                    "",
+                    "openai",
+                    StatsToolRuntimeMode::Compiler,
+                    &dmeta.provider,
+                    &dmeta.model,
+                    &dmeta.base_url,
+                    ToolRuntimeDecision::FinalAnswer,
+                    Vec::new(),
+                    dmeta.usage.prompt_tokens,
+                    dmeta.usage.completion_tokens,
+                    runtime_started.elapsed().as_millis() as u64,
+                );
+            }
             state.stats.record_success(
                 start_time.elapsed().as_millis() as u64,
                 dmeta.usage.prompt_tokens,

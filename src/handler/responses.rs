@@ -191,7 +191,7 @@ async fn responses_v8(
 /// → 根据 `is_stream` 返回 SSE 事件流或 JSON 响应。
 async fn responses_v8_tools(
     state: Arc<AppState>,
-    req: ResponsesRequest,
+    _req: ResponsesRequest,
     chat_req: crate::model::openai::ChatCompletionRequest,
     model_full: String,
     start_time: std::time::Instant,
@@ -231,12 +231,17 @@ async fn responses_v8_tools(
         }
     };
 
+    // 注册活跃会话：在 create_completion 之前插入，保证异常分支的 remove 不打错。
+    state.active_sessions.insert(session_data.id, ());
+
     let should_thinking = state.model_mapper.should_thinking(&chat_req.model);
     let ouyi_req = match convert_request(&chat_req, &model_full, should_thinking) {
         Ok(r) => r,
         Err(e) => {
             let err = AppError::Internal(e);
             record_responses_error(&state, start_time, &model_full, &err, "ouyi8");
+            state.active_sessions.remove(&session_data.id);
+            spawn_session_cleanup(client, session_data.id);
             return Err(err);
         }
     };
@@ -259,8 +264,6 @@ async fn responses_v8_tools(
             return Err(AppError::Upstream(msg));
         }
     };
-
-    state.active_sessions.insert(session_data.id, ());
 
     // 收集上游文本（SSE bytes → String）
     use crate::client::sse::{SseLineBuffer, parse_sse_line};
@@ -363,10 +366,9 @@ async fn responses_v8_tools(
         let sse = axum::response::sse::Sse::new(tokio_stream::iter(sse_events));
         Ok(sse.into_response())
     } else {
-        let prompt_tokens = 0u64;
-        let completion_tokens = 0u64;
+        // Ouyi 上游不发 usage 块，目前没有上游 token 计数可填；传 None 让函数读 pipeline meta
         let resp_json = responses_non_stream::build_responses_response_from_pipeline(
-            &task_id, &short_model, &pipeline_out, prompt_tokens, completion_tokens,
+            &task_id, &short_model, &pipeline_out, None,
         );
         Ok(Json(resp_json).into_response())
     }
@@ -537,7 +539,7 @@ async fn responses_v7_tools(
         Ok(sse.into_response())
     } else {
         let resp_json = responses_non_stream::build_responses_response_from_pipeline(
-            &task_id, &short_model, &pipeline_out, 0, 0,
+            &task_id, &short_model, &pipeline_out, None,
         );
         Ok(Json(resp_json).into_response())
     }
