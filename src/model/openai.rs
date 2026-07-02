@@ -221,7 +221,6 @@ pub struct ResponseUsage {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use serde_json::json;
 
     #[test]
     fn response_output_item_function_call_serializes_with_call_id_and_arguments() {
@@ -240,8 +239,8 @@ mod tests {
         assert_eq!(v["call_id"], "call_abc");
         assert_eq!(v["name"], "Bash");
         assert_eq!(v["arguments"], "{\"command\":\"ls\"}");
-        // content should be skipped or empty array
-        assert!(v.get("content").is_none() || v["content"].is_array());
+        // function_call 项的 content 始终序列化为空数组
+        assert_eq!(v["content"], serde_json::json!([]));
     }
 
     #[test]
