@@ -471,11 +471,6 @@ fn normalize_ouyi_display_text(text: &str, latest_user_text: Option<&str>) -> St
     normalize_plain_text(&parsed.normal_text, latest_user_text)
 }
 
-fn broker_error_to_final_answer_text(ouyi_output: &str) -> String {
-    let extracted = crate::tool_runtime::payload::extract_payloads(ouyi_output);
-    normalize_plain_text(&extracted.sanitized_text, None)
-}
-
 async fn request_final_answer_after_suppressed_tool_intent(
     client: &OuyiHttpClient,
     session_id: i64,
