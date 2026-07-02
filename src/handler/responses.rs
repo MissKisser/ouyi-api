@@ -20,6 +20,9 @@ use crate::platform::OuyiPlatform;
 #[path = "responses_stream.rs"]
 mod responses_stream;
 
+#[path = "responses_non_stream.rs"]
+mod responses_non_stream;
+
 pub async fn responses(
     State(state): State<Arc<AppState>>,
     Json(req): Json<ResponsesRequest>,
