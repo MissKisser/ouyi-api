@@ -31,18 +31,173 @@ pub enum PipelineOutput {
 }
 
 pub async fn run_openai_tool_pipeline(
-    _state: &AppState,
-    _request: &ChatCompletionRequest,
-    _upstream_output: String,
-    _platform_key: &str,
-    _start_time: Instant,
+    state: &AppState,
+    request: &ChatCompletionRequest,
+    upstream_output: String,
+    platform_key: &str,
+    start_time: Instant,
 ) -> PipelineOutput {
-    unimplemented!("pipeline 尚未实现")
+    use crate::tool_runtime::decision::{
+        ToolDecisionMode, ToolTextDecision, decide_openai_tools_from_text,
+    };
+
+    let runtime_cfg = state.config.read().await.openai_tool_runtime.clone();
+
+    // 阶段 A：决策
+    let decision = match decide_openai_tools_from_text(
+        state.http_client.clone(),
+        runtime_cfg.as_ref(),
+        request,
+        &upstream_output,
+    )
+    .await
+    {
+        Ok(d) => d,
+        Err(e) => {
+            tracing::error!(error = %e, "openai tool pipeline: decision failed");
+            return PipelineOutput::FinalAnswer {
+                text: upstream_output,
+                meta: PipelineMeta {
+                    provider: "error".into(),
+                    model: "error".into(),
+                    base_url: None,
+                    prompt_tokens: 0,
+                    completion_tokens: 0,
+                    platform_key: platform_key.into(),
+                    short_model: request.model.clone(),
+                },
+            };
+        }
+    };
+
+    // 阶段 D：构造 meta 的小工具
+    let build_meta = |short_model: String,
+                      provider: String,
+                      model: String,
+                      base_url: String,
+                      pt: u64,
+                      ct: u64| PipelineMeta {
+        provider,
+        model,
+        base_url: if base_url.is_empty() { None } else { Some(base_url) },
+        prompt_tokens: pt,
+        completion_tokens: ct,
+        platform_key: platform_key.into(),
+        short_model,
+    };
+
+    match decision {
+        ToolTextDecision::ToolCalls { calls, meta: dmeta } => {
+            // 阶段 B：ledger 写入
+            for call in &calls {
+                let call_key = format!("{}:{}", request.model, call.id);
+                if let Err(e) = state
+                    .tool_ledger
+                    .record_tool_use(&call_key, &call.id, &call.name)
+                {
+                    tracing::warn!(error = %e, call_id = %call.id, "ledger.record_tool_use failed; degrading to FinalAnswer");
+                    return PipelineOutput::FinalAnswer {
+                        text: upstream_output,
+                        meta: build_meta(
+                            request.model.clone(),
+                            dmeta.provider,
+                            dmeta.model,
+                            dmeta.base_url,
+                            dmeta.usage.prompt_tokens,
+                            dmeta.usage.completion_tokens,
+                        ),
+                    };
+                }
+                let broker_call = crate::tool_runtime::broker::BrokerToolCall {
+                    id: call.id.clone(),
+                    name: call.name.clone(),
+                    input: call.input.clone(),
+                };
+                if let Some(plan) = crate::tool_runtime::broker::detect_long_task(&broker_call) {
+                    if let Err(e) = state.tool_ledger.attach_long_task(
+                        &call_key,
+                        plan.file_path,
+                        plan.done_marker,
+                        plan.max_polls,
+                    ) {
+                        tracing::warn!(error = %e, "ledger.attach_long_task failed; continuing");
+                    }
+                }
+            }
+            // 阶段 D：记录 stats（tool_runtime 自身）
+            if dmeta.mode != ToolDecisionMode::None {
+                use crate::admin::stats::{ToolRuntimeDecision, ToolRuntimeMode as StatsToolRuntimeMode};
+                let mode = match dmeta.mode {
+                    ToolDecisionMode::Broker => StatsToolRuntimeMode::Broker,
+                    ToolDecisionMode::Compiler => StatsToolRuntimeMode::Compiler,
+                    ToolDecisionMode::None => unreachable!(),
+                };
+                let tool_names: Vec<String> = calls.iter().map(|c| c.name.clone()).collect();
+                let runtime_started = Instant::now();
+                state.stats.record_tool_runtime_success(
+                    "",
+                    "openai",
+                    mode,
+                    &dmeta.provider,
+                    &dmeta.model,
+                    &dmeta.base_url,
+                    ToolRuntimeDecision::ToolCalls,
+                    tool_names,
+                    dmeta.usage.prompt_tokens,
+                    dmeta.usage.completion_tokens,
+                    runtime_started.elapsed().as_millis() as u64,
+                );
+            }
+            PipelineOutput::ToolCalls {
+                calls,
+                meta: build_meta(
+                    request.model.clone(),
+                    dmeta.provider,
+                    dmeta.model,
+                    dmeta.base_url,
+                    dmeta.usage.prompt_tokens,
+                    dmeta.usage.completion_tokens,
+                ),
+            }
+        }
+        ToolTextDecision::FinalAnswer { meta: dmeta } => {
+            state.stats.record_success(
+                start_time.elapsed().as_millis() as u64,
+                dmeta.usage.prompt_tokens,
+                dmeta.usage.completion_tokens,
+                &request.model,
+                platform_key,
+            );
+            PipelineOutput::FinalAnswer {
+                text: upstream_output,
+                meta: build_meta(
+                    request.model.clone(),
+                    dmeta.provider,
+                    dmeta.model,
+                    dmeta.base_url,
+                    dmeta.usage.prompt_tokens,
+                    dmeta.usage.completion_tokens,
+                ),
+            }
+        }
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::config::{
+        AppConfig, LimitsConfig, Ouyi7Config, OuyiConfig, ServerConfig, ToolCallConfig,
+        ToolRuntimeConfig, ToolRuntimeMode, ToolRuntimeProvider,
+    };
+    use crate::platform::{OuyiPlatform, PlatformStatus};
+    use crate::tool_runtime::ToolLedger;
+    use crate::admin::auth::AdminStore;
+    use crate::admin::stats::StatsCollector;
+    use crate::model::mapper::ModelMapper;
+    use dashmap::DashMap;
+    use std::sync::Arc;
+    use tokio::sync::RwLock as AsyncRwLock;
 
     #[test]
     fn pipeline_meta_carries_compiler_usage_and_platform_key() {
@@ -84,6 +239,131 @@ mod tests {
                 assert_eq!(calls[0].name, "Bash");
             }
             _ => panic!("expected ToolCalls"),
+        }
+    }
+
+    /// 构造最小可用 AppState 用于 pipeline 单元测试。
+    /// 不依赖真实 OUYI，决策阶段只读 config.openai_tool_runtime。
+    fn test_state(runtime_cfg: Option<ToolRuntimeConfig>) -> Arc<AppState> {
+        let http_client = reqwest::Client::new();
+        let config = AppConfig {
+            server: ServerConfig {
+                host: "127.0.0.1".into(),
+                port: 0,
+            },
+            ouyi: OuyiConfig {
+                base_url: "http://localhost".into(),
+                jwt_token: "t".into(),
+                app_version: "3.0.3".into(),
+                model_refresh_interval_secs: 3600,
+            },
+            limits: LimitsConfig {
+                request_timeout_secs: 5,
+                no_data_timeout_secs: 5,
+                max_response_bytes: 1024,
+                max_messages_bytes: 1024,
+            },
+            admin: None,
+            tool_call: ToolCallConfig::default(),
+            tool_runtime: runtime_cfg.clone(),
+            openai_tool_runtime: runtime_cfg,
+            platform: None,
+            ouyi_v7: Some(Ouyi7Config {
+                base_url: "http://localhost".into(),
+                chatapi_prefix: "/chatapi".into(),
+                jwt_token: "t".into(),
+                default_model: "x".into(),
+                model_refresh_interval_secs: 3600,
+                max_history_messages: 20,
+                simulated_stream_chunk_chars: 80,
+            }),
+        };
+        let mapper = ModelMapper::new();
+        Arc::new(AppState {
+            config: AsyncRwLock::new(config),
+            http_client: http_client.clone(),
+            ouyi_client: AsyncRwLock::new(crate::client::OuyiClient::V8(
+                crate::client::http::OuyiHttpClient::new(
+                    http_client.clone(),
+                    "http://localhost".into(),
+                    "t".into(),
+                    "3.0.3".into(),
+                ),
+            )),
+            active_sessions: DashMap::new(),
+            tool_sessions: DashMap::new(),
+            tool_ledger: ToolLedger::new(),
+            model_mapper: mapper,
+            admin_store: AsyncRwLock::new(AdminStore::new("s".into(), String::new())),
+            account_store: crate::admin::AccountStore::new(),
+            stats: StatsCollector::new(),
+            platform: AsyncRwLock::new(OuyiPlatform::Ouyi8),
+            platform_status: AsyncRwLock::new(PlatformStatus::new(
+                OuyiPlatform::Ouyi8,
+                "http://localhost".into(),
+            )),
+        })
+    }
+
+    fn disabled_cfg() -> ToolRuntimeConfig {
+        ToolRuntimeConfig {
+            enabled: false,
+            mode: ToolRuntimeMode::Compiler,
+            provider: ToolRuntimeProvider::OpenaiCompatible,
+            base_url: Some("http://tool.local/v1".into()),
+            api_key: Some("sk-test".into()),
+            api_key_env: None,
+            model: Some("mock".into()),
+            timeout_secs: 5,
+        }
+    }
+
+    fn chat_req_with_tools() -> ChatCompletionRequest {
+        ChatCompletionRequest {
+            model: "gpt-test".into(),
+            messages: vec![crate::model::openai::ChatMessage {
+                role: "user".into(),
+                content: Some("请执行 ls".into()),
+                tool_calls: None,
+                tool_call_id: None,
+                name: None,
+            }],
+            stream: false,
+            temperature: None,
+            max_tokens: None,
+            tools: Some(vec![crate::model::openai::ToolDef {
+                tool_type: "function".into(),
+                function: crate::model::openai::ToolFunction {
+                    name: "Bash".into(),
+                    description: Some("Run shell".into()),
+                    parameters: Some(serde_json::json!({"type": "object"})),
+                },
+            }]),
+            tool_choice: None,
+            parallel_tool_calls: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn pipeline_final_answer_path_records_meta_and_text() {
+        // 上游文本不包含 tool markers 且 runtime 禁用 → FinalAnswer
+        let state = test_state(Some(disabled_cfg()));
+        let req = chat_req_with_tools();
+        let out = run_openai_tool_pipeline(
+            &state,
+            &req,
+            "我不调用任何工具".into(),
+            "ouyi8",
+            Instant::now(),
+        )
+        .await;
+        match out {
+            PipelineOutput::FinalAnswer { text, meta } => {
+                assert_eq!(text, "我不调用任何工具");
+                assert_eq!(meta.platform_key, "ouyi8");
+                assert_eq!(meta.short_model, "gpt-test");
+            }
+            _ => panic!("expected FinalAnswer"),
         }
     }
 }
