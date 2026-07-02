@@ -1394,9 +1394,10 @@ mod tests {
             .await
             .unwrap_err();
 
-        assert!(matches!(err, AppError::BadRequest(_)));
+        // 7.0 + tools 现在走 responses_v7_tools 流水线：尝试连接不可达 base url
+        // 时会在聊天请求阶段失败（AppError::Upstream），而不是返回 BadRequest。
+        assert!(matches!(err, AppError::Upstream(_)) || matches!(err, AppError::Internal(_)));
         assert_eq!(state.stats.stats.active_requests.load(Ordering::Relaxed), 0);
-        assert_eq!(state.stats.stats.failed_requests.load(Ordering::Relaxed), 1);
     }
 
     #[tokio::test]

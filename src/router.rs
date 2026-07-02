@@ -426,14 +426,21 @@ mod tests {
                 .is_some_and(|text| text.contains("当前目录"))
         );
 
-        let (status, _) = post_json(
+        let (status, value) = post_json(
             &client,
             &base_url,
             "/openai/v1/responses",
             responses_tools_body(),
         )
         .await;
-        assert_eq!(status, 400);
+        assert_eq!(status, 200);
+        // 验证 tool_call 输出
+        let output = value["output"].as_array().expect("output 应该是数组");
+        assert!(!output.is_empty(), "output 应至少含一个项");
+        assert_eq!(output[0]["type"], "function_call");
+        assert!(output[0]["call_id"].is_string());
+        assert!(output[0]["name"].is_string());
+        assert!(output[0]["arguments"].is_string());
 
         for path in ["/anthropic/v1/messages", "/anthropic/messages"] {
             let (status, value) = post_json(&client, &base_url, path, anthropic_tool_body()).await;
@@ -445,7 +452,25 @@ mod tests {
 
         let (status, _) = get_json(&client, &base_url, "/admin/api/status").await;
         assert_eq!(status, 401);
-        assert_eq!(tool_requests.load(Ordering::SeqCst), 3);
+
+        // 流式 + tools
+        let mut stream_body = responses_tools_body();
+        stream_body["stream"] = json!(true);
+        let resp = client
+            .post(format!("{base_url}/openai/v1/responses"))
+            .json(&stream_body)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 200);
+        let body = resp.text().await.unwrap();
+        // 验证关键事件存在
+        assert!(body.contains("response.created"), "应有 response.created 事件");
+        assert!(body.contains("response.output_item.added"), "应有 output_item.added 事件");
+        assert!(body.contains("response.function_call_arguments"), "应有 function_call_arguments 事件");
+        assert!(body.contains("response.completed"), "应有 response.completed 事件");
+
+        assert_eq!(tool_requests.load(Ordering::SeqCst), 5);
     }
 
     #[tokio::test]
@@ -500,14 +525,15 @@ mod tests {
                 .is_some_and(|text| text.contains("7.0 mock"))
         );
 
-        let (status, _) = post_json(
+        let (status, value) = post_json(
             &client,
             &base_url,
             "/openai/v1/responses",
             responses_tools_body(),
         )
         .await;
-        assert_eq!(status, 400);
+        assert_eq!(status, 200);
+        assert_eq!(value["output"][0]["type"], "function_call");
     }
 
     #[tokio::test]
