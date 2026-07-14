@@ -1,0 +1,50 @@
+# Build artifacts
+/target
+**/target
+web/dist
+
+# Node
+web/node_modules
+web/.vite
+
+# Git / metadata
+.git
+.gitignore
+.gitattributes
+.worktrees
+.idea
+.vscode
+.DS_Store
+Thumbs.db
+
+# Claude / IDE / agent caches — none of this belongs in the image
+.claude
+.omc
+.omx
+.sisyphus
+.playwright-mcp
+
+# Secrets — never bake these into the image
+config.toml
+.env
+.env.*
+
+# Logs / temp
+*.log
+logs/
+*.tmp
+*.temp
+
+# Project-local scripts not needed at runtime
+scripts/
+
+# Docker / compose files referencing each other (no point in copying into the image)
+Dockerfile
+.dockerignore
+docker-compose.yml
+docker-compose.dev.yml
+
+# Tests / CI config — re-run them in CI rather than shipping
+.github
+.gitlab-ci.yml
+opencode.json
