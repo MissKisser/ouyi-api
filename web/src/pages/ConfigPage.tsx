@@ -31,7 +31,11 @@ import {
   Globe,
 } from 'lucide-react';
 import { useTranslation } from 'react-i18next';
-import { MAX_CONCURRENT_REQUESTS, isValidMaxConcurrentRequests } from '@/lib/concurrency';
+import {
+  MAX_CONCURRENT_REQUESTS,
+  isValidMaxConcurrentRequests,
+  parseMaxConcurrentRequestsInput,
+} from '@/lib/concurrency';
 
 /** Collapsible section wrapper */
 function Section({
@@ -756,8 +760,10 @@ export function ConfigPage() {
               min={0}
               max={MAX_CONCURRENT_REQUESTS}
               step={1}
-              value={config.limits.max_concurrent_requests}
-              onChange={(e) => update(['limits', 'max_concurrent_requests'], Number(e.target.value))}
+              value={Number.isNaN(config.limits.max_concurrent_requests) ? '' : config.limits.max_concurrent_requests}
+              onChange={(e) =>
+                update(['limits', 'max_concurrent_requests'], parseMaxConcurrentRequestsInput(e.target.value))
+              }
               aria-invalid={!valid}
             />
             <p className={`mt-1 text-xs ${valid ? 'text-muted-foreground' : 'text-destructive'}`}>
