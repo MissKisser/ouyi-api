@@ -5,6 +5,7 @@ use axum::response::IntoResponse;
 use reqwest::StatusCode as ReqwestStatusCode;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
+use std::path::Path;
 use std::sync::Arc;
 use std::time::Instant;
 
@@ -14,8 +15,8 @@ use crate::client::http::OuyiHttpClient;
 use crate::config::{
     AppConfig, Ouyi7Config, PlatformConfig, ToolRuntimeConfig, ToolRuntimeMode,
     ToolRuntimeProvider, remove_openai_tool_runtime_config, remove_tool_runtime_config,
-    write_admin_config, write_openai_tool_runtime_config, write_ouyi_config, write_ouyi_v7_config,
-    write_platform_config, write_server_config, write_tool_runtime_config,
+    write_admin_config, write_limits_config, write_openai_tool_runtime_config, write_ouyi_config,
+    write_ouyi_v7_config, write_platform_config, write_server_config, write_tool_runtime_config,
 };
 use crate::handler::models::list_models as list_openai_models;
 use crate::model::mapper::ModelCategory;
@@ -365,8 +366,14 @@ pub struct Ouyi7ConfigView {
 }
 
 #[derive(Serialize)]
+pub struct LimitsConfigView {
+    max_concurrent_requests: usize,
+}
+
+#[derive(Serialize)]
 pub struct FullConfigResponse {
     server: ServerConfigView,
+    limits: LimitsConfigView,
     deepseek: DeepSeekConfigView,
     proxy: ProxyConfigView,
     admin: AdminConfigResponse,
@@ -447,6 +454,9 @@ pub async fn admin_config(State(state): State<Arc<AppState>>) -> impl IntoRespon
             host: config.server.host.clone(),
             port: config.server.port,
             cors_origins: vec!["*".to_string()],
+        },
+        limits: LimitsConfigView {
+            max_concurrent_requests: config.limits.max_concurrent_requests,
         },
         deepseek: DeepSeekConfigView {
             api_base: config.ouyi.base_url.clone(),
@@ -820,6 +830,7 @@ async fn send_anthropic_tool_runtime_test(
 #[derive(Deserialize)]
 pub struct ConfigUpdate {
     pub server: Option<ServerConfigUpdate>,
+    pub limits: Option<LimitsConfigUpdate>,
     pub deepseek: Option<OuyiConfigUpdate>,
     pub proxy: Option<ProxyConfigUpdate>,
     pub admin: Option<AdminUpdate>,
@@ -828,6 +839,11 @@ pub struct ConfigUpdate {
     pub openai_tool_runtime: Option<ToolRuntimeConfigUpdate>,
     pub platform: Option<PlatformConfigUpdate>,
     pub ouyi_v7: Option<Ouyi7ConfigUpdate>,
+}
+
+#[derive(Deserialize)]
+pub struct LimitsConfigUpdate {
+    pub max_concurrent_requests: Option<usize>,
 }
 
 #[derive(Deserialize)]
@@ -948,6 +964,34 @@ fn build_account_entry_from_raw(
     }
 }
 
+const MAX_CONCURRENT_REQUESTS: usize = 1000;
+
+#[derive(Debug)]
+pub(super) enum LimitsConfigUpdateError {
+    Invalid(String),
+    Persistence(crate::error::AppError),
+}
+
+pub(super) async fn apply_limits_config_update(
+    state: &AppState,
+    config_path: &Path,
+    max_concurrent_requests: usize,
+) -> Result<(), LimitsConfigUpdateError> {
+    if max_concurrent_requests > MAX_CONCURRENT_REQUESTS {
+        return Err(LimitsConfigUpdateError::Invalid(format!(
+            "max_concurrent_requests must be between 0 and {MAX_CONCURRENT_REQUESTS}"
+        )));
+    }
+
+    let mut config = state.config.write().await;
+    let mut limits = config.limits.clone();
+    limits.max_concurrent_requests = max_concurrent_requests;
+    write_limits_config(config_path, &limits).map_err(LimitsConfigUpdateError::Persistence)?;
+    config.limits.max_concurrent_requests = max_concurrent_requests;
+    state.concurrency_limiter.set_limit(max_concurrent_requests);
+    Ok(())
+}
+
 pub async fn admin_put_config(
     State(state): State<Arc<AppState>>,
     Json(body): Json<serde_json::Value>,
@@ -964,6 +1008,28 @@ pub async fn admin_put_config(
                 .into_response();
         }
     };
+
+    if let Some(limits) = update.limits
+        && let Some(max_concurrent_requests) = limits.max_concurrent_requests
+    {
+        let config_path = std::path::PathBuf::from(AppConfig::config_path());
+        if let Err(error) =
+            apply_limits_config_update(&state, &config_path, max_concurrent_requests).await
+        {
+            return match error {
+                LimitsConfigUpdateError::Invalid(error) => (
+                    StatusCode::BAD_REQUEST,
+                    Json(serde_json::json!({"ok": false, "error": error})),
+                )
+                    .into_response(),
+                LimitsConfigUpdateError::Persistence(error) => (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    Json(serde_json::json!({"ok": false, "error": error.to_string()})),
+                )
+                    .into_response(),
+            };
+        }
+    }
 
     // Handle admin password change
     if let Some(admin) = update.admin

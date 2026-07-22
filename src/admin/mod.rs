@@ -150,7 +150,10 @@ async fn serve_embedded_fallback(uri: axum::http::Uri) -> Response {
 mod tests {
     use super::*;
 
+    use std::path::PathBuf;
+
     use axum::http::StatusCode;
+    use serde_json::{Value, json};
 
     use crate::admin::auth::AdminStore;
     use crate::admin::stats::StatsCollector;
@@ -162,9 +165,31 @@ mod tests {
     use crate::model::mapper::ModelMapper;
     use crate::platform::{OuyiPlatform, PlatformStatus};
 
+    struct TempFileGuard(PathBuf);
+
+    impl TempFileGuard {
+        fn new(label: &str) -> Self {
+            Self(std::env::temp_dir().join(format!(
+                "ouyi-admin-limits-{label}-{}.toml",
+                uuid::Uuid::new_v4()
+            )))
+        }
+    }
+
+    impl Drop for TempFileGuard {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_file(&self.0);
+        }
+    }
+
     fn make_test_state() -> Arc<AppState> {
+        make_test_state_with_limit(0)
+    }
+
+    fn make_test_state_with_limit(max_concurrent_requests: usize) -> Arc<AppState> {
         let http_client = reqwest::Client::builder()
             .timeout(std::time::Duration::from_secs(5))
+            .no_proxy()
             .build()
             .unwrap();
         let mapper = ModelMapper::new();
@@ -187,7 +212,7 @@ mod tests {
                 no_data_timeout_secs: 5,
                 max_response_bytes: 1024 * 1024,
                 max_messages_bytes: 1024 * 1024,
-                max_concurrent_requests: 0,
+                max_concurrent_requests,
             },
             admin: Some(AdminConfig {
                 jwt_secret: Some("test-secret".to_string()),
@@ -204,7 +229,9 @@ mod tests {
         };
 
         Arc::new(AppState {
-            concurrency_limiter: crate::concurrency::ConcurrencyLimiter::new(0),
+            concurrency_limiter: crate::concurrency::ConcurrencyLimiter::new(
+                max_concurrent_requests,
+            ),
             config: tokio::sync::RwLock::new(config),
             http_client: http_client.clone(),
             ouyi_client: tokio::sync::RwLock::new(crate::client::OuyiClient::V8(
@@ -240,11 +267,135 @@ mod tests {
             axum::serve(listener, app).await.unwrap();
         });
 
-        let response = reqwest::get(format!("http://{}/admin/api/status", addr))
+        let response = reqwest::Client::builder()
+            .no_proxy()
+            .build()
+            .unwrap()
+            .get(format!("http://{}/admin/api/status", addr))
+            .send()
             .await
             .unwrap();
         server.abort();
 
         assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    async fn spawn_admin_server(state: Arc<AppState>) -> (String, tokio::task::JoinHandle<()>) {
+        let app = admin_routes(state.clone()).with_state(state);
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+        (format!("http://{addr}"), server)
+    }
+
+    async fn admin_token(state: &AppState) -> String {
+        state
+            .admin_store
+            .read()
+            .await
+            .generate_token("admin")
+            .unwrap()
+    }
+
+    #[tokio::test]
+    async fn authenticated_config_get_returns_in_memory_concurrency_limit() {
+        let state = make_test_state_with_limit(7);
+        let token = admin_token(&state).await;
+        let (base_url, server) = spawn_admin_server(state).await;
+
+        let response = reqwest::Client::builder()
+            .no_proxy()
+            .build()
+            .unwrap()
+            .get(format!("{base_url}/admin/api/config"))
+            .bearer_auth(token)
+            .send()
+            .await
+            .unwrap();
+        server.abort();
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let body: Value = response.json().await.unwrap();
+        assert_eq!(body["limits"]["max_concurrent_requests"], 7);
+    }
+
+    #[tokio::test]
+    async fn config_put_rejects_invalid_concurrency_limits_without_mutating_runtime() {
+        let state = make_test_state_with_limit(7);
+        let token = admin_token(&state).await;
+        let (base_url, server) = spawn_admin_server(state.clone()).await;
+        let client = reqwest::Client::builder().no_proxy().build().unwrap();
+
+        for invalid in [json!(-1), json!(1.5), json!(1001)] {
+            let response = client
+                .put(format!("{base_url}/admin/api/config"))
+                .bearer_auth(&token)
+                .json(&json!({
+                    "limits": {
+                        "max_concurrent_requests": invalid
+                    }
+                }))
+                .send()
+                .await
+                .unwrap();
+
+            assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+            let body: Value = response.json().await.unwrap();
+            assert_eq!(body["ok"], false);
+            assert!(body["error"].is_string());
+            assert_eq!(state.config.read().await.limits.max_concurrent_requests, 7);
+            assert_eq!(state.concurrency_limiter.limit(), 7);
+        }
+
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn limits_update_helper_persists_then_updates_memory_and_limiter() {
+        let state = make_test_state_with_limit(9);
+        let config_file = TempFileGuard::new("success");
+        std::fs::write(
+            &config_file.0,
+            "[limits]\nmax_concurrent_requests = 9\n\n[server]\nport = 3000\n",
+        )
+        .unwrap();
+
+        handlers::apply_limits_config_update(&state, &config_file.0, 3)
+            .await
+            .unwrap();
+
+        let persisted: toml::Value = std::fs::read_to_string(&config_file.0)
+            .unwrap()
+            .parse()
+            .unwrap();
+        assert_eq!(
+            persisted["limits"]["max_concurrent_requests"].as_integer(),
+            Some(3)
+        );
+        assert_eq!(state.config.read().await.limits.max_concurrent_requests, 3);
+        assert_eq!(state.concurrency_limiter.limit(), 3);
+    }
+
+    #[tokio::test]
+    async fn limits_update_helper_keeps_runtime_unchanged_when_persistence_fails() {
+        for (label, contents) in [("missing", None), ("invalid", Some("not = [valid"))] {
+            let state = make_test_state_with_limit(9);
+            let config_file = TempFileGuard::new(label);
+            if let Some(contents) = contents {
+                std::fs::write(&config_file.0, contents).unwrap();
+            }
+
+            let result = handlers::apply_limits_config_update(&state, &config_file.0, 3).await;
+
+            assert!(result.is_err(), "{label}");
+            assert_eq!(
+                state.config.read().await.limits.max_concurrent_requests,
+                9,
+                "{label}"
+            );
+            assert_eq!(state.concurrency_limiter.limit(), 9, "{label}");
+        }
     }
 }
