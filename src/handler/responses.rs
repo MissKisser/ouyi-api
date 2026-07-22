@@ -1019,6 +1019,7 @@ async fn handle_responses_non_stream(
     Ok(Json(response).into_response())
 }
 
+#[cfg(test)]
 fn convert_responses_to_chat(req: &ResponsesRequest) -> Result<ChatCompletionRequest, AppError> {
     convert_responses_to_chat_with_history(req, &[])
 }

@@ -18,10 +18,12 @@ pub struct DialectToolCall {
 }
 
 #[derive(Debug, Default)]
+#[cfg(test)]
 pub struct DialectParser {
     buffer: String,
 }
 
+#[cfg(test)]
 impl DialectParser {
     pub fn new() -> Self {
         Self::default()

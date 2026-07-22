@@ -3,7 +3,9 @@ use std::time::Instant;
 use dashmap::DashMap;
 
 use crate::error::AppError;
-use crate::model::anthropic::{AnthropicContent, ContentBlock, MessagesRequest};
+use crate::model::anthropic::MessagesRequest;
+#[cfg(test)]
+use crate::model::anthropic::{AnthropicContent, ContentBlock};
 
 pub mod broker;
 pub mod context;
@@ -255,6 +257,7 @@ pub fn session_key_for_request(req: &MessagesRequest) -> Option<String> {
         .map(|id| format!("{}:{}", req.model, id))
 }
 
+#[cfg(test)]
 pub fn latest_tool_result_id(req: &MessagesRequest) -> Option<String> {
     for msg in req.messages.iter().rev() {
         if let AnthropicContent::Blocks(blocks) = &msg.content {
