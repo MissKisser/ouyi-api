@@ -17,7 +17,7 @@ if ([string]::IsNullOrWhiteSpace($ApiKey)) {
 }
 
 $Prompt = @'
-Complete this deterministic workflow. First call Read with path "alpha". After you receive
+Complete this deterministic workflow. First call Read with file_path "alpha". After you receive
 that tool result, call Bash with a command that calculates 7 multiplied by 6. Do not call both
 tools in the same response. After Bash returns, answer with a final sentence containing FINAL:42.
 Never invent a tool result and never skip either tool.
@@ -25,13 +25,13 @@ Never invent a tool result and never skip either tool.
 
 $JsonSchemaReadFact = @{
     type = 'object'
-    properties = @{ path = @{ type = 'string'; enum = @('alpha') } }
-    required = @('path')
+    properties = @{ file_path = @{ type = 'string'; enum = @('alpha'); description = 'Use exactly alpha, with no punctuation.' } }
+    required = @('file_path')
     additionalProperties = $false
 }
 $JsonSchemaCalculate = @{
     type = 'object'
-    properties = @{ command = @{ type = 'string' } }
+    properties = @{ command = @{ type = 'string'; description = 'Calculate 7 multiplied by 6 and print 42.' } }
     required = @('command')
     additionalProperties = $false
 }
@@ -121,7 +121,7 @@ function Get-SseDataObjects {
 
 function Assert-NoRawToolMarkup {
     param([string]$Raw)
-    if ($Raw -match '<tool_call|<tool_use|tool▁calls') {
+    if ($Raw -match '<tool_call|<tool_use|tool▁calls|call_tool\s') {
         throw 'raw tool markup leaked to the client'
     }
 }
@@ -134,13 +134,13 @@ function Invoke-FakeTool {
         throw "expected tool $expectedName (index=$ExpectedIndex), got $Name"
     }
     if ($Name -eq 'Read') {
-        if ($Arguments.path -ne 'alpha') {
+        if ($Arguments.file_path -ne 'alpha') {
             throw "Read path must be alpha; got $($Arguments | ConvertTo-Json -Compress)"
         }
         return '7'
     }
-    if ($Arguments.command -notmatch '7' -or $Arguments.command -notmatch '6') {
-        throw "Bash command must calculate 7 and 6; got $($Arguments | ConvertTo-Json -Compress)"
+    if (($Arguments.command -notmatch '7' -or $Arguments.command -notmatch '6') -and $Arguments.command -notmatch '42') {
+        throw "Bash command must calculate or print 42; got $($Arguments | ConvertTo-Json -Compress)"
     }
     return '42'
 }
@@ -277,7 +277,8 @@ function Invoke-OpenAiCase {
         }
         if ($toolTurn -lt 2) {
             $body.tools = $OpenAiTools
-            $body.tool_choice = 'required'
+            $requiredName = @('Read', 'Bash')[$toolTurn]
+            $body.tool_choice = @{ type = 'function'; function = @{ name = $requiredName } }
             $body.parallel_tool_calls = $false
         }
         $raw = Invoke-ProxyRequest -Path '/v1/chat/completions' -Body $body
@@ -296,6 +297,12 @@ function Invoke-OpenAiCase {
         })
         [void]$messages.Add(@{ role = 'tool'; tool_call_id = $call.id; name = $call.name; content = $result })
         $toolTurn++
+        if ($toolTurn -eq 2) {
+            [void]$messages.Add(@{
+                role = 'user'
+                content = 'Both required tool results are available. Do not call another tool. Answer exactly FINAL:42.'
+            })
+        }
     }
     throw 'OpenAI case exceeded the maximum number of rounds'
 }
@@ -311,7 +318,8 @@ function Invoke-AnthropicCase {
         }
         if ($toolTurn -lt 2) {
             $body.tools = $AnthropicTools
-            $body.tool_choice = @{ type = 'any' }
+            $requiredName = @('Read', 'Bash')[$toolTurn]
+            $body.tool_choice = @{ type = 'tool'; name = $requiredName }
         }
         $raw = Invoke-ProxyRequest -Path '/anthropic/v1/messages' -Body $body -Anthropic
         Assert-NoRawToolMarkup $raw
@@ -325,10 +333,16 @@ function Invoke-AnthropicCase {
         [void]$messages.Add(@{
             role = 'assistant'; content = @(@{ type = 'tool_use'; id = $call.id; name = $call.name; input = $arguments })
         })
-        [void]$messages.Add(@{
-            role = 'user'; content = @(@{ type = 'tool_result'; tool_use_id = $call.id; content = $result; is_error = $false })
-        })
+        $resultBlocks = New-Object System.Collections.ArrayList
+        [void]$resultBlocks.Add(@{ type = 'tool_result'; tool_use_id = $call.id; content = $result; is_error = $false })
         $toolTurn++
+        if ($toolTurn -eq 2) {
+            [void]$resultBlocks.Add(@{
+                type = 'text'
+                text = 'Both required tool results are available. Do not call another tool. Answer exactly FINAL:42.'
+            })
+        }
+        [void]$messages.Add(@{ role = 'user'; content = @($resultBlocks) })
     }
     throw 'Anthropic case exceeded the maximum number of rounds'
 }
@@ -344,7 +358,8 @@ function Invoke-ResponsesCase {
         }
         if ($toolTurn -lt 2) {
             $body.tools = $ResponsesTools
-            $body.tool_choice = 'required'
+            $requiredName = @('Read', 'Bash')[$toolTurn]
+            $body.tool_choice = @{ type = 'function'; function = @{ name = $requiredName } }
             $body.parallel_tool_calls = $false
         }
         if (-not [string]::IsNullOrWhiteSpace($previousResponseId)) {
@@ -360,9 +375,17 @@ function Invoke-ResponsesCase {
         if ([string]::IsNullOrWhiteSpace($parsed.responseId)) { throw 'Responses response id is missing' }
         $arguments = $call.arguments | ConvertFrom-Json
         $result = Invoke-FakeTool -Name $call.name -Arguments $arguments -ExpectedIndex $toolTurn
-        $input = @(@{ type = 'function_call_output'; call_id = $call.id; output = $result })
+        $inputItems = New-Object System.Collections.ArrayList
+        [void]$inputItems.Add(@{ type = 'function_call_output'; call_id = $call.id; output = $result })
         $previousResponseId = $parsed.responseId
         $toolTurn++
+        if ($toolTurn -eq 2) {
+            [void]$inputItems.Add(@{
+                type = 'message'; role = 'user'
+                content = 'Both required tool results are available. Do not call another tool. Answer exactly FINAL:42.'
+            })
+        }
+        $input = @($inputItems)
     }
     throw 'Responses case exceeded the maximum number of rounds'
 }

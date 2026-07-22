@@ -2,12 +2,14 @@ use crate::adapter::tool_call::ToolCallParser;
 
 const GLM_OPEN: &str = "<tool_call>";
 const GLM_PARAMS: &str = "▁params▁";
+const CALL_TOOL_PREFIX: &str = "call_tool ";
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ToolDialect {
     Canonical,
     Anthropic,
     GlmCompact,
+    CallTool,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -43,12 +45,18 @@ pub fn has_explicit_tool_intent(text: &str) -> bool {
         || text.contains("<tool_use>")
         || text.contains("<|tool▁calls▁begin|>")
         || text.contains("<|tool_calls_begin|>")
+        || text.contains(CALL_TOOL_PREFIX)
 }
 
 pub fn parse_known_tool_calls(text: &str) -> Result<Vec<DialectToolCall>, String> {
     let glm_calls = parse_glm_calls(text)?;
     if !glm_calls.is_empty() {
         return Ok(glm_calls);
+    }
+
+    let call_tool_calls = parse_call_tool_calls(text)?;
+    if !call_tool_calls.is_empty() {
+        return Ok(call_tool_calls);
     }
 
     let dialect = if text.contains("<tool_use>") {
@@ -79,6 +87,124 @@ pub fn parse_known_tool_calls(text: &str) -> Result<Vec<DialectToolCall>, String
             })
         })
         .collect()
+}
+
+fn parse_call_tool_calls(text: &str) -> Result<Vec<DialectToolCall>, String> {
+    let mut calls = Vec::new();
+    let mut cursor = 0;
+    while let Some(relative_start) = text[cursor..].find(CALL_TOOL_PREFIX) {
+        let call_start = cursor + relative_start + CALL_TOOL_PREFIX.len();
+        let rest = text[call_start..].trim_start();
+        let name_len = rest
+            .char_indices()
+            .find(|(_, ch)| !ch.is_ascii_alphanumeric() && !matches!(ch, '_' | '-' | '.'))
+            .map(|(index, _)| index)
+            .unwrap_or(rest.len());
+        let name = rest[..name_len].trim();
+        if name.is_empty() {
+            return Err("call_tool 缺少工具名".to_string());
+        }
+        let after_name = rest[name_len..].trim_start();
+        if !after_name.starts_with('(') {
+            return Err("call_tool 工具名后缺少参数括号".to_string());
+        }
+        let close = find_matching_parenthesis(after_name)
+            .ok_or_else(|| "call_tool 参数括号未闭合".to_string())?;
+        let input = parse_call_tool_arguments(&after_name[1..close])?;
+        calls.push(DialectToolCall {
+            name: name.to_string(),
+            input,
+            dialect: ToolDialect::CallTool,
+        });
+        cursor = text.len() - after_name.len() + close + 1;
+    }
+    Ok(calls)
+}
+
+fn find_matching_parenthesis(text: &str) -> Option<usize> {
+    let mut depth = 0usize;
+    let mut quote = None;
+    let mut escaped = false;
+    for (index, ch) in text.char_indices() {
+        if let Some(active_quote) = quote {
+            if escaped {
+                escaped = false;
+            } else if ch == '\\' {
+                escaped = true;
+            } else if ch == active_quote {
+                quote = None;
+            }
+            continue;
+        }
+        if matches!(ch, '\'' | '"') {
+            quote = Some(ch);
+        } else if ch == '(' {
+            depth += 1;
+        } else if ch == ')' {
+            depth = depth.checked_sub(1)?;
+            if depth == 0 {
+                return Some(index);
+            }
+        }
+    }
+    None
+}
+
+fn parse_call_tool_arguments(text: &str) -> Result<serde_json::Value, String> {
+    let mut object = serde_json::Map::new();
+    for part in split_call_tool_arguments(text) {
+        let (key, raw_value) = part
+            .split_once('=')
+            .ok_or_else(|| format!("call_tool 参数缺少等号: {part}"))?;
+        let key = key.trim();
+        if key.is_empty() {
+            return Err("call_tool 参数名为空".to_string());
+        }
+        let raw_value = raw_value.trim();
+        let value = serde_json::from_str(raw_value).unwrap_or_else(|_| {
+            serde_json::Value::String(raw_value.trim_matches('"').trim_matches('\'').to_string())
+        });
+        object.insert(key.to_string(), value);
+    }
+    Ok(serde_json::Value::Object(object))
+}
+
+fn split_call_tool_arguments(text: &str) -> Vec<&str> {
+    let mut parts = Vec::new();
+    let mut start = 0usize;
+    let mut quote = None;
+    let mut escaped = false;
+    let mut nested = 0usize;
+    for (index, ch) in text.char_indices() {
+        if let Some(active_quote) = quote {
+            if escaped {
+                escaped = false;
+            } else if ch == '\\' {
+                escaped = true;
+            } else if ch == active_quote {
+                quote = None;
+            }
+            continue;
+        }
+        match ch {
+            '\'' | '"' => quote = Some(ch),
+            '(' | '[' | '{' => nested += 1,
+            ')' | ']' | '}' => nested = nested.saturating_sub(1),
+            ',' if nested == 0 => {
+                let part = text[start..index].trim();
+                if !part.is_empty() {
+                    parts.push(part);
+                }
+                start = index + ch.len_utf8();
+            }
+            _ => {}
+        }
+    }
+    let tail = text[start..].trim();
+    if !tail.is_empty() {
+        parts.push(tail);
+    }
+    parts
 }
 
 fn parse_glm_calls(text: &str) -> Result<Vec<DialectToolCall>, String> {
@@ -189,6 +315,18 @@ mod tests {
     }
 
     #[test]
+    fn parses_call_tool_function_syntax() {
+        let calls =
+            parse_known_tool_calls("I will inspect it now.\n\ncall_tool Read(file_path=\"alpha\")")
+                .unwrap();
+
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].name, "Read");
+        assert_eq!(calls[0].input["file_path"], "alpha");
+        assert_eq!(calls[0].dialect, ToolDialect::CallTool);
+    }
+
+    #[test]
     fn buffers_glm_tag_and_json_across_chunks() {
         let mut parser = DialectParser::new();
         parser.push_chunk("<tool_");
@@ -204,6 +342,7 @@ mod tests {
     fn recognizes_explicit_intent_without_misclassifying_plain_text() {
         assert!(has_explicit_tool_intent("<tool_call>Bash▁params▁{}"));
         assert!(has_explicit_tool_intent("<tool_use>{}</tool_use>"));
+        assert!(has_explicit_tool_intent("call_tool Read(file_path=\"a\")"));
         assert!(!has_explicit_tool_intent("Use the Bash tool if needed."));
     }
 }

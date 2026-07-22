@@ -259,7 +259,11 @@ pub fn convert_anthropic_request(
     let mut text = text_parts.join("\n");
 
     if has_tools {
-        if force_tool {
+        if let Some(crate::model::anthropic::ToolChoice::Tool { name }) = &req.tool_choice {
+            text.push_str(&format!(
+                "\n\n[System]: 你必须调用名为 {name} 的工具。只能回复该工具调用，不能回复文字。"
+            ));
+        } else if force_tool {
             text.push_str(
                 "\n\n[System]: 你必须使用工具来完成当前任务。只能回复工具调用，不能回复文字。",
             );
@@ -462,5 +466,22 @@ mod tests {
         let tool_pos = sys.find("工具调用").unwrap();
         let system_pos = sys.find("You are helpful").unwrap();
         assert!(tool_pos < system_pos, "工具指令应在系统提示之前");
+    }
+
+    #[test]
+    fn test_specific_tool_choice_names_the_required_tool() {
+        let mut req = make_req(AnthropicContent::Text("inspect".to_string()));
+        req.tools = Some(vec![AnthropicTool {
+            name: "Read".to_string(),
+            description: "Read a file".to_string(),
+            input_schema: serde_json::json!({"type":"object"}),
+        }]);
+        req.tool_choice = Some(crate::model::anthropic::ToolChoice::Tool {
+            name: "Read".to_string(),
+        });
+
+        let converted = convert_anthropic_request(&req, "test", false).unwrap();
+
+        assert!(converted.text.contains("必须调用名为 Read 的工具"));
     }
 }
