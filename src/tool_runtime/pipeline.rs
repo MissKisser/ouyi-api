@@ -311,6 +311,7 @@ mod tests {
             active_sessions: DashMap::new(),
             tool_sessions: DashMap::new(),
             tool_ledger: ToolLedger::new(),
+            responses_state: crate::responses_state::ResponsesState::default(),
             model_mapper: mapper,
             admin_store: AsyncRwLock::new(AdminStore::new("s".into(), String::new())),
             account_store: crate::admin::AccountStore::new(),

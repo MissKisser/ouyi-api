@@ -2534,6 +2534,7 @@ mod tests {
             active_sessions: dashmap::DashMap::new(),
             tool_sessions: dashmap::DashMap::new(),
             tool_ledger: crate::tool_runtime::ToolLedger::new(),
+            responses_state: crate::responses_state::ResponsesState::default(),
             model_mapper: mapper,
             admin_store: tokio::sync::RwLock::new(AdminStore::new(
                 "test-secret".to_string(),
@@ -2616,6 +2617,7 @@ mod tests {
             active_sessions: dashmap::DashMap::new(),
             tool_sessions: dashmap::DashMap::new(),
             tool_ledger: crate::tool_runtime::ToolLedger::new(),
+            responses_state: crate::responses_state::ResponsesState::default(),
             model_mapper: mapper,
             admin_store: tokio::sync::RwLock::new(AdminStore::new(
                 "test-secret".to_string(),

@@ -27,7 +27,14 @@ pub async fn responses(
     State(state): State<Arc<AppState>>,
     Json(req): Json<ResponsesRequest>,
 ) -> Result<axum::response::Response, AppError> {
-    let chat_req = convert_responses_to_chat(&req)?;
+    let prior_messages = match req.previous_response_id.as_deref() {
+        Some(previous_id) => state
+            .responses_state
+            .get(previous_id)
+            .ok_or_else(|| AppError::ResponseNotFound(previous_id.to_string()))?,
+        None => Vec::new(),
+    };
+    let chat_req = convert_responses_to_chat_with_history(&req, &prior_messages)?;
     let is_stream = req.stream;
 
     let model_full = state.model_mapper.to_ouyi(&chat_req.model);
@@ -353,6 +360,7 @@ async fn responses_v8_tools(
 
     let short_model = chat_req.model.clone();
     let task_id = format!("resp_{}", crate::tool_runtime::uuid_short());
+    persist_response_history(&state, &task_id, &chat_req, &pipeline_out);
 
     if is_stream {
         let events =
@@ -523,6 +531,7 @@ async fn responses_v7_tools(
     let short_model = chat_req.model.clone();
     let task_id = format!("resp_{}", crate::tool_runtime::uuid_short());
     let is_stream = req.stream;
+    persist_response_history(&state, &task_id, &chat_req, &pipeline_out);
 
     if is_stream {
         let events =
@@ -1011,6 +1020,13 @@ async fn handle_responses_non_stream(
 }
 
 fn convert_responses_to_chat(req: &ResponsesRequest) -> Result<ChatCompletionRequest, AppError> {
+    convert_responses_to_chat_with_history(req, &[])
+}
+
+fn convert_responses_to_chat_with_history(
+    req: &ResponsesRequest,
+    prior_messages: &[ChatMessage],
+) -> Result<ChatCompletionRequest, AppError> {
     let messages = match &req.input {
         serde_json::Value::String(text) => {
             let mut msgs = Vec::new();
@@ -1034,6 +1050,25 @@ fn convert_responses_to_chat(req: &ResponsesRequest) -> Result<ChatCompletionReq
         }
         serde_json::Value::Array(items) => {
             let mut msgs: Vec<ChatMessage> = Vec::new();
+            let mut tool_names: std::collections::HashMap<String, String> = prior_messages
+                .iter()
+                .filter_map(|message| message.tool_calls.as_ref())
+                .flatten()
+                .map(|call| (call.id.clone(), call.function.name.clone()))
+                .collect();
+            tool_names.extend(
+                items
+                    .iter()
+                    .filter(|item| {
+                        item.get("type").and_then(|value| value.as_str()) == Some("function_call")
+                    })
+                    .filter_map(|item| {
+                        Some((
+                            item.get("call_id")?.as_str()?.to_string(),
+                            item.get("name")?.as_str()?.to_string(),
+                        ))
+                    }),
+            );
 
             if let Some(instructions) = &req.instructions {
                 msgs.push(ChatMessage {
@@ -1046,15 +1081,103 @@ fn convert_responses_to_chat(req: &ResponsesRequest) -> Result<ChatCompletionReq
             }
 
             for item in items {
-                let role = item
-                    .get("role")
-                    .and_then(|v| v.as_str())
-                    .unwrap_or("user")
-                    .to_string();
+                match item.get("type").and_then(|value| value.as_str()) {
+                    Some("function_call") => {
+                        let typed: crate::model::openai::ResponsesInputItem =
+                            serde_json::from_value(item.clone()).map_err(|error| {
+                                AppError::BadRequest(format!("无效 function_call: {error}"))
+                            })?;
+                        let crate::model::openai::ResponsesInputItem::FunctionCall {
+                            call_id,
+                            name,
+                            arguments,
+                        } = typed
+                        else {
+                            unreachable!();
+                        };
+                        serde_json::from_str::<serde_json::Value>(&arguments).map_err(|error| {
+                            AppError::BadRequest(format!(
+                                "function_call {call_id} 参数 JSON 无效: {error}"
+                            ))
+                        })?;
+                        msgs.push(ChatMessage {
+                            role: "assistant".to_string(),
+                            content: None,
+                            tool_calls: Some(vec![crate::model::openai::ToolCall {
+                                id: call_id,
+                                call_type: "function".to_string(),
+                                function: crate::model::openai::ToolCallFunction {
+                                    name,
+                                    arguments,
+                                },
+                            }]),
+                            tool_call_id: None,
+                            name: None,
+                        });
+                        continue;
+                    }
+                    Some("function_call_output") => {
+                        let typed: crate::model::openai::ResponsesInputItem =
+                            serde_json::from_value(item.clone()).map_err(|error| {
+                                AppError::BadRequest(format!("无效 function_call_output: {error}"))
+                            })?;
+                        let crate::model::openai::ResponsesInputItem::FunctionCallOutput {
+                            call_id,
+                            output,
+                        } = typed
+                        else {
+                            unreachable!();
+                        };
+                        let name = tool_names.get(&call_id).cloned().ok_or_else(|| {
+                            AppError::BadRequest(format!(
+                                "function_call_output {call_id} 找不到对应 function_call"
+                            ))
+                        })?;
+                        let output = output
+                            .as_str()
+                            .map(str::to_string)
+                            .unwrap_or_else(|| output.to_string());
+                        msgs.push(ChatMessage {
+                            role: "tool".to_string(),
+                            content: Some(output),
+                            tool_calls: None,
+                            tool_call_id: Some(call_id),
+                            name: Some(name),
+                        });
+                        continue;
+                    }
+                    Some("message") | None => {}
+                    Some(other) => {
+                        return Err(AppError::BadRequest(format!(
+                            "不支持的 Responses input 类型: {other}"
+                        )));
+                    }
+                }
+                let (role, content_value) = if item.get("type").and_then(|value| value.as_str())
+                    == Some("message")
+                {
+                    let typed: crate::model::openai::ResponsesInputItem =
+                        serde_json::from_value(item.clone()).map_err(|error| {
+                            AppError::BadRequest(format!("无效 Responses message: {error}"))
+                        })?;
+                    let crate::model::openai::ResponsesInputItem::Message { role, content } = typed
+                    else {
+                        unreachable!();
+                    };
+                    (role, content)
+                } else {
+                    (
+                        item.get("role")
+                            .and_then(|v| v.as_str())
+                            .unwrap_or("user")
+                            .to_string(),
+                        item.get("content").cloned().unwrap_or_default(),
+                    )
+                };
 
                 let content = match role.as_str() {
                     "developer" => {
-                        let c = extract_text_content(item.get("content"));
+                        let c = extract_text_content(Some(&content_value));
                         let mut msg = ChatMessage {
                             role: "system".to_string(),
                             content: Some(c),
@@ -1071,7 +1194,7 @@ fn convert_responses_to_chat(req: &ResponsesRequest) -> Result<ChatCompletionReq
                         msgs.push(msg);
                         continue;
                     }
-                    _ => extract_text_content(item.get("content")),
+                    _ => extract_text_content(Some(&content_value)),
                 };
 
                 msgs.push(ChatMessage {
@@ -1091,13 +1214,16 @@ fn convert_responses_to_chat(req: &ResponsesRequest) -> Result<ChatCompletionReq
         }
     };
 
-    if messages.is_empty() {
+    if messages.is_empty() && prior_messages.is_empty() {
         return Err(AppError::BadRequest("消息列表为空".to_string()));
     }
 
+    let mut messages_with_history = prior_messages.to_vec();
+    messages_with_history.extend(messages);
+
     Ok(ChatCompletionRequest {
         model: req.model.clone(),
-        messages,
+        messages: messages_with_history,
         stream: false,
         temperature: req.temperature,
         max_tokens: req.max_output_tokens,
@@ -1105,8 +1231,8 @@ fn convert_responses_to_chat(req: &ResponsesRequest) -> Result<ChatCompletionReq
             .tools
             .as_ref()
             .map(|tools| convert_responses_tools(tools)),
-        tool_choice: None,
-        parallel_tool_calls: None,
+        tool_choice: req.tool_choice.clone(),
+        parallel_tool_calls: req.parallel_tool_calls,
     })
 }
 
@@ -1133,6 +1259,47 @@ fn convert_responses_tools(tools: &[serde_json::Value]) -> Vec<ToolDef> {
             })
         })
         .collect()
+}
+
+fn persist_response_history(
+    state: &AppState,
+    response_id: &str,
+    request: &ChatCompletionRequest,
+    output: &crate::tool_runtime::pipeline::PipelineOutput,
+) {
+    let mut messages = request.messages.clone();
+    let assistant = match output {
+        crate::tool_runtime::pipeline::PipelineOutput::ToolCalls { calls, .. } => ChatMessage {
+            role: "assistant".to_string(),
+            content: None,
+            tool_calls: Some(
+                calls
+                    .iter()
+                    .map(|call| crate::model::openai::ToolCall {
+                        id: call.id.clone(),
+                        call_type: "function".to_string(),
+                        function: crate::model::openai::ToolCallFunction {
+                            name: call.name.clone(),
+                            arguments: call.input.to_string(),
+                        },
+                    })
+                    .collect(),
+            ),
+            tool_call_id: None,
+            name: None,
+        },
+        crate::tool_runtime::pipeline::PipelineOutput::FinalAnswer { text, .. } => ChatMessage {
+            role: "assistant".to_string(),
+            content: Some(text.clone()),
+            tool_calls: None,
+            tool_call_id: None,
+            name: None,
+        },
+    };
+    messages.push(assistant);
+    state
+        .responses_state
+        .insert(response_id.to_string(), messages);
 }
 
 fn extract_text_content(content: Option<&serde_json::Value>) -> String {
@@ -1205,6 +1372,54 @@ fn uuid_short() -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_function_call_output_converts_to_named_tool_message() {
+        let req: ResponsesRequest = serde_json::from_value(serde_json::json!({
+            "model":"gpt-test",
+            "input":[
+                {"type":"function_call","call_id":"c1","name":"Bash","arguments":"{\"command\":\"pwd\"}"},
+                {"type":"function_call_output","call_id":"c1","output":"D:/repo"}
+            ],
+            "tool_choice":"required",
+            "parallel_tool_calls":false
+        })).unwrap();
+
+        let chat = convert_responses_to_chat(&req).unwrap();
+
+        assert_eq!(chat.messages[0].role, "assistant");
+        assert_eq!(chat.messages[0].tool_calls.as_ref().unwrap()[0].id, "c1");
+        assert_eq!(chat.messages[1].role, "tool");
+        assert_eq!(chat.messages[1].tool_call_id.as_deref(), Some("c1"));
+        assert_eq!(chat.messages[1].name.as_deref(), Some("Bash"));
+        assert_eq!(chat.messages[1].content.as_deref(), Some("D:/repo"));
+        assert_eq!(chat.tool_choice, Some(serde_json::json!("required")));
+        assert_eq!(chat.parallel_tool_calls, Some(false));
+    }
+
+    #[test]
+    fn test_previous_response_history_resolves_output_call_name() {
+        let prior: ChatCompletionRequest = serde_json::from_value(serde_json::json!({
+            "model":"gpt-test",
+            "messages":[{"role":"assistant","tool_calls":[{
+                "id":"c1","type":"function",
+                "function":{"name":"Bash","arguments":"{\"command\":\"pwd\"}"}
+            }]}]
+        }))
+        .unwrap();
+        let req: ResponsesRequest = serde_json::from_value(serde_json::json!({
+            "model":"gpt-test",
+            "previous_response_id":"resp_1",
+            "input":[{"type":"function_call_output","call_id":"c1","output":"D:/repo"}]
+        }))
+        .unwrap();
+
+        let chat = convert_responses_to_chat_with_history(&req, &prior.messages).unwrap();
+
+        assert_eq!(chat.messages.len(), 2);
+        assert_eq!(chat.messages[1].role, "tool");
+        assert_eq!(chat.messages[1].name.as_deref(), Some("Bash"));
+    }
     use axum::Json;
     use axum::extract::State;
     use serde_json::json;
@@ -1249,6 +1464,7 @@ mod tests {
             active_sessions: dashmap::DashMap::new(),
             tool_sessions: dashmap::DashMap::new(),
             tool_ledger: crate::tool_runtime::ToolLedger::new(),
+            responses_state: crate::responses_state::ResponsesState::default(),
             model_mapper: mapper,
             admin_store: tokio::sync::RwLock::new(AdminStore::new(
                 "test-secret".to_string(),
@@ -1360,6 +1576,7 @@ mod tests {
             active_sessions: dashmap::DashMap::new(),
             tool_sessions: dashmap::DashMap::new(),
             tool_ledger: crate::tool_runtime::ToolLedger::new(),
+            responses_state: crate::responses_state::ResponsesState::default(),
             model_mapper: mapper,
             admin_store: tokio::sync::RwLock::new(AdminStore::new(
                 "test-secret".to_string(),
@@ -1391,6 +1608,9 @@ mod tests {
             })]),
             temperature: None,
             max_output_tokens: None,
+            tool_choice: None,
+            parallel_tool_calls: None,
+            previous_response_id: None,
         };
 
         let err = responses(State(state.clone()), Json(req))
@@ -1421,6 +1641,9 @@ mod tests {
             })]),
             temperature: None,
             max_output_tokens: None,
+            tool_choice: None,
+            parallel_tool_calls: None,
+            previous_response_id: None,
         };
 
         let err = responses(State(state.clone()), Json(req))

@@ -175,6 +175,33 @@ pub struct ResponsesRequest {
     pub temperature: Option<f64>,
     #[serde(default)]
     pub max_output_tokens: Option<u64>,
+    #[serde(default)]
+    pub tool_choice: Option<serde_json::Value>,
+    #[serde(default)]
+    pub parallel_tool_calls: Option<bool>,
+    #[serde(default)]
+    pub previous_response_id: Option<String>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(tag = "type")]
+pub enum ResponsesInputItem {
+    #[serde(rename = "message")]
+    Message {
+        role: String,
+        content: serde_json::Value,
+    },
+    #[serde(rename = "function_call")]
+    FunctionCall {
+        call_id: String,
+        name: String,
+        arguments: String,
+    },
+    #[serde(rename = "function_call_output")]
+    FunctionCallOutput {
+        call_id: String,
+        output: serde_json::Value,
+    },
 }
 
 #[derive(Debug, Clone, Serialize)]

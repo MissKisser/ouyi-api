@@ -176,6 +176,7 @@ mod tests {
             active_sessions: DashMap::new(),
             tool_sessions: DashMap::new(),
             tool_ledger: crate::tool_runtime::ToolLedger::new(),
+            responses_state: crate::responses_state::ResponsesState::default(),
             model_mapper: mapper,
             admin_store: RwLock::new(AdminStore::new("test-secret".to_string(), String::new())),
             account_store: AccountStore::new(),

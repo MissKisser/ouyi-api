@@ -22,6 +22,9 @@ pub enum AppError {
     #[error("模型未找到: {0}")]
     ModelNotFound(String),
 
+    #[error("Responses 续轮不存在或已过期: {0}")]
+    ResponseNotFound(String),
+
     #[error("请求过大: {0}")]
     PayloadTooLarge(String),
 
@@ -44,6 +47,7 @@ impl IntoResponse for AppError {
             AppError::ToolRecursion(_) => (StatusCode::BAD_GATEWAY, "tool_runtime_recursion"),
             AppError::SseStream(_) => (StatusCode::BAD_GATEWAY, "stream_error"),
             AppError::ModelNotFound(_) => (StatusCode::NOT_FOUND, "model_not_found"),
+            AppError::ResponseNotFound(_) => (StatusCode::NOT_FOUND, "response_not_found"),
             AppError::PayloadTooLarge(_) => (StatusCode::PAYLOAD_TOO_LARGE, "payload_too_large"),
             AppError::BadRequest(_) => (StatusCode::BAD_REQUEST, "bad_request"),
             AppError::Unauthorized => (StatusCode::UNAUTHORIZED, "authentication_error"),

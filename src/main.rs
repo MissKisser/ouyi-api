@@ -7,6 +7,7 @@ mod error;
 mod handler;
 mod model;
 mod platform;
+mod responses_state;
 mod router;
 mod tool_runtime;
 
@@ -52,6 +53,7 @@ pub struct AppState {
     /// Anthropic tool_use 会话缓存，key 为对话标识
     pub tool_sessions: DashMap<String, CachedToolSession>,
     pub tool_ledger: ToolLedger,
+    pub responses_state: responses_state::ResponsesState,
     pub model_mapper: ModelMapper,
     pub(crate) admin_store: RwLock<AdminStore>,
     pub account_store: AccountStore,
@@ -164,6 +166,7 @@ async fn main() -> Result<(), AppError> {
         active_sessions: DashMap::new(),
         tool_sessions: DashMap::new(),
         tool_ledger: ToolLedger::new(),
+        responses_state: responses_state::ResponsesState::default(),
         model_mapper,
         admin_store: RwLock::new(admin_store),
         account_store,
