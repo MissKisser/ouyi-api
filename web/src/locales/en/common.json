@@ -214,10 +214,17 @@
     "empty": "No models found",
     "clickToCopy": "Click to copy model ID",
     "searchPlaceholder": "Search model name or ID...",
-    "allCategories": "All"
+    "allCategories": "All",
+    "columnName": "Name",
+    "columnId": "Model ID",
+    "columnAction": "Action",
+    "copy": "Copy",
+    "copied": "Copied"
   },
   "chat": {
     "selectModel": "Select Model",
+    "searchModel": "Search model name, ID or provider...",
+    "noMatches": "No matching models",
     "params": "Params",
     "temperature": "Temperature",
     "topP": "Top P",

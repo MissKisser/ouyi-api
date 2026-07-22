@@ -32,15 +32,15 @@ export function Layout() {
   ];
 
   return (
-    <div className="min-h-screen flex bg-background">
-      {/* Sidebar */}
-      <aside className="w-56 border-r bg-card flex flex-col">
-        <div className="p-4 flex items-center gap-2">
+    <div className="h-screen flex bg-background overflow-hidden">
+      {/* Sidebar — fixed at viewport height, never scrolls with main */}
+      <aside className="w-56 shrink-0 border-r bg-card flex flex-col h-full overflow-y-auto">
+        <div className="p-4 flex items-center gap-2 shrink-0">
           <img src={`${import.meta.env.BASE_URL}admin/favicon.svg`} alt="Logo" className="h-6 w-6" />
           <span className="font-bold text-lg">DS Free API</span>
         </div>
-        <Separator />
-        <nav className="flex-1 p-2 space-y-1">
+        <Separator className="shrink-0" />
+        <nav className="flex-1 p-2 space-y-1 min-h-0">
           {navItems.map(({ to, icon: Icon, label }) => (
             <NavLink
               key={to}
@@ -58,8 +58,8 @@ export function Layout() {
             </NavLink>
           ))}
         </nav>
-        <Separator />
-        <div className="p-2 space-y-2">
+        <Separator className="shrink-0" />
+        <div className="p-2 space-y-2 shrink-0">
           <LanguageSwitcher />
           <Button
             variant="ghost"
@@ -72,8 +72,8 @@ export function Layout() {
         </div>
       </aside>
 
-      {/* Main content */}
-      <main className="flex-1 overflow-auto">
+      {/* Main content — owns the scroll, never grows the document */}
+      <main className="flex-1 min-w-0 h-full overflow-auto">
         <div className="p-6 w-full">
           <Outlet />
         </div>

@@ -381,37 +381,40 @@ export function LogsPage() {
 
   return (
     <div className="space-y-6">
-      <h1 className="text-2xl font-bold flex items-center gap-2">
-        <ScrollText className="h-6 w-6" />
-        {t('logs.title')}
-      </h1>
+      {/* 标题 + Tab 切换 —— 钉在主区域顶部，不随日志表格滚动 */}
+      <div className="sticky top-0 z-10 -mx-6 px-6 pt-3 pb-3 bg-background/95 backdrop-blur supports-[backdrop-filter]:bg-background/80 border-b flex flex-col gap-3">
+        <h1 className="text-2xl font-bold flex items-center gap-2">
+          <ScrollText className="h-6 w-6" />
+          {t('logs.title')}
+        </h1>
 
-      {/* Tab switcher */}
-      <div className="flex gap-2">
-        <Button
-          variant={tab === 'request' ? 'default' : 'outline'}
-          size="sm"
-          onClick={() => setTab('request')}
-        >
-          <ScrollText className="h-4 w-4 mr-1" />
-          {t('logs.tabs.request')}
-        </Button>
-        <Button
-          variant={tab === 'runtime' ? 'default' : 'outline'}
-          size="sm"
-          onClick={() => setTab('runtime')}
-        >
-          <Terminal className="h-4 w-4 mr-1" />
-          {t('logs.tabs.runtime')}
-        </Button>
-        <Button
-          variant={tab === 'toolRuntime' ? 'default' : 'outline'}
-          size="sm"
-          onClick={() => setTab('toolRuntime')}
-        >
-          <Wrench className="h-4 w-4 mr-1" />
-          {t('logs.tabs.toolRuntime')}
-        </Button>
+        {/* Tab switcher */}
+        <div className="flex gap-2">
+          <Button
+            variant={tab === 'request' ? 'default' : 'outline'}
+            size="sm"
+            onClick={() => setTab('request')}
+          >
+            <ScrollText className="h-4 w-4 mr-1" />
+            {t('logs.tabs.request')}
+          </Button>
+          <Button
+            variant={tab === 'runtime' ? 'default' : 'outline'}
+            size="sm"
+            onClick={() => setTab('runtime')}
+          >
+            <Terminal className="h-4 w-4 mr-1" />
+            {t('logs.tabs.runtime')}
+          </Button>
+          <Button
+            variant={tab === 'toolRuntime' ? 'default' : 'outline'}
+            size="sm"
+            onClick={() => setTab('toolRuntime')}
+          >
+            <Wrench className="h-4 w-4 mr-1" />
+            {t('logs.tabs.toolRuntime')}
+          </Button>
+        </div>
       </div>
 
       {tab === 'request' && <RequestLogsTab />}

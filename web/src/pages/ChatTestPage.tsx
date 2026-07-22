@@ -1,14 +1,15 @@
-import { useState, useRef, useEffect, useCallback } from 'react';
+import { useState, useRef, useEffect, useCallback, useMemo } from 'react';
 import { useTranslation } from 'react-i18next';
-import { Send, Settings2, Trash2, Copy, RefreshCw } from 'lucide-react';
+import { Send, Settings2, Trash2, Copy, RefreshCw, Search, Check, ChevronDown } from 'lucide-react';
 import { apiFetchModels, apiFetchCategorizedModels, apiFetchModelsOpenAI, type ModelInfo, type CategorizedModelGroup } from '@/lib/api';
 import { Button } from '@/components/ui/button';
 import { Textarea } from '@/components/ui/textarea';
 import { Label } from '@/components/ui/label';
 import { Switch } from '@/components/ui/switch';
 import { Slider } from '@/components/ui/slider';
-import { Select, SelectGroup, SelectItem } from '@/components/ui/select';
+import { Input } from '@/components/ui/input';
 import { Collapsible, CollapsibleContent } from '@/components/ui/collapsible';
+import { compareProviders, localizeProviderName } from '@/lib/model-labels';
 
 interface Message {
   role: 'user' | 'assistant' | 'system';
@@ -37,11 +38,16 @@ const DEFAULT_PARAMS: ChatParams = {
 };
 
 export function ChatTestPage() {
-  const { t } = useTranslation();
+  const { t, i18n } = useTranslation();
   const [models, setModels] = useState<ModelInfo[]>([]);
   const [categorizedGroups, setCategorizedGroups] = useState<CategorizedModelGroup[]>([]);
   const [useCategorized, setUseCategorized] = useState(true);
   const [selectedModel, setSelectedModel] = useState('');
+  const [modelSearch, setModelSearch] = useState('');
+  const [modelPickerOpen, setModelPickerOpen] = useState(false);
+  const [providerFilter, setProviderFilter] = useState<string | null>(null);
+  const providerChipRefs = useRef<Record<string, HTMLButtonElement | null>>({});
+  const providerGroupRefs = useRef<Record<string, HTMLDivElement | null>>({});
   const [messages, setMessages] = useState<Message[]>([]);
   const [input, setInput] = useState('');
   const [isLoading, setIsLoading] = useState(false);
@@ -52,17 +58,96 @@ export function ChatTestPage() {
   const abortRef = useRef<AbortController | null>(null);
   const messagesRef = useRef(messages);
   const rafRef = useRef<number | null>(null);
+  const modelPickerRef = useRef<HTMLDivElement>(null);
+
+  // 当前选中模型的展示名（用于触发器按钮）
+  const selectedDisplay = useMemo(() => {
+    if (!selectedModel) return '';
+    const lang = i18n.language;
+    if (useCategorized) {
+      for (const group of categorizedGroups) {
+        const hit = group.models.find(m => m.value === selectedModel);
+        if (hit) return `${hit.label}  ·  ${localizeProviderName(group.provider_name, lang)}`;
+      }
+    } else {
+      const hit = models.find(m => m.id === selectedModel);
+      if (hit) return hit.id;
+    }
+    return selectedModel;
+  }, [selectedModel, categorizedGroups, models, useCategorized, i18n.language]);
+
+  // 按 search 过滤后的分组与模型
+  const filteredCategorized = useMemo(() => {
+    const query = modelSearch.toLowerCase().trim();
+    if (!useCategorized) return [];
+    return categorizedGroups
+      .filter(group => !providerFilter || group.provider_key === providerFilter)
+      .map(group => {
+        const groupHits = query
+          ? group.provider_name.toLowerCase().includes(query) || group.provider_key.toLowerCase().includes(query)
+          : true;
+        const models = !query
+          ? group.models
+          : groupHits
+            ? group.models
+            : group.models.filter(
+                m => m.label.toLowerCase().includes(query) || m.value.toLowerCase().includes(query),
+              );
+        return { ...group, models };
+      })
+      .filter(group => group.models.length > 0);
+  }, [categorizedGroups, modelSearch, useCategorized, providerFilter]);
+
+  const filteredFlat = useMemo(() => {
+    const query = modelSearch.toLowerCase().trim();
+    if (useCategorized) return [];
+    if (!query) return models;
+    return models.filter(m => m.id.toLowerCase().includes(query));
+  }, [models, modelSearch, useCategorized]);
+
+  // 关闭 picker 的外部点击 / Esc
+  useEffect(() => {
+    if (!modelPickerOpen) return;
+    const onPointer = (e: MouseEvent) => {
+      if (modelPickerRef.current && !modelPickerRef.current.contains(e.target as Node)) {
+        setModelPickerOpen(false);
+        setProviderFilter(null);
+      }
+    };
+    const onKey = (e: KeyboardEvent) => {
+      if (e.key === 'Escape') {
+        setModelPickerOpen(false);
+        setProviderFilter(null);
+      }
+    };
+    document.addEventListener('mousedown', onPointer);
+    document.addEventListener('keydown', onKey);
+    return () => {
+      document.removeEventListener('mousedown', onPointer);
+      document.removeEventListener('keydown', onKey);
+    };
+  }, [modelPickerOpen]);
 
   useEffect(() => {
     messagesRef.current = messages;
   }, [messages]);
 
-  // 加载模型列表
+  // 当用户点击 chip 切到某个 provider 时，自动滚动 dropdown 到该组
+  useEffect(() => {
+    if (!modelPickerOpen || !providerFilter) return;
+    const id = window.setTimeout(() => {
+      const el = providerGroupRefs.current[providerFilter];
+      if (el) el.scrollIntoView({ block: 'start', behavior: 'smooth' });
+    }, 50);
+    return () => window.clearTimeout(id);
+  }, [modelPickerOpen, providerFilter, modelSearch]);  // 加载模型列表
   useEffect(() => {
     const fetchModels = async () => {
       try {
         const categorized = await apiFetchCategorizedModels();
-        const groups = categorized.categories ?? [];
+        const groups = (categorized.categories ?? [])
+          .slice()
+          .sort((a, b) => compareProviders(a.provider_name, b.provider_name));
         if (groups.length > 0) {
           setCategorizedGroups(groups);
           setUseCategorized(true);
@@ -216,26 +301,159 @@ export function ChatTestPage() {
     <div className="flex flex-col h-[calc(100vh-4rem)] -m-6">
       {/* 顶部栏：模型选择 + 参数面板 */}
       <div className="flex items-center gap-4 px-4 py-2 border-b bg-card shrink-0">
-        <div className="flex-1">
-          <Select
-            value={selectedModel}
-            onValueChange={setSelectedModel}
-            placeholder={t('chat.selectModel')}
-            className="w-full max-w-xs"
+        <div className="flex-1 min-w-0 relative" ref={modelPickerRef}>
+          <Button
+            type="button"
+            variant="outline"
+            className="w-full justify-between font-normal h-9 px-3 min-w-0"
+            onClick={() => {
+              if (modelPickerOpen) {
+                setModelPickerOpen(false);
+                setProviderFilter(null);
+              } else {
+                setModelSearch('');
+                setProviderFilter(null);
+                setModelPickerOpen(true);
+              }
+            }}
+            disabled={!selectedModel && categorizedGroups.length === 0 && models.length === 0}
           >
-            {useCategorized
-              ? categorizedGroups.map(group => (
-                  <SelectGroup key={group.provider_key} label={group.provider_name}>
-                    {group.models.map(m => (
-                      <SelectItem key={m.value} value={m.value}>{m.label}</SelectItem>
-                    ))}
-                  </SelectGroup>
-                ))
-              : models.map(m => (
-                  <SelectItem key={m.id} value={m.id}>{(m as { display?: string }).display || m.id}</SelectItem>
-                ))
-            }
-          </Select>
+            <span className="truncate text-left flex-1">
+              {selectedDisplay || t('chat.selectModel')}
+            </span>
+            <ChevronDown className="h-4 w-4 ml-2 shrink-0 opacity-60" />
+          </Button>
+          {useCategorized && categorizedGroups.length > 0 && (
+            <div className="mt-2 flex gap-1.5 overflow-x-auto pb-1 -mx-1 px-1">
+              <button
+                type="button"
+                className={`shrink-0 inline-flex items-center text-xs px-2.5 h-7 rounded-full border transition-colors ${providerFilter === null ? 'bg-primary text-primary-foreground border-primary' : 'bg-background hover:bg-accent hover:text-accent-foreground text-muted-foreground'}`}
+                onClick={() => {
+                  setProviderFilter(null);
+                  if (!modelPickerOpen) setModelPickerOpen(true);
+                }}
+              >
+                {t('models.allCategories')}
+              </button>
+              {categorizedGroups.map(group => {
+                const active = providerFilter === group.provider_key;
+                return (
+                  <button
+                    key={group.provider_key}
+                    type="button"
+                    ref={el => {
+                      providerChipRefs.current[group.provider_key] = el;
+                    }}
+                    className={`shrink-0 inline-flex items-center text-xs px-2.5 h-7 rounded-full border transition-colors ${active ? 'bg-primary text-primary-foreground border-primary' : 'bg-background hover:bg-accent hover:text-accent-foreground text-muted-foreground'}`}
+                    onClick={() => {
+                      setProviderFilter(group.provider_key);
+                      if (!modelPickerOpen) setModelPickerOpen(true);
+                    }}
+                  >
+                    {localizeProviderName(group.provider_name, i18n.language)}
+                    <span className={`ml-1 ${active ? 'opacity-80' : 'opacity-60'}`}>{group.count}</span>
+                  </button>
+                );
+              })}
+            </div>
+          )}
+          {modelPickerOpen && (
+            <div className="absolute z-50 mt-1 w-full max-h-[60vh] overflow-hidden flex flex-col rounded-md border bg-popover shadow-lg">
+              <div className="p-2 border-b shrink-0">
+                <div className="relative">
+                  <Search className="absolute left-2.5 top-1/2 -translate-y-1/2 h-4 w-4 text-muted-foreground" />
+                  <Input
+                    autoFocus
+                    value={modelSearch}
+                    onChange={e => {
+                      setModelSearch(e.target.value);
+                      if (providerFilter) setProviderFilter(null);
+                    }}
+                    placeholder={t('chat.searchModel')}
+                    className="pl-8 h-8"
+                    onKeyDown={e => {
+                      if (e.key === 'Enter' && modelSearch.trim()) {
+                        // 回车直接选中第一个可见项
+                        const first = useCategorized
+                          ? filteredCategorized[0]?.models[0]
+                          : filteredFlat[0];
+                        if (first) {
+                          const value = useCategorized
+                            ? (first as { value: string }).value
+                            : (first as { id: string }).id;
+                          setSelectedModel(value);
+                          setModelPickerOpen(false);
+                          e.preventDefault();
+                        }
+                      }
+                    }}
+                  />
+                </div>
+              </div>
+              <div className="overflow-y-auto p-1 text-sm">
+                {useCategorized ? (
+                  filteredCategorized.length === 0 ? (
+                    <div className="px-3 py-6 text-center text-muted-foreground text-xs">
+                      {t('chat.noMatches')}
+                    </div>
+                  ) : (
+                    filteredCategorized.map(group => (
+                      <div
+                        key={group.provider_key}
+                        className="mb-1"
+                        ref={el => {
+                          providerGroupRefs.current[group.provider_key] = el;
+                        }}
+                      >
+                        <div className="px-2 pt-2 pb-1 text-xs font-medium text-muted-foreground sticky top-0 bg-popover">
+                          {localizeProviderName(group.provider_name, i18n.language)} <span className="opacity-60">({group.models.length})</span>
+                        </div>
+                        {group.models.map(m => {
+                          const active = m.value === selectedModel;
+                          return (
+                            <button
+                              key={m.value}
+                              type="button"
+                              className={`w-full text-left px-2 py-1.5 rounded-sm hover:bg-accent hover:text-accent-foreground flex items-center gap-2 ${active ? 'bg-accent/50' : ''}`}
+                              onClick={() => {
+                                setSelectedModel(m.value);
+                                setModelPickerOpen(false);
+                              }}
+                            >
+                              <span className="flex-1 truncate">{m.label}</span>
+                              {active && <Check className="h-3.5 w-3.5 text-primary shrink-0" />}
+                            </button>
+                          );
+                        })}
+                      </div>
+                    ))
+                  )
+                ) : filteredFlat.length === 0 ? (
+                  <div className="px-3 py-6 text-center text-muted-foreground text-xs">
+                    {t('chat.noMatches')}
+                  </div>
+                ) : (
+                  filteredFlat.map(m => {
+                    const active = m.id === selectedModel;
+                    return (
+                      <button
+                        key={m.id}
+                        type="button"
+                        className={`w-full text-left px-2 py-1.5 rounded-sm hover:bg-accent hover:text-accent-foreground flex items-center gap-2 ${active ? 'bg-accent/50' : ''}`}
+                        onClick={() => {
+                          setSelectedModel(m.id);
+                          setModelPickerOpen(false);
+                        }}
+                      >
+                        <span className="flex-1 truncate">{m.id}</span>
+                        {active && <Check className="h-3.5 w-3.5 text-primary shrink-0" />}
+                      </button>
+                    );
+                  })
+                )}
+              </div>
+            </div>
+          )}
         </div>
 
         <div className="relative">
