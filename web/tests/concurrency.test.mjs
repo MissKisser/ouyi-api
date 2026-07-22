@@ -1,4 +1,5 @@
 import assert from 'node:assert/strict';
+import { readFile } from 'node:fs/promises';
 import test from 'node:test';
 
 import {
@@ -30,4 +31,11 @@ test('keeps an empty concurrency input invalid', () => {
 
 test('parses a numeric concurrency input', () => {
   assert.equal(parseMaxConcurrentRequestsInput('3'), 3);
+});
+
+test('shows concurrency settings in an expanded dedicated config section', async () => {
+  const source = await readFile(new URL('../src/pages/ConfigPage.tsx', import.meta.url), 'utf8');
+
+  assert.match(source, /<Section title=\{t\('config\.sections\.limits'\)\}[^>]*defaultOpen/);
+  assert.match(source, /t\('config\.server\.maxConcurrentRequests'\)/);
 });

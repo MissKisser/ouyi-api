@@ -1,14 +1,52 @@
 import { useState, useCallback, useMemo } from 'react';
 import useSWR from 'swr';
-import { apiFetch, apiFetchCategorizedModels, type ModelListResponse, type CategorizedModelsResponse } from '@/lib/api';
+import {
+  apiFetch,
+  apiFetchCategorizedModels,
+  type CategorizedModelGroup,
+  type ModelListResponse,
+  type CategorizedModelsResponse,
+} from '@/lib/api';
 import { Card, CardContent, CardHeader, CardTitle } from '@/components/ui/card';
 import { Badge } from '@/components/ui/badge';
 import { Input } from '@/components/ui/input';
 import { Boxes, Copy, Check, Search, ChevronDown, ChevronRight } from 'lucide-react';
 import { useTranslation } from 'react-i18next';
+import { compareProviders, localizeProviderName } from '@/lib/model-labels';
+
+/**
+ * Filter categorized model groups by an active provider chip and a free-text
+ * query. The query is case-insensitive and matches against the group's
+ * provider name/key as well as each model's label/value, so that natural
+ * searches like "openai" or "gpt-4o-mini" both surface the right group.
+ */
+function filterCategorizedGroups(
+  groups: CategorizedModelGroup[],
+  activeProvider: string | null,
+  search: string,
+): CategorizedModelGroup[] {
+  const query = search.toLowerCase().trim();
+  return groups
+    .filter(g => !activeProvider || g.provider_key === activeProvider)
+    .map(g => {
+      const groupMatches = query
+        ? g.provider_name.toLowerCase().includes(query) || g.provider_key.toLowerCase().includes(query)
+        : true;
+      if (!query) return g;
+      return {
+        ...g,
+        models: groupMatches
+          ? g.models
+          : g.models.filter(
+              m => m.label.toLowerCase().includes(query) || m.value.toLowerCase().includes(query),
+            ),
+      };
+    })
+    .filter(g => g.models.length > 0);
+}
 
 export function ModelsPage() {
-  const { t } = useTranslation();
+  const { t, i18n } = useTranslation();
   const [copiedId, setCopiedId] = useState<string | null>(null);
   const [search, setSearch] = useState('');
   const [activeProvider, setActiveProvider] = useState<string | null>(null);
@@ -35,31 +73,25 @@ export function ModelsPage() {
   );
 
   const categorizedGroups = useMemo(
-    () => categorizedResponse?.categories ?? [],
+    () => (categorizedResponse?.categories ?? []).slice().sort((a, b) => compareProviders(a.provider_name, b.provider_name)),
     [categorizedResponse?.categories],
   );
 
-  const shouldFetchFlat = categorizedGroups.length === 0;
+  // Only fall back to the flat /admin/api/models endpoint when the categorized
+  // endpoint is unavailable (no response yet or hard error). A categorized
+  // response with zero entries should still render the categorized UI — we used
+  // to flip to the flat view in that case, which silently hid the search box.
+  const hasCategories = categorizedGroups.length > 0;
+  const shouldFetchFlat = !hasCategories && !error;
   const { data: models } = useSWR<ModelListResponse>(
     shouldFetchFlat ? '/admin/api/models' : null,
     (url: string) => apiFetch<ModelListResponse>(url),
   );
 
-  const hasCategories = categorizedGroups.length > 0;
-
-  const filteredGroups = useMemo(() => {
-    if (!hasCategories) return [];
-    const q = search.toLowerCase().trim();
-    return categorizedGroups
-      .filter(g => !activeProvider || g.provider_key === activeProvider)
-      .map(g => ({
-        ...g,
-        models: q
-          ? g.models.filter(m => m.label.toLowerCase().includes(q) || m.value.toLowerCase().includes(q))
-          : g.models,
-      }))
-      .filter(g => g.models.length > 0);
-  }, [categorizedGroups, activeProvider, search, hasCategories]);
+  const filteredGroups = useMemo(
+    () => filterCategorizedGroups(categorizedGroups, activeProvider, search),
+    [categorizedGroups, activeProvider, search],
+  );
 
   const filteredFlatModels = useMemo(() => {
     if (hasCategories || !models?.data) return [];
@@ -86,45 +118,47 @@ export function ModelsPage() {
 
   return (
     <div className="space-y-4">
-      <h1 className="text-2xl font-bold flex items-center gap-2">
-        <Boxes className="h-6 w-6" />
-        {t('models.title')}
-        <Badge variant="secondary" className="text-xs ml-2">
-          {shownCount}/{totalCount}
-        </Badge>
-      </h1>
-
-      {/* 搜索 & 分类筛选 */}
-      <div className="flex flex-col gap-3 sm:flex-row sm:items-center">
-        <div className="relative flex-1 max-w-sm">
+      {/* 标题 + 搜索 + 分类筛选 —— 整体钉在主区域顶部，不随卡片列表滚动 */}
+      <div className="sticky top-0 z-10 -mx-6 px-6 pt-3 pb-3 bg-background/95 backdrop-blur supports-[backdrop-filter]:bg-background/80 border-b flex flex-col gap-3">
+        <h1 className="text-2xl font-bold flex items-center gap-2">
+          <Boxes className="h-6 w-6" />
+          {t('models.title')}
+          <Badge variant="secondary" className="text-xs ml-2">
+            {shownCount}/{totalCount}
+          </Badge>
+        </h1>
+        <div className="relative w-full">
           <Search className="absolute left-2.5 top-1/2 -translate-y-1/2 h-4 w-4 text-muted-foreground" />
           <Input
             placeholder={t('models.searchPlaceholder')}
             value={search}
             onChange={e => setSearch(e.target.value)}
-            className="pl-8"
+            className="pl-8 w-full"
           />
         </div>
         {hasCategories && (
-          <div className="flex flex-wrap gap-1.5">
-            <Badge
-              variant={activeProvider === null ? 'default' : 'outline'}
-              className="cursor-pointer text-xs"
+          <div className="flex gap-1.5 overflow-x-auto pb-1 -mx-1 px-1">
+            <button
+              type="button"
+              className={`shrink-0 inline-flex items-center text-xs px-2.5 h-7 rounded-full border transition-colors ${activeProvider === null ? 'bg-primary text-primary-foreground border-primary' : 'bg-background hover:bg-accent hover:text-accent-foreground text-muted-foreground'}`}
               onClick={() => setActiveProvider(null)}
             >
               {t('models.allCategories')}
-            </Badge>
-            {categorizedGroups.map(g => (
-              <Badge
-                key={g.provider_key}
-                variant={activeProvider === g.provider_key ? 'default' : 'outline'}
-                className="cursor-pointer text-xs"
-                onClick={() => setActiveProvider(activeProvider === g.provider_key ? null : g.provider_key)}
-              >
-                {g.provider_name}
-                <span className="ml-1 opacity-60">{g.count}</span>
-              </Badge>
-            ))}
+            </button>
+            {categorizedGroups.map(g => {
+              const active = activeProvider === g.provider_key;
+              return (
+                <button
+                  key={g.provider_key}
+                  type="button"
+                  className={`shrink-0 inline-flex items-center text-xs px-2.5 h-7 rounded-full border transition-colors ${active ? 'bg-primary text-primary-foreground border-primary' : 'bg-background hover:bg-accent hover:text-accent-foreground text-muted-foreground'}`}
+                  onClick={() => setActiveProvider(active ? null : g.provider_key)}
+                >
+                  {localizeProviderName(g.provider_name, i18n.language)}
+                  <span className={`ml-1 ${active ? 'opacity-80' : 'opacity-60'}`}>{g.count}</span>
+                </button>
+              );
+            })}
           </div>
         )}
       </div>
@@ -144,7 +178,7 @@ export function ModelsPage() {
                       {isCollapsed
                         ? <ChevronRight className="h-4 w-4 text-muted-foreground" />
                         : <ChevronDown className="h-4 w-4 text-muted-foreground" />}
-                      {group.provider_name}
+                      {localizeProviderName(group.provider_name, i18n.language)}
                     </span>
                     <Badge variant="secondary" className="text-xs">
                       {group.models.length} {t('models.available')}
@@ -152,24 +186,50 @@ export function ModelsPage() {
                   </CardTitle>
                 </CardHeader>
                 {!isCollapsed && (
-                  <CardContent>
-                    <div className="flex flex-wrap gap-2">
-                      {group.models.map((model) => {
-                        const isCopied = copiedId === model.value;
-                        return (
-                          <Badge
-                            key={model.value}
-                            variant="outline"
-                            className="text-xs cursor-pointer hover:bg-accent hover:text-accent-foreground transition-colors"
-                            onClick={() => handleCopy(model.value)}
-                            title={`${t('models.clickToCopy')}: ${model.value}`}
-                          >
-                            {isCopied ? <Check className="h-3 w-3 mr-1" /> : <Copy className="h-3 w-3 mr-1 opacity-50" />}
-                            {model.label}
-                          </Badge>
-                        );
-                      })}
-                    </div>
+                  <CardContent className="pt-0">
+                    <table className="w-full text-sm">
+                      <thead>
+                        <tr className="text-xs text-muted-foreground border-b">
+                          <th className="text-left font-medium py-2 pl-1 pr-3 w-2/5">{t('models.columnName')}</th>
+                          <th className="text-left font-medium py-2 px-3">{t('models.columnId')}</th>
+                          <th className="text-right font-medium py-2 pl-3 pr-1 w-24">{t('models.columnAction')}</th>
+                        </tr>
+                      </thead>
+                      <tbody>
+                        {group.models.map((model) => {
+                          const isCopied = copiedId === model.value;
+                          const sameName = model.label === model.value;
+                          return (
+                            <tr
+                              key={model.value}
+                              className="border-b last:border-b-0 hover:bg-muted/40 transition-colors"
+                            >
+                              <td className="py-2 pl-1 pr-3 align-top">
+                                <span className="font-medium">{model.label}</span>
+                              </td>
+                              <td className="py-2 px-3 align-top">
+                                {sameName ? (
+                                  <span className="text-muted-foreground text-xs">—</span>
+                                ) : (
+                                  <code className="text-xs font-mono text-muted-foreground break-all">{model.value}</code>
+                                )}
+                              </td>
+                              <td className="py-2 pl-3 pr-1 align-top text-right">
+                                <button
+                                  type="button"
+                                  onClick={() => handleCopy(model.value)}
+                                  className={`inline-flex items-center gap-1 text-xs px-2 h-7 rounded-md border transition-colors ${isCopied ? 'bg-primary text-primary-foreground border-primary' : 'bg-background hover:bg-accent hover:text-accent-foreground text-muted-foreground'}`}
+                                  title={model.value}
+                                >
+                                  {isCopied ? <Check className="h-3 w-3" /> : <Copy className="h-3 w-3" />}
+                                  <span>{isCopied ? t('models.copied') : t('models.copy')}</span>
+                                </button>
+                              </td>
+                            </tr>
+                          );
+                        })}
+                      </tbody>
+                    </table>
                   </CardContent>
                 )}
               </Card>

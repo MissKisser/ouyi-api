@@ -29,6 +29,7 @@ import {
   User,
   Shield,
   Globe,
+  Gauge,
 } from 'lucide-react';
 import { useTranslation } from 'react-i18next';
 import {
@@ -394,6 +395,35 @@ export function ConfigPage() {
         </div>
       </Section>
 
+      {/* Concurrency limits */}
+      <Section title={t('config.sections.limits')} icon={Gauge} defaultOpen>
+        <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
+          <div>
+            <label className="text-sm text-muted-foreground block mb-1">
+              {t('config.server.maxConcurrentRequests')}
+            </label>
+            <Input
+              type="number"
+              min={0}
+              max={MAX_CONCURRENT_REQUESTS}
+              step={1}
+              value={Number.isNaN(config.limits.max_concurrent_requests) ? '' : config.limits.max_concurrent_requests}
+              onChange={(e) =>
+                update(['limits', 'max_concurrent_requests'], parseMaxConcurrentRequestsInput(e.target.value))
+              }
+              aria-invalid={!valid}
+            />
+            <p className={`mt-1 text-xs ${valid ? 'text-muted-foreground' : 'text-destructive'}`}>
+              {!valid
+                ? t('config.server.maxConcurrentRequestsError')
+                : config.limits.max_concurrent_requests === 0
+                  ? t('config.server.maxConcurrentRequestsUnlimited')
+                  : t('config.server.maxConcurrentRequestsHotReloadHint')}
+            </p>
+          </div>
+        </div>
+      </Section>
+
       {/* Ouyi 7 */}
       <Section title={t('config.sections.ouyi7')} icon={Globe}>
         <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
@@ -750,29 +780,6 @@ export function ConfigPage() {
               value={config.server.port}
               onChange={(e) => update(['server', 'port'], Number(e.target.value))}
             />
-          </div>
-          <div className="md:col-span-2">
-            <label className="text-sm text-muted-foreground block mb-1">
-              {t('config.server.maxConcurrentRequests')}
-            </label>
-            <Input
-              type="number"
-              min={0}
-              max={MAX_CONCURRENT_REQUESTS}
-              step={1}
-              value={Number.isNaN(config.limits.max_concurrent_requests) ? '' : config.limits.max_concurrent_requests}
-              onChange={(e) =>
-                update(['limits', 'max_concurrent_requests'], parseMaxConcurrentRequestsInput(e.target.value))
-              }
-              aria-invalid={!valid}
-            />
-            <p className={`mt-1 text-xs ${valid ? 'text-muted-foreground' : 'text-destructive'}`}>
-              {!valid
-                ? t('config.server.maxConcurrentRequestsError')
-                : config.limits.max_concurrent_requests === 0
-                  ? t('config.server.maxConcurrentRequestsUnlimited')
-                  : t('config.server.maxConcurrentRequestsHotReloadHint')}
-            </p>
           </div>
         </div>
       </Section>
