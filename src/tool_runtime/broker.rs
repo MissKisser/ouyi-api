@@ -1,33 +1,11 @@
-use crate::adapter::tool_call::{ToolCallParser, repair_json};
 use crate::config::ToolRuntimeConfig;
 use crate::error::AppError;
 use crate::model::anthropic::MessagesRequest;
+use crate::tool_runtime::dialect::parse_known_tool_calls;
 use crate::tool_runtime::protocol::ToolSpec;
 
 fn broker_id() -> String {
     format!("call_broker_{}", uuid::Uuid::new_v4().simple())
-}
-
-fn parse_arguments_json(arguments: &str, tool_name: &str) -> Option<serde_json::Value> {
-    if let Ok(v) = serde_json::from_str(arguments) {
-        return Some(v);
-    }
-    let repaired = repair_json(arguments)?;
-    match serde_json::from_str(&repaired) {
-        Ok(v) => {
-            tracing::info!(%tool_name, "工具参数 JSON 已自动整理");
-            Some(v)
-        }
-        Err(e) => {
-            tracing::warn!(
-                %tool_name,
-                arguments_len = arguments.len(),
-                %e,
-                "工具参数 JSON 解析失败，跳过该工具调用"
-            );
-            None
-        }
-    }
 }
 
 #[derive(Debug, Clone)]
@@ -57,31 +35,19 @@ pub fn parse_marked_tool_calls(
     ouyi_output: &str,
     tools: &[ToolSpec],
 ) -> Result<Vec<BrokerToolCall>, String> {
-    let mut parser = ToolCallParser::new();
-    let parsed = parser.process_chunk(ouyi_output);
+    let parsed = parse_known_tool_calls(ouyi_output)?;
     let mut calls = Vec::new();
 
-    for delta in parsed.tool_deltas {
-        let func = delta
-            .function
-            .ok_or_else(|| "工具调用缺少 function".to_string())?;
-        let name = func
-            .name
-            .filter(|name| !name.is_empty())
-            .ok_or_else(|| "工具调用缺少 name".to_string())?;
+    for parsed_call in parsed {
+        let name = parsed_call.name;
         if find_tool(tools, &name).is_none() {
             tracing::warn!(%name, "主模型输出未知工具，已跳过");
             continue;
         }
-        let arguments = func.arguments.unwrap_or_else(|| "{}".to_string());
-        let input = match parse_arguments_json(&arguments, &name) {
-            Some(v) => v,
-            None => continue,
-        };
         calls.push(BrokerToolCall {
             id: broker_id(),
             name,
-            input,
+            input: parsed_call.input,
         });
     }
 
@@ -419,6 +385,18 @@ mod tests {
         assert_eq!(calls[0].name, "Bash");
         assert_eq!(calls[0].input["command"], "pwd");
         assert!(calls[0].id.starts_with("call_broker_"));
+    }
+
+    #[test]
+    fn test_parse_marked_glm_tool_call() {
+        let tools = vec![bash_spec()];
+        let output = r#"<tool_call>Bash▁command▁params▁{"command":"pwd"}"#;
+
+        let calls = parse_marked_tool_calls(output, &tools).unwrap();
+
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].name, "Bash");
+        assert_eq!(calls[0].input["command"], "pwd");
     }
 
     #[test]
