@@ -31,6 +31,7 @@ where
     Ok(config)
 }
 
+#[cfg(test)]
 pub fn write_document(path: &Path, document: &toml_edit::DocumentMut) -> Result<(), AppError> {
     let _guard = CONFIG_FILE_LOCK
         .lock()
@@ -38,6 +39,7 @@ pub fn write_document(path: &Path, document: &toml_edit::DocumentMut) -> Result<
     atomic_replace_unlocked(path, document.to_string().as_bytes())
 }
 
+#[cfg(test)]
 pub fn atomic_replace(path: &Path, bytes: &[u8]) -> Result<(), AppError> {
     let _guard = CONFIG_FILE_LOCK
         .lock()
