@@ -17,39 +17,36 @@ if ([string]::IsNullOrWhiteSpace($ApiKey)) {
 }
 
 $Prompt = @'
-Complete this deterministic workflow. First call ReadFact with key "alpha". After you receive
-that tool result, call Calculate with left equal to the numeric ReadFact result and right equal
-to 6. Do not call both tools in the same response. After Calculate returns, answer with a final
-sentence containing FINAL:42. Never invent a tool result and never skip either tool.
+Complete this deterministic workflow. First call Read with path "alpha". After you receive
+that tool result, call Bash with a command that calculates 7 multiplied by 6. Do not call both
+tools in the same response. After Bash returns, answer with a final sentence containing FINAL:42.
+Never invent a tool result and never skip either tool.
 '@
 
 $JsonSchemaReadFact = @{
     type = 'object'
-    properties = @{ key = @{ type = 'string'; enum = @('alpha') } }
-    required = @('key')
+    properties = @{ path = @{ type = 'string'; enum = @('alpha') } }
+    required = @('path')
     additionalProperties = $false
 }
 $JsonSchemaCalculate = @{
     type = 'object'
-    properties = @{
-        left = @{ type = 'integer' }
-        right = @{ type = 'integer'; enum = @(6) }
-    }
-    required = @('left', 'right')
+    properties = @{ command = @{ type = 'string' } }
+    required = @('command')
     additionalProperties = $false
 }
 
 $OpenAiTools = @(
-    @{ type = 'function'; function = @{ name = 'ReadFact'; description = 'Read the requested deterministic fact.'; parameters = $JsonSchemaReadFact } },
-    @{ type = 'function'; function = @{ name = 'Calculate'; description = 'Multiply left by right.'; parameters = $JsonSchemaCalculate } }
+    @{ type = 'function'; function = @{ name = 'Read'; description = 'Read the requested deterministic fact.'; parameters = $JsonSchemaReadFact } },
+    @{ type = 'function'; function = @{ name = 'Bash'; description = 'Run the requested calculation command.'; parameters = $JsonSchemaCalculate } }
 )
 $AnthropicTools = @(
-    @{ name = 'ReadFact'; description = 'Read the requested deterministic fact.'; input_schema = $JsonSchemaReadFact },
-    @{ name = 'Calculate'; description = 'Multiply left by right.'; input_schema = $JsonSchemaCalculate }
+    @{ name = 'Read'; description = 'Read the requested deterministic fact.'; input_schema = $JsonSchemaReadFact },
+    @{ name = 'Bash'; description = 'Run the requested calculation command.'; input_schema = $JsonSchemaCalculate }
 )
 $ResponsesTools = @(
-    @{ type = 'function'; name = 'ReadFact'; description = 'Read the requested deterministic fact.'; parameters = $JsonSchemaReadFact },
-    @{ type = 'function'; name = 'Calculate'; description = 'Multiply left by right.'; parameters = $JsonSchemaCalculate }
+    @{ type = 'function'; name = 'Read'; description = 'Read the requested deterministic fact.'; parameters = $JsonSchemaReadFact },
+    @{ type = 'function'; name = 'Bash'; description = 'Run the requested calculation command.'; parameters = $JsonSchemaCalculate }
 )
 
 function Invoke-ProxyRequest {
@@ -131,17 +128,19 @@ function Assert-NoRawToolMarkup {
 
 function Invoke-FakeTool {
     param([string]$Name, [object]$Arguments, [int]$ExpectedIndex)
-    $toolSequence = @('ReadFact', 'Calculate')
+    $toolSequence = @('Read', 'Bash')
     if ($ExpectedIndex -ge $toolSequence.Count -or $Name -ne $toolSequence[$ExpectedIndex]) {
         $expectedName = if ($ExpectedIndex -lt $toolSequence.Count) { $toolSequence[$ExpectedIndex] } else { '<none>' }
         throw "expected tool $expectedName (index=$ExpectedIndex), got $Name"
     }
-    if ($Name -eq 'ReadFact') {
-        if ($Arguments.key -ne 'alpha') { throw 'ReadFact key must be alpha' }
+    if ($Name -eq 'Read') {
+        if ($Arguments.path -ne 'alpha') {
+            throw "Read path must be alpha; got $($Arguments | ConvertTo-Json -Compress)"
+        }
         return '7'
     }
-    if ([int]$Arguments.left -ne 7 -or [int]$Arguments.right -ne 6) {
-        throw "Calculate arguments must be left=7,right=6; got $($Arguments | ConvertTo-Json -Compress)"
+    if ($Arguments.command -notmatch '7' -or $Arguments.command -notmatch '6') {
+        throw "Bash command must calculate 7 and 6; got $($Arguments | ConvertTo-Json -Compress)"
     }
     return '42'
 }
@@ -274,8 +273,12 @@ function Invoke-OpenAiCase {
     $toolTurn = 0
     for ($round = 0; $round -lt 4; $round++) {
         $body = @{
-            model = $Model; messages = @($messages); tools = $OpenAiTools
-            tool_choice = 'auto'; parallel_tool_calls = $false; stream = $Stream; max_tokens = 256
+            model = $Model; messages = @($messages); stream = $Stream; max_tokens = 256
+        }
+        if ($toolTurn -lt 2) {
+            $body.tools = $OpenAiTools
+            $body.tool_choice = 'required'
+            $body.parallel_tool_calls = $false
         }
         $raw = Invoke-ProxyRequest -Path '/v1/chat/completions' -Body $body
         Assert-NoRawToolMarkup $raw
@@ -304,8 +307,11 @@ function Invoke-AnthropicCase {
     $toolTurn = 0
     for ($round = 0; $round -lt 4; $round++) {
         $body = @{
-            model = $Model; messages = @($messages); tools = $AnthropicTools
-            tool_choice = @{ type = 'auto' }; stream = $Stream; max_tokens = 256
+            model = $Model; messages = @($messages); stream = $Stream; max_tokens = 256
+        }
+        if ($toolTurn -lt 2) {
+            $body.tools = $AnthropicTools
+            $body.tool_choice = @{ type = 'any' }
         }
         $raw = Invoke-ProxyRequest -Path '/anthropic/v1/messages' -Body $body -Anthropic
         Assert-NoRawToolMarkup $raw
@@ -334,8 +340,12 @@ function Invoke-ResponsesCase {
     $toolTurn = 0
     for ($round = 0; $round -lt 4; $round++) {
         $body = @{
-            model = $Model; input = $input; tools = $ResponsesTools
-            tool_choice = 'auto'; parallel_tool_calls = $false; stream = $Stream; max_output_tokens = 256
+            model = $Model; input = $input; stream = $Stream; max_output_tokens = 256
+        }
+        if ($toolTurn -lt 2) {
+            $body.tools = $ResponsesTools
+            $body.tool_choice = 'required'
+            $body.parallel_tool_calls = $false
         }
         if (-not [string]::IsNullOrWhiteSpace($previousResponseId)) {
             $body.previous_response_id = $previousResponseId

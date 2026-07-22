@@ -79,7 +79,7 @@ async fn responses_v8(
     let config = state.config.read().await.clone();
     let should_thinking = state.model_mapper.should_thinking(&chat_req.model);
 
-    let has_tools = req.tools.as_ref().is_some_and(|tools| !tools.is_empty());
+    let has_tools = crate::tool_runtime::protocol::openai_tools_enabled(&chat_req);
     if has_tools {
         return responses_v8_tools(state, req, chat_req, model_full, start_time, is_stream).await;
     }
@@ -403,7 +403,7 @@ async fn responses_v7(
 
     let max_history = v7_config.max_history_messages;
 
-    let has_tools = req.tools.as_ref().is_some_and(|tools| !tools.is_empty());
+    let has_tools = crate::tool_runtime::protocol::openai_tools_enabled(&chat_req);
     if has_tools {
         return responses_v7_tools(state, req, chat_req, model_full, start_time).await;
     }

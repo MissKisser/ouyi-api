@@ -48,7 +48,7 @@ pub async fn chat_completions(
     let start_time = std::time::Instant::now();
 
     // 长时任务轮询检查（所有平台共用）
-    let has_tools = req.tools.as_ref().is_some_and(|tools| !tools.is_empty());
+    let has_tools = crate::tool_runtime::protocol::openai_tools_enabled(&req);
     if has_tools {
         if let Some(response) =
             maybe_build_openai_long_task_poll_response(&state, &req, &req.model, start_time).await?
@@ -92,7 +92,7 @@ async fn chat_completions_v8(
     let model_full = state.model_mapper.to_ouyi(&req.model);
     let should_thinking = state.model_mapper.should_thinking(&req.model);
 
-    let has_tools = req.tools.as_ref().is_some_and(|tools| !tools.is_empty());
+    let has_tools = crate::tool_runtime::protocol::openai_tools_enabled(&req);
 
     // 请求转换
     let ouyi_req = match convert_request(&req, &model_full, should_thinking) {
@@ -215,7 +215,7 @@ async fn chat_completions_v7(
     };
     let max_history = v7_config.max_history_messages;
 
-    let has_tools = req.tools.as_ref().is_some_and(|tools| !tools.is_empty());
+    let has_tools = crate::tool_runtime::protocol::openai_tools_enabled(&req);
 
     // 请求转换
     let ouyi_input = match crate::adapter::ouyi_v7_request::from_openai_chat(

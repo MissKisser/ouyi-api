@@ -1,6 +1,11 @@
 use crate::model::anthropic::AnthropicTool;
 use crate::model::openai::ToolDef;
 
+pub fn openai_tools_enabled(req: &crate::model::openai::ChatCompletionRequest) -> bool {
+    req.tools.as_ref().is_some_and(|tools| !tools.is_empty())
+        && req.tool_choice.as_ref().and_then(|choice| choice.as_str()) != Some("none")
+}
+
 /// 协议无关工具规格，用于 OpenAI 和 Anthropic 工具的统一表示
 #[derive(Debug, Clone, PartialEq)]
 pub struct ToolSpec {
@@ -343,6 +348,38 @@ mod tests {
             ctx.tool_choice,
             Some(ToolChoiceSpec::Tool("Read".to_string()))
         );
+    }
+
+    #[test]
+    fn test_openai_tools_enabled_respects_none_choice() {
+        let mut req = ChatCompletionRequest {
+            model: "gpt-test".to_string(),
+            messages: vec![ChatMessage {
+                role: "user".to_string(),
+                content: Some("test".to_string()),
+                tool_calls: None,
+                tool_call_id: None,
+                name: None,
+            }],
+            stream: false,
+            temperature: None,
+            max_tokens: None,
+            tools: Some(vec![ToolDef {
+                tool_type: "function".to_string(),
+                function: ToolFunction {
+                    name: "Bash".to_string(),
+                    description: None,
+                    parameters: None,
+                },
+            }]),
+            tool_choice: None,
+            parallel_tool_calls: None,
+        };
+        req.tool_choice = Some(serde_json::json!("none"));
+        assert!(!openai_tools_enabled(&req));
+
+        req.tool_choice = Some(serde_json::json!("auto"));
+        assert!(openai_tools_enabled(&req));
     }
 
     #[test]
