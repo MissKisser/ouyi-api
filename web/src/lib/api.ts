@@ -315,6 +315,15 @@ export async function apiSaveConfig(config: Record<string, unknown>): Promise<{ 
   });
 }
 
+export async function apiSaveConcurrencyLimit(value: number): Promise<FullConfig> {
+  await apiSaveConfig({ limits: { max_concurrent_requests: value } });
+  const fresh = await apiFetchConfig();
+  if (fresh.limits.max_concurrent_requests !== value) {
+    throw new Error('Concurrency limit was not persisted');
+  }
+  return fresh;
+}
+
 export async function apiTestToolRuntime(config: ToolRuntimeConfig): Promise<ToolRuntimeTestResponse> {
   return apiFetch<ToolRuntimeTestResponse>('/admin/api/tool-runtime/test', {
     method: 'POST',

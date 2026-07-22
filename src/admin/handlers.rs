@@ -13,10 +13,14 @@ use crate::AppState;
 use crate::admin::accounts::AccountEntry;
 use crate::client::http::OuyiHttpClient;
 use crate::config::{
-    AppConfig, Ouyi7Config, PlatformConfig, ToolRuntimeConfig, ToolRuntimeMode,
-    ToolRuntimeProvider, remove_openai_tool_runtime_config, remove_tool_runtime_config,
-    write_admin_config, write_limits_config, write_openai_tool_runtime_config, write_ouyi_config,
-    write_ouyi_v7_config, write_platform_config, write_server_config, write_tool_runtime_config,
+    AdminConfig, AppConfig, Ouyi7Config, PlatformConfig, ToolRuntimeConfig, ToolRuntimeMode,
+    ToolRuntimeProvider, write_admin_config, write_app_config,
+};
+#[cfg(test)]
+use crate::config::{
+    remove_openai_tool_runtime_config, remove_tool_runtime_config, write_limits_config,
+    write_openai_tool_runtime_config, write_ouyi_config, write_ouyi_v7_config,
+    write_platform_config, write_server_config, write_tool_runtime_config,
 };
 use crate::error::AppError;
 use crate::handler::models::list_models as list_openai_models;
@@ -828,7 +832,7 @@ async fn send_anthropic_tool_runtime_test(
     Ok(())
 }
 
-#[derive(Deserialize)]
+#[derive(Clone, Deserialize)]
 pub struct ConfigUpdate {
     pub server: Option<ServerConfigUpdate>,
     pub limits: Option<LimitsConfigUpdate>,
@@ -842,12 +846,12 @@ pub struct ConfigUpdate {
     pub ouyi_v7: Option<Ouyi7ConfigUpdate>,
 }
 
-#[derive(Deserialize)]
+#[derive(Clone, Deserialize)]
 pub struct LimitsConfigUpdate {
     pub max_concurrent_requests: Option<usize>,
 }
 
-#[derive(Deserialize)]
+#[derive(Clone, Deserialize)]
 pub struct ToolRuntimeConfigUpdate {
     pub enabled: Option<bool>,
     pub provider: Option<String>,
@@ -878,14 +882,14 @@ pub struct ToolRuntimeTestResponse {
     pub base_url: String,
 }
 
-#[derive(Deserialize)]
+#[derive(Clone, Deserialize)]
 pub struct ServerConfigUpdate {
     pub host: Option<String>,
     pub port: Option<u16>,
     pub cors_origins: Option<Vec<String>>,
 }
 
-#[derive(Deserialize)]
+#[derive(Clone, Deserialize)]
 pub struct OuyiConfigUpdate {
     pub api_base: Option<String>,
     pub client_version: Option<String>,
@@ -894,13 +898,13 @@ pub struct OuyiConfigUpdate {
     pub model_refresh_interval_secs: Option<u64>,
 }
 
-#[derive(Deserialize)]
+#[derive(Clone, Deserialize)]
 pub struct PlatformConfigUpdate {
     pub default: Option<String>,
     pub prompt_on_start: Option<bool>,
 }
 
-#[derive(Deserialize)]
+#[derive(Clone, Deserialize)]
 pub struct Ouyi7ConfigUpdate {
     pub base_url: Option<String>,
     pub chatapi_prefix: Option<String>,
@@ -911,18 +915,18 @@ pub struct Ouyi7ConfigUpdate {
     pub simulated_stream_chunk_chars: Option<usize>,
 }
 
-#[derive(Deserialize)]
+#[derive(Clone, Deserialize)]
 pub struct ProxyConfigUpdate {
     pub url: Option<String>,
 }
 
-#[derive(Deserialize)]
+#[derive(Clone, Deserialize)]
 pub struct AdminUpdate {
     pub old_password: Option<String>,
     pub new_password: Option<String>,
 }
 
-#[derive(Deserialize)]
+#[derive(Clone, Deserialize)]
 pub struct AccountEntryRaw {
     pub email: String,
     pub mobile: String,
@@ -969,11 +973,13 @@ const MAX_CONCURRENT_REQUESTS: usize = 1000;
 pub(super) static CONFIG_UPDATE_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 
 #[derive(Debug)]
+#[cfg(test)]
 pub(super) enum LimitsConfigUpdateError {
     Invalid(String),
     Persistence(AppError),
 }
 
+#[cfg(test)]
 pub(super) async fn apply_limits_config_update(
     state: &AppState,
     config_path: &Path,
@@ -1005,6 +1011,236 @@ pub(super) async fn apply_limits_config_update(
     Ok(())
 }
 
+pub(super) struct PreparedConfigUpdate {
+    server_changed: bool,
+    accounts: Option<Vec<AccountEntryRaw>>,
+}
+
+#[derive(Debug)]
+pub(super) enum ConfigUpdateError {
+    BadRequest(String),
+    Unauthorized(String),
+    Persistence(AppError),
+}
+
+pub(super) async fn prepare_and_commit_config_update(
+    state: &Arc<AppState>,
+    config_path: &Path,
+    update: ConfigUpdate,
+) -> Result<PreparedConfigUpdate, ConfigUpdateError> {
+    let current = state.config.read().await.clone();
+    let mut candidate = current.clone();
+    let mut limits_changed = None;
+    let mut server_changed = false;
+    let mut deepseek_changed = false;
+    let mut v7_changed = false;
+    let mut new_password_hash = None;
+
+    if let Some(limits) = update.limits.as_ref()
+        && let Some(value) = limits.max_concurrent_requests
+    {
+        if value > MAX_CONCURRENT_REQUESTS {
+            return Err(ConfigUpdateError::BadRequest(format!(
+                "max_concurrent_requests must be between 0 and {MAX_CONCURRENT_REQUESTS}"
+            )));
+        }
+        candidate.limits.max_concurrent_requests = value;
+        limits_changed = Some(value);
+    }
+
+    if let Some(admin) = update.admin.as_ref()
+        && let (Some(old_pw), Some(new_pw)) = (&admin.old_password, &admin.new_password)
+    {
+        if new_pw.is_empty() {
+            return Err(ConfigUpdateError::Unauthorized(
+                "New password is empty".to_string(),
+            ));
+        }
+        let store = state.admin_store.read().await;
+        if !store.verify_password(old_pw) {
+            return Err(ConfigUpdateError::Unauthorized(
+                "Old password is incorrect".to_string(),
+            ));
+        }
+        let password_hash =
+            crate::admin::auth::AdminStore::hash_password(new_pw).map_err(|_| {
+                ConfigUpdateError::Persistence(AppError::Internal(
+                    "Password hashing failed".to_string(),
+                ))
+            })?;
+        let jwt_secret = store.jwt_secret.clone();
+        drop(store);
+        candidate.admin = Some(AdminConfig {
+            jwt_secret: Some(jwt_secret),
+            password_hash: Some(password_hash.clone()),
+        });
+        new_password_hash = Some(password_hash);
+    }
+
+    if let Some(server) = update.server.as_ref() {
+        if let Some(host) = &server.host {
+            candidate.server.host = host.clone();
+            server_changed = true;
+        }
+        if let Some(port) = server.port {
+            candidate.server.port = port;
+            server_changed = true;
+        }
+        if let Some(cors_origins) = &server.cors_origins {
+            tracing::info!(
+                count = cors_origins.len(),
+                "CORS origins received via admin UI"
+            );
+        }
+    }
+
+    if let Some(ouyi_update) = update.deepseek.as_ref() {
+        if let Some(api_base) = &ouyi_update.api_base {
+            candidate.ouyi.base_url = api_base.clone();
+        }
+        if let Some(jwt_token) = &ouyi_update.jwt_token
+            && !jwt_token.trim().is_empty()
+            && !is_masked_secret(jwt_token)
+        {
+            candidate.ouyi.jwt_token = jwt_token.clone();
+        }
+        if let Some(client_version) = &ouyi_update.client_version {
+            candidate.ouyi.app_version = client_version.clone();
+        }
+        if let Some(interval) = ouyi_update.model_refresh_interval_secs {
+            candidate.ouyi.model_refresh_interval_secs = interval;
+        }
+        deepseek_changed = true;
+    }
+
+    if let Some(v7_update) = update.ouyi_v7.as_ref() {
+        let mut v7 = candidate.ouyi_v7.clone().unwrap_or(Ouyi7Config {
+            base_url: "https://api-8.rcouyi.com".to_string(),
+            chatapi_prefix: "/chatapi".to_string(),
+            jwt_token: String::new(),
+            default_model: "ouyi-chat".to_string(),
+            model_refresh_interval_secs: 1800,
+            max_history_messages: 20,
+            simulated_stream_chunk_chars: 80,
+        });
+        if let Some(value) = &v7_update.base_url {
+            v7.base_url = value.clone();
+        }
+        if let Some(value) = &v7_update.chatapi_prefix {
+            v7.chatapi_prefix = value.clone();
+        }
+        if let Some(value) = &v7_update.jwt_token
+            && !value.trim().is_empty()
+            && !is_masked_secret(value)
+        {
+            v7.jwt_token = value.clone();
+        }
+        if let Some(value) = &v7_update.default_model {
+            v7.default_model = value.clone();
+        }
+        if let Some(value) = v7_update.model_refresh_interval_secs {
+            v7.model_refresh_interval_secs = value;
+        }
+        if let Some(value) = v7_update.max_history_messages {
+            v7.max_history_messages = value;
+        }
+        if let Some(value) = v7_update.simulated_stream_chunk_chars {
+            v7.simulated_stream_chunk_chars = value;
+        }
+        candidate.ouyi_v7 = Some(v7);
+        v7_changed = true;
+    }
+
+    if let Some(platform_update) = update.platform.as_ref() {
+        let mut platform = candidate.platform.clone().unwrap_or(PlatformConfig {
+            default: crate::platform::OuyiPlatform::Ouyi8,
+            prompt_on_start: true,
+        });
+        if let Some(default) = &platform_update.default {
+            platform.default =
+                crate::platform::OuyiPlatform::from_env_value(default).ok_or_else(|| {
+                    ConfigUpdateError::BadRequest("Invalid platform default".to_string())
+                })?;
+        }
+        if let Some(prompt_on_start) = platform_update.prompt_on_start {
+            platform.prompt_on_start = prompt_on_start;
+        }
+        candidate.platform = Some(platform);
+    }
+
+    if let Some(proxy) = update.proxy.as_ref()
+        && let Some(url) = proxy.url.as_ref()
+    {
+        tracing::info!(
+            configured = !url.trim().is_empty(),
+            "Proxy config received via admin UI"
+        );
+    }
+
+    if let Some(tool_runtime_update) = update.tool_runtime.clone() {
+        candidate.tool_runtime =
+            build_tool_runtime_config(candidate.tool_runtime.as_ref(), tool_runtime_update);
+    }
+    if let Some(openai_tool_runtime_update) = update.openai_tool_runtime.clone() {
+        candidate.openai_tool_runtime = build_openai_tool_runtime_config(
+            candidate.openai_tool_runtime.as_ref(),
+            openai_tool_runtime_update,
+        );
+    }
+
+    let path = config_path.to_path_buf();
+    let persisted = tokio::task::spawn_blocking(move || write_app_config(&path, &candidate))
+        .await
+        .map_err(|error| {
+            ConfigUpdateError::Persistence(AppError::Internal(format!(
+                "Config write task failed: {error}"
+            )))
+        })?
+        .map_err(ConfigUpdateError::Persistence)?;
+
+    {
+        let mut state_config = state.config.write().await;
+        *state_config = persisted.clone();
+    }
+    if let Some(value) = limits_changed {
+        state.concurrency_limiter.set_limit(value);
+    }
+    if let Some(password_hash) = &new_password_hash {
+        let mut store = state.admin_store.write().await;
+        store.set_password_hash(password_hash.clone());
+    }
+
+    let active_platform = *state.platform.read().await;
+    if deepseek_changed && active_platform == crate::platform::OuyiPlatform::Ouyi8 {
+        let new_client = OuyiHttpClient::new(
+            state.http_client.clone(),
+            persisted.ouyi.base_url.clone(),
+            persisted.ouyi.jwt_token.clone(),
+            persisted.ouyi.app_version.clone(),
+        );
+        *state.ouyi_client.write().await = crate::client::OuyiClient::V8(new_client);
+        state.platform_status.write().await.base_url = persisted.ouyi.base_url.clone();
+    }
+    if v7_changed
+        && active_platform == crate::platform::OuyiPlatform::Ouyi7
+        && let Some(v7) = persisted.ouyi_v7.clone()
+    {
+        let new_client = crate::client::ouyi_v7::Ouyi7HttpClient::new(
+            state.http_client.clone(),
+            v7.base_url.clone(),
+            v7.chatapi_prefix.clone(),
+            v7.jwt_token.clone(),
+        );
+        *state.ouyi_client.write().await = crate::client::OuyiClient::V7(new_client);
+        state.platform_status.write().await.base_url = v7.base_url;
+    }
+
+    Ok(PreparedConfigUpdate {
+        server_changed,
+        accounts: update.accounts,
+    })
+}
+
 pub async fn admin_put_config(
     State(state): State<Arc<AppState>>,
     Json(body): Json<serde_json::Value>,
@@ -1022,6 +1258,75 @@ pub async fn admin_put_config(
         }
     };
     let _config_update_guard = CONFIG_UPDATE_LOCK.lock().await;
+
+    let config_path = std::path::PathBuf::from(AppConfig::config_path());
+    let prepared = match prepare_and_commit_config_update(&state, &config_path, update).await {
+        Ok(prepared) => prepared,
+        Err(ConfigUpdateError::BadRequest(error)) => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(serde_json::json!({"ok": false, "error": error})),
+            )
+                .into_response();
+        }
+        Err(ConfigUpdateError::Unauthorized(error)) => {
+            return (
+                StatusCode::UNAUTHORIZED,
+                Json(serde_json::json!({"ok": false, "error": error})),
+            )
+                .into_response();
+        }
+        Err(ConfigUpdateError::Persistence(error)) => {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(serde_json::json!({"ok": false, "error": error.to_string()})),
+            )
+                .into_response();
+        }
+    };
+
+    if let Some(raw_accounts) = prepared.accounts {
+        let existing_accounts = state.account_store.get_accounts().await;
+        let accounts = raw_accounts
+            .into_iter()
+            .map(|raw| {
+                let existing = existing_accounts
+                    .iter()
+                    .find(|entry| entry.email == raw.email);
+                build_account_entry_from_raw(raw, existing)
+            })
+            .collect();
+        state.account_store.set_accounts(accounts).await;
+    }
+
+    let mut response = serde_json::json!({"ok": true});
+    if prepared.server_changed {
+        response["server_note"] = serde_json::Value::String(
+            "Server host/port changes require a service restart".to_string(),
+        );
+    }
+    (StatusCode::OK, Json(response)).into_response()
+}
+
+#[cfg(test)]
+#[allow(dead_code)]
+async fn legacy_admin_put_config(
+    State(state): State<Arc<AppState>>,
+    Json(body): Json<serde_json::Value>,
+) -> impl IntoResponse {
+    let update = match serde_json::from_value::<ConfigUpdate>(body) {
+        Ok(update) => update,
+        Err(error) => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(serde_json::json!({
+                    "ok": false,
+                    "error": format!("Invalid config: {error}")
+                })),
+            )
+                .into_response();
+        }
+    };
 
     if let Some(limits) = update.limits
         && let Some(max_concurrent_requests) = limits.max_concurrent_requests

@@ -2,8 +2,8 @@
 #
 # Usage:
 #   1. Copy `.env.example` to `.env` and fill in real values.
-#   2. Make sure `./config/` contains a real config.toml (NEVER commit secrets).
-#      Tip: `cp config.example.toml config/config.toml` then edit.
+#   2. Make sure `${OUYI_CONFIG_DIR}` contains a real config.toml (NEVER commit secrets).
+#      Production default: /var/lib/ouyi-api/config.
 #   3. `docker compose up -d --build`
 #   4. Tail logs: `docker compose logs -f ouyi-api`
 #
@@ -14,7 +14,7 @@
 #   * host.bind should be a single, non-default port the user has explicitly
 #     chosen. 127.0.0.1 is the safe default; switch to "0.0.0.0" or a specific
 #     host IP only if a reverse proxy is NOT going to front this container.
-#   * ./config must contain config.toml. The container writes back into
+#   * OUYI_CONFIG_DIR must contain config.toml. The container writes back into
 #     OUYI_CONFIG when JWT self-repair runs (interactive prompt is skipped
 #     because stdin is not a TTY here — that's intentional for unattended ops).
 
@@ -41,9 +41,9 @@ services:
       # different interface.
       - "${SERVER_BIND:-127.0.0.1}:${SERVER_PORT:-3000}:${SERVER_PORT:-3000}"
     volumes:
-      # Bind mount host directory so admin/JWT self-repair can persist
-      # writes back into config.toml (see config.rs).
-      - ./config:/app/config:rw
+      # Keep mutable configuration outside the release checkout so container
+      # recreation, image rebuilds, deployments and rollbacks cannot replace it.
+      - ${OUYI_CONFIG_DIR:-/var/lib/ouyi-api/config}:/app/config:rw
     # Healthcheck defined in the Dockerfile — same probe logic.
     healthcheck:
       test:

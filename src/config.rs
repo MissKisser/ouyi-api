@@ -180,9 +180,12 @@ pub struct LimitsConfig {
 impl AppConfig {
     pub fn load() -> Result<Self, Box<dyn std::error::Error>> {
         let path = std::env::var("OUYI_CONFIG").unwrap_or_else(|_| "config.toml".to_string());
-        let content = std::fs::read_to_string(&path)?;
-        let config: Self = toml::from_str(&content)?;
-        Ok(config)
+        Self::load_from_path(Path::new(&path))
+    }
+
+    pub fn load_from_path(path: &Path) -> Result<Self, Box<dyn std::error::Error>> {
+        let content = std::fs::read_to_string(path)?;
+        Ok(toml::from_str(&content)?)
     }
 
     pub fn config_path() -> String {
@@ -190,24 +193,161 @@ impl AppConfig {
     }
 }
 
-pub fn update_ouyi_jwt_token(path: &Path, jwt_token: &str) -> Result<(), crate::error::AppError> {
-    let content = std::fs::read_to_string(path)
-        .map_err(|e| crate::error::AppError::Config(format!("读取配置失败: {}", e)))?;
+/// Persist a complete in-memory configuration as one validated, atomic file update.
+///
+/// The existing per-section writers remain available for startup/self-healing paths, but
+/// admin updates should use this function so a request cannot leave only half of its fields
+/// written when a later validation or persistence step fails.
+pub fn write_app_config(path: &Path, config: &AppConfig) -> Result<AppConfig, AppError> {
+    crate::config_store::update_document(path, |doc| {
+        let server = ensure_table(doc, "server")?;
+        server["host"] = toml_edit::value(config.server.host.as_str());
+        server["port"] = toml_edit::value(i64::from(config.server.port));
 
-    let mut doc = content
-        .parse::<toml_edit::DocumentMut>()
-        .map_err(|e| crate::error::AppError::Config(format!("解析配置失败: {}", e)))?;
+        let ouyi = ensure_table(doc, "ouyi")?;
+        ouyi["base_url"] = toml_edit::value(config.ouyi.base_url.as_str());
+        ouyi["jwt_token"] = toml_edit::value(config.ouyi.jwt_token.as_str());
+        ouyi["app_version"] = toml_edit::value(config.ouyi.app_version.as_str());
+        ouyi["model_refresh_interval_secs"] =
+            toml_edit::value(config.ouyi.model_refresh_interval_secs as i64);
 
-    if !doc.contains_key("ouyi") {
-        return Err(crate::error::AppError::Config(
-            "配置缺少 [ouyi] 段".to_string(),
-        ));
+        let limits = ensure_table(doc, "limits")?;
+        limits["request_timeout_secs"] =
+            toml_edit::value(config.limits.request_timeout_secs as i64);
+        limits["no_data_timeout_secs"] =
+            toml_edit::value(config.limits.no_data_timeout_secs as i64);
+        limits["max_response_bytes"] = toml_edit::value(config.limits.max_response_bytes as i64);
+        limits["max_messages_bytes"] = toml_edit::value(config.limits.max_messages_bytes as i64);
+        limits["max_concurrent_requests"] = toml_edit::value(
+            i64::try_from(config.limits.max_concurrent_requests).map_err(|_| {
+                AppError::Config("max_concurrent_requests 超出可持久化范围".to_string())
+            })?,
+        );
+
+        write_optional_admin(doc, config.admin.as_ref())?;
+        write_optional_platform(doc, config.platform.as_ref())?;
+        write_optional_ouyi_v7(doc, config.ouyi_v7.as_ref())?;
+        write_optional_tool_runtime(doc, "tool_runtime", config.tool_runtime.as_ref())?;
+        write_optional_tool_runtime(
+            doc,
+            "openai_tool_runtime",
+            config.openai_tool_runtime.as_ref(),
+        )?;
+        Ok(())
+    })
+}
+
+fn ensure_table<'a>(
+    doc: &'a mut toml_edit::DocumentMut,
+    name: &str,
+) -> Result<&'a mut toml_edit::Table, AppError> {
+    if !doc.contains_key(name) {
+        doc[name] = toml_edit::Item::Table(toml_edit::Table::new());
     }
+    doc[name]
+        .as_table_mut()
+        .ok_or_else(|| AppError::Config(format!("配置 [{name}] 必须是普通 table")))
+}
 
-    doc["ouyi"]["jwt_token"] = toml_edit::value(jwt_token);
+fn write_optional_admin(
+    doc: &mut toml_edit::DocumentMut,
+    config: Option<&AdminConfig>,
+) -> Result<(), AppError> {
+    let Some(config) = config else {
+        doc.remove("admin");
+        return Ok(());
+    };
+    let table = ensure_table(doc, "admin")?;
+    set_optional_string(table, "jwt_secret", config.jwt_secret.as_deref());
+    set_optional_string(table, "password_hash", config.password_hash.as_deref());
+    Ok(())
+}
 
-    std::fs::write(path, doc.to_string())
-        .map_err(|e| crate::error::AppError::Config(format!("写入配置失败: {}", e)))?;
+fn write_optional_platform(
+    doc: &mut toml_edit::DocumentMut,
+    config: Option<&PlatformConfig>,
+) -> Result<(), AppError> {
+    let Some(config) = config else {
+        doc.remove("platform");
+        return Ok(());
+    };
+    let table = ensure_table(doc, "platform")?;
+    table["default"] = toml_edit::value(match config.default {
+        OuyiPlatform::Ouyi7 => "ouyi7",
+        OuyiPlatform::Ouyi8 => "ouyi8",
+    });
+    table["prompt_on_start"] = toml_edit::value(config.prompt_on_start);
+    Ok(())
+}
+
+fn write_optional_ouyi_v7(
+    doc: &mut toml_edit::DocumentMut,
+    config: Option<&Ouyi7Config>,
+) -> Result<(), AppError> {
+    let Some(config) = config else {
+        doc.remove("ouyi_v7");
+        return Ok(());
+    };
+    let table = ensure_table(doc, "ouyi_v7")?;
+    table["base_url"] = toml_edit::value(config.base_url.as_str());
+    table["chatapi_prefix"] = toml_edit::value(config.chatapi_prefix.as_str());
+    table["jwt_token"] = toml_edit::value(config.jwt_token.as_str());
+    table["default_model"] = toml_edit::value(config.default_model.as_str());
+    table["model_refresh_interval_secs"] =
+        toml_edit::value(config.model_refresh_interval_secs as i64);
+    table["max_history_messages"] = toml_edit::value(config.max_history_messages as i64);
+    table["simulated_stream_chunk_chars"] =
+        toml_edit::value(config.simulated_stream_chunk_chars as i64);
+    Ok(())
+}
+
+fn write_optional_tool_runtime(
+    doc: &mut toml_edit::DocumentMut,
+    name: &str,
+    config: Option<&ToolRuntimeConfig>,
+) -> Result<(), AppError> {
+    let Some(config) = config else {
+        doc.remove(name);
+        return Ok(());
+    };
+    let table = ensure_table(doc, name)?;
+    table["enabled"] = toml_edit::value(config.enabled);
+    table["mode"] = toml_edit::value(match config.mode {
+        ToolRuntimeMode::Native => "native",
+        ToolRuntimeMode::Compiler => "compiler",
+    });
+    table["provider"] = toml_edit::value(match config.provider {
+        ToolRuntimeProvider::Anthropic => "anthropic",
+        ToolRuntimeProvider::OpenaiCompatible => "openai-compatible",
+    });
+    set_optional_string(table, "base_url", config.base_url.as_deref());
+    set_optional_string(table, "api_key", config.api_key.as_deref());
+    set_optional_string(table, "api_key_env", config.api_key_env.as_deref());
+    set_optional_string(table, "model", config.model.as_deref());
+    table["timeout_secs"] = toml_edit::value(config.timeout_secs as i64);
+    Ok(())
+}
+
+fn set_optional_string(table: &mut toml_edit::Table, key: &str, value: Option<&str>) {
+    match value {
+        Some(value) => table[key] = toml_edit::value(value),
+        None => {
+            table.remove(key);
+        }
+    }
+}
+
+pub fn update_ouyi_jwt_token(path: &Path, jwt_token: &str) -> Result<(), crate::error::AppError> {
+    crate::config_store::update_document(path, |doc| {
+        if !doc.contains_key("ouyi") {
+            return Err(crate::error::AppError::Config(
+                "配置缺少 [ouyi] 段".to_string(),
+            ));
+        }
+        doc["ouyi"]["jwt_token"] = toml_edit::value(jwt_token);
+        Ok(())
+    })
+    .map_err(|e| crate::error::AppError::Config(format!("写入配置失败: {}", e)))?;
 
     tracing::info!("Ouyi JWT Token 已更新");
     Ok(())
@@ -217,29 +357,23 @@ pub fn update_ouyi_v7_jwt_token(
     path: &Path,
     jwt_token: &str,
 ) -> Result<(), crate::error::AppError> {
-    let content = std::fs::read_to_string(path)
-        .map_err(|e| crate::error::AppError::Config(format!("读取配置失败: {}", e)))?;
-
-    let mut doc = content
-        .parse::<toml_edit::DocumentMut>()
-        .map_err(|e| crate::error::AppError::Config(format!("解析配置失败: {}", e)))?;
-
-    if !doc.contains_key("ouyi_v7") {
-        let mut table = toml_edit::Table::new();
-        table["base_url"] = toml_edit::value("https://api-8.rcouyi.com");
-        table["chatapi_prefix"] = toml_edit::value("/chatapi");
-        table["jwt_token"] = toml_edit::value(jwt_token);
-        table["default_model"] = toml_edit::value("ouyi-chat");
-        table["model_refresh_interval_secs"] = toml_edit::value(1800i64);
-        table["max_history_messages"] = toml_edit::value(20i64);
-        table["simulated_stream_chunk_chars"] = toml_edit::value(80i64);
-        doc["ouyi_v7"] = toml_edit::Item::Table(table);
-    } else {
-        doc["ouyi_v7"]["jwt_token"] = toml_edit::value(jwt_token);
-    }
-
-    std::fs::write(path, doc.to_string())
-        .map_err(|e| crate::error::AppError::Config(format!("写入配置失败: {}", e)))?;
+    crate::config_store::update_document(path, |doc| {
+        if !doc.contains_key("ouyi_v7") {
+            let mut table = toml_edit::Table::new();
+            table["base_url"] = toml_edit::value("https://api-8.rcouyi.com");
+            table["chatapi_prefix"] = toml_edit::value("/chatapi");
+            table["jwt_token"] = toml_edit::value(jwt_token);
+            table["default_model"] = toml_edit::value("ouyi-chat");
+            table["model_refresh_interval_secs"] = toml_edit::value(1800i64);
+            table["max_history_messages"] = toml_edit::value(20i64);
+            table["simulated_stream_chunk_chars"] = toml_edit::value(80i64);
+            doc["ouyi_v7"] = toml_edit::Item::Table(table);
+        } else {
+            doc["ouyi_v7"]["jwt_token"] = toml_edit::value(jwt_token);
+        }
+        Ok(())
+    })
+    .map_err(|e| crate::error::AppError::Config(format!("写入配置失败: {}", e)))?;
 
     tracing::info!("Ouyi V7 JWT Token 已更新");
     Ok(())
@@ -250,26 +384,21 @@ pub fn write_admin_config(
     jwt_secret: &str,
     password_hash: &str,
 ) -> Result<(), crate::error::AppError> {
-    let content = std::fs::read_to_string(path)
-        .map_err(|e| crate::error::AppError::Config(format!("读取配置失败: {}", e)))?;
-
-    let mut doc = content
-        .parse::<toml_edit::DocumentMut>()
-        .map_err(|e| crate::error::AppError::Config(format!("解析配置失败: {}", e)))?;
-
-    if !doc.contains_key("admin") {
-        doc["admin"] = toml_edit::Item::Table(toml_edit::Table::new());
-    }
-    doc["admin"]["jwt_secret"] = toml_edit::value(jwt_secret);
-    doc["admin"]["password_hash"] = toml_edit::value(password_hash);
-
-    std::fs::write(path, doc.to_string())
-        .map_err(|e| crate::error::AppError::Config(format!("写入配置失败: {}", e)))?;
+    crate::config_store::update_document(path, |doc| {
+        if !doc.contains_key("admin") {
+            doc["admin"] = toml_edit::Item::Table(toml_edit::Table::new());
+        }
+        doc["admin"]["jwt_secret"] = toml_edit::value(jwt_secret);
+        doc["admin"]["password_hash"] = toml_edit::value(password_hash);
+        Ok(())
+    })
+    .map_err(|e| crate::error::AppError::Config(format!("写入配置失败: {}", e)))?;
 
     tracing::info!("Admin 配置已更新");
     Ok(())
 }
 
+#[cfg(test)]
 pub fn write_limits_config(path: &Path, config: &LimitsConfig) -> Result<(), AppError> {
     let max_concurrent_requests = i64::try_from(config.max_concurrent_requests)
         .map_err(|_| AppError::Config("max_concurrent_requests 超出可持久化范围".to_string()))?;
@@ -290,13 +419,14 @@ pub fn write_limits_config(path: &Path, config: &LimitsConfig) -> Result<(), App
         .ok_or_else(|| AppError::Config("配置 [limits] 必须是普通 table".to_string()))?;
     limits["max_concurrent_requests"] = toml_edit::value(max_concurrent_requests);
 
-    std::fs::write(path, doc.to_string())
+    crate::config_store::write_document(path, &doc)
         .map_err(|e| AppError::Config(format!("写入配置失败: {}", e)))?;
 
     tracing::info!("Limits 配置已更新");
     Ok(())
 }
 
+#[cfg(test)]
 pub fn write_ouyi_config(path: &Path, config: &OuyiConfig) -> Result<(), crate::error::AppError> {
     let content = std::fs::read_to_string(path)
         .map_err(|e| crate::error::AppError::Config(format!("读取配置失败: {}", e)))?;
@@ -314,13 +444,14 @@ pub fn write_ouyi_config(path: &Path, config: &OuyiConfig) -> Result<(), crate::
     doc["ouyi"]["model_refresh_interval_secs"] =
         toml_edit::value(config.model_refresh_interval_secs as i64);
 
-    std::fs::write(path, doc.to_string())
+    crate::config_store::write_document(path, &doc)
         .map_err(|e| crate::error::AppError::Config(format!("写入配置失败: {}", e)))?;
 
     tracing::info!("Ouyi 配置已更新");
     Ok(())
 }
 
+#[cfg(test)]
 pub fn write_ouyi_v7_config(
     path: &Path,
     config: &Ouyi7Config,
@@ -345,13 +476,14 @@ pub fn write_ouyi_v7_config(
     doc["ouyi_v7"]["simulated_stream_chunk_chars"] =
         toml_edit::value(config.simulated_stream_chunk_chars as i64);
 
-    std::fs::write(path, doc.to_string())
+    crate::config_store::write_document(path, &doc)
         .map_err(|e| crate::error::AppError::Config(format!("写入配置失败: {}", e)))?;
 
     tracing::info!("Ouyi V7 配置已更新");
     Ok(())
 }
 
+#[cfg(test)]
 pub fn write_server_config(
     path: &Path,
     config: &ServerConfig,
@@ -369,13 +501,14 @@ pub fn write_server_config(
     doc["server"]["host"] = toml_edit::value(config.host.as_str());
     doc["server"]["port"] = toml_edit::value(config.port as i64);
 
-    std::fs::write(path, doc.to_string())
+    crate::config_store::write_document(path, &doc)
         .map_err(|e| crate::error::AppError::Config(format!("写入配置失败: {}", e)))?;
 
     tracing::info!("Server 配置已更新");
     Ok(())
 }
 
+#[cfg(test)]
 pub fn write_platform_config(
     path: &Path,
     config: &PlatformConfig,
@@ -397,13 +530,14 @@ pub fn write_platform_config(
     doc["platform"]["default"] = toml_edit::value(platform);
     doc["platform"]["prompt_on_start"] = toml_edit::value(config.prompt_on_start);
 
-    std::fs::write(path, doc.to_string())
+    crate::config_store::write_document(path, &doc)
         .map_err(|e| crate::error::AppError::Config(format!("写入配置失败: {}", e)))?;
 
     tracing::info!("平台配置已更新");
     Ok(())
 }
 
+#[cfg(test)]
 pub fn write_tool_runtime_config(
     path: &Path,
     config: &ToolRuntimeConfig,
@@ -416,6 +550,11 @@ pub fn write_tool_runtime_config(
         .map_err(|e| crate::error::AppError::Config(format!("解析配置失败: {}", e)))?;
 
     let mut table = toml_edit::Table::new();
+    table["enabled"] = toml_edit::value(config.enabled);
+    table["mode"] = toml_edit::value(match config.mode {
+        ToolRuntimeMode::Native => "native",
+        ToolRuntimeMode::Compiler => "compiler",
+    });
     table["provider"] = toml_edit::value(match config.provider {
         ToolRuntimeProvider::Anthropic => "anthropic",
         ToolRuntimeProvider::OpenaiCompatible => "openai-compatible",
@@ -435,12 +574,13 @@ pub fn write_tool_runtime_config(
     table["timeout_secs"] = toml_edit::value(config.timeout_secs as i64);
     doc["tool_runtime"] = toml_edit::Item::Table(table);
 
-    std::fs::write(path, doc.to_string())
+    crate::config_store::write_document(path, &doc)
         .map_err(|e| crate::error::AppError::Config(format!("写入配置失败: {}", e)))?;
 
     Ok(())
 }
 
+#[cfg(test)]
 pub fn remove_tool_runtime_config(path: &Path) -> Result<(), crate::error::AppError> {
     let content = std::fs::read_to_string(path)
         .map_err(|e| crate::error::AppError::Config(format!("读取配置失败: {}", e)))?;
@@ -450,12 +590,13 @@ pub fn remove_tool_runtime_config(path: &Path) -> Result<(), crate::error::AppEr
         .map_err(|e| crate::error::AppError::Config(format!("解析配置失败: {}", e)))?;
     doc.remove("tool_runtime");
 
-    std::fs::write(path, doc.to_string())
+    crate::config_store::write_document(path, &doc)
         .map_err(|e| crate::error::AppError::Config(format!("写入配置失败: {}", e)))?;
 
     Ok(())
 }
 
+#[cfg(test)]
 pub fn write_openai_tool_runtime_config(
     path: &Path,
     config: &ToolRuntimeConfig,
@@ -469,6 +610,10 @@ pub fn write_openai_tool_runtime_config(
 
     let mut table = toml_edit::Table::new();
     table["enabled"] = toml_edit::value(config.enabled);
+    table["mode"] = toml_edit::value(match config.mode {
+        ToolRuntimeMode::Native => "native",
+        ToolRuntimeMode::Compiler => "compiler",
+    });
     table["provider"] = toml_edit::value("openai-compatible");
     if let Some(base_url) = &config.base_url {
         table["base_url"] = toml_edit::value(base_url.as_str());
@@ -485,12 +630,13 @@ pub fn write_openai_tool_runtime_config(
     table["timeout_secs"] = toml_edit::value(config.timeout_secs as i64);
     doc["openai_tool_runtime"] = toml_edit::Item::Table(table);
 
-    std::fs::write(path, doc.to_string())
+    crate::config_store::write_document(path, &doc)
         .map_err(|e| crate::error::AppError::Config(format!("写入配置失败: {}", e)))?;
 
     Ok(())
 }
 
+#[cfg(test)]
 pub fn remove_openai_tool_runtime_config(path: &Path) -> Result<(), crate::error::AppError> {
     let content = std::fs::read_to_string(path)
         .map_err(|e| crate::error::AppError::Config(format!("读取配置失败: {}", e)))?;
@@ -500,7 +646,7 @@ pub fn remove_openai_tool_runtime_config(path: &Path) -> Result<(), crate::error
         .map_err(|e| crate::error::AppError::Config(format!("解析配置失败: {}", e)))?;
     doc.remove("openai_tool_runtime");
 
-    std::fs::write(path, doc.to_string())
+    crate::config_store::write_document(path, &doc)
         .map_err(|e| crate::error::AppError::Config(format!("写入配置失败: {}", e)))?;
 
     Ok(())
@@ -523,6 +669,99 @@ max_messages_bytes = 1048576
         .unwrap();
 
         assert_eq!(limits.max_concurrent_requests, 0);
+    }
+
+    #[test]
+    fn test_load_from_path_reads_persisted_concurrency() {
+        let path =
+            std::env::temp_dir().join(format!("ouyi-config-load-{}.toml", uuid::Uuid::new_v4()));
+        std::fs::write(
+            &path,
+            r#"
+[server]
+host = "127.0.0.1"
+port = 3000
+[ouyi]
+base_url = "https://example.invalid"
+jwt_token = "test"
+app_version = "3.0.3"
+model_refresh_interval_secs = 3600
+[limits]
+request_timeout_secs = 30
+no_data_timeout_secs = 30
+max_response_bytes = 1048576
+max_messages_bytes = 1048576
+max_concurrent_requests = 2
+"#,
+        )
+        .unwrap();
+
+        let config = AppConfig::load_from_path(&path).unwrap();
+
+        assert_eq!(config.limits.max_concurrent_requests, 2);
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn test_write_app_config_persists_concurrency_and_runtime_flags_together() {
+        let path = std::env::temp_dir().join(format!(
+            "ouyi-full-config-write-{}.toml",
+            uuid::Uuid::new_v4()
+        ));
+        std::fs::write(
+            &path,
+            r#"# keep this comment
+[server]
+host = "127.0.0.1"
+port = 3000
+
+[ouyi]
+base_url = "https://example.invalid"
+jwt_token = "test"
+app_version = "3.0.3"
+model_refresh_interval_secs = 3600
+
+[limits]
+request_timeout_secs = 30
+no_data_timeout_secs = 30
+max_response_bytes = 1048576
+max_messages_bytes = 1048576
+max_concurrent_requests = 1
+
+[custom]
+preserved = true
+"#,
+        )
+        .unwrap();
+
+        let mut candidate = AppConfig::load_from_path(&path).unwrap();
+        candidate.limits.max_concurrent_requests = 2;
+        candidate.tool_runtime = Some(ToolRuntimeConfig {
+            enabled: false,
+            mode: ToolRuntimeMode::Native,
+            provider: ToolRuntimeProvider::Anthropic,
+            base_url: Some("https://tool.example.invalid".to_string()),
+            api_key: None,
+            api_key_env: Some("TOOL_API_KEY".to_string()),
+            model: Some("glm-5.2".to_string()),
+            timeout_secs: 45,
+        });
+
+        let persisted = write_app_config(&path, &candidate).unwrap();
+        let content = std::fs::read_to_string(&path).unwrap();
+        let document = content.parse::<toml_edit::DocumentMut>().unwrap();
+
+        assert_eq!(persisted.limits.max_concurrent_requests, 2);
+        assert_eq!(
+            document["limits"]["max_concurrent_requests"].as_integer(),
+            Some(2)
+        );
+        assert_eq!(document["tool_runtime"]["enabled"].as_bool(), Some(false));
+        assert_eq!(document["tool_runtime"]["mode"].as_str(), Some("native"));
+        assert_eq!(document["custom"]["preserved"].as_bool(), Some(true));
+        assert!(content.contains("# keep this comment"));
+
+        let _ = std::fs::remove_file(path);
     }
 
     #[test]
@@ -976,8 +1215,8 @@ max_messages_bytes = 1048576
         .unwrap();
 
         let runtime = ToolRuntimeConfig {
-            enabled: true,
-            mode: ToolRuntimeMode::Compiler,
+            enabled: false,
+            mode: ToolRuntimeMode::Native,
             provider: ToolRuntimeProvider::OpenaiCompatible,
             base_url: Some("https://api.example.com/v1".to_string()),
             api_key: Some("sk-test".to_string()),

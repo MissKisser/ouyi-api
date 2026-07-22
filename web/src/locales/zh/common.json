@@ -129,7 +129,11 @@
       "maxConcurrentRequests": "全局推理并发上限",
       "maxConcurrentRequestsUnlimited": "0 表示不限制并发请求。",
       "maxConcurrentRequestsHotReloadHint": "保存后立即热更新，无需重启服务。",
-      "maxConcurrentRequestsError": "请输入 0 到 1000 之间的整数。"
+      "maxConcurrentRequestsError": "请输入 0 到 1000 之间的整数。",
+      "maxConcurrentRequestsSave": "保存并发限制",
+      "maxConcurrentRequestsDirty": "并发值尚未保存",
+      "maxConcurrentRequestsSaved": "并发限制已保存并立即生效。",
+      "maxConcurrentRequestsSaveFailed": "并发限制保存失败：{{error}}"
     },
     "deepseek": {
       "apiBase": "API Base",

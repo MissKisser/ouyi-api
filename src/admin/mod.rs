@@ -182,6 +182,40 @@ mod tests {
         }
     }
 
+    fn write_complete_test_config(path: &std::path::Path, concurrency: usize) {
+        std::fs::write(
+            path,
+            format!(
+                r#"# preserved
+[server]
+host = "127.0.0.1"
+port = 0
+
+[ouyi]
+base_url = "http://127.0.0.1:1"
+jwt_token = "test-jwt"
+app_version = "3.0.3"
+model_refresh_interval_secs = 3600
+
+[limits]
+request_timeout_secs = 5
+no_data_timeout_secs = 5
+max_response_bytes = 1048576
+max_messages_bytes = 1048576
+max_concurrent_requests = {concurrency}
+
+[admin]
+jwt_secret = "test-secret"
+
+[platform]
+default = "ouyi8"
+prompt_on_start = false
+"#
+            ),
+        )
+        .unwrap();
+    }
+
     fn make_test_state() -> Arc<AppState> {
         make_test_state_with_limit(0)
     }
@@ -398,6 +432,58 @@ mod tests {
             );
             assert_eq!(state.concurrency_limiter.limit(), 9, "{label}");
         }
+    }
+
+    #[tokio::test]
+    async fn full_config_update_rejects_bad_password_without_partial_concurrency_commit() {
+        let state = make_test_state_with_limit(1);
+        state
+            .admin_store
+            .write()
+            .await
+            .set_password_hash(AdminStore::hash_password("correct-password").unwrap());
+        let config_file = TempFileGuard::new("bad-password-transaction");
+        write_complete_test_config(&config_file.0, 1);
+        let before = std::fs::read(&config_file.0).unwrap();
+        let update = serde_json::from_value(json!({
+            "limits": {"max_concurrent_requests": 2},
+            "admin": {
+                "old_password": "wrong-password",
+                "new_password": "replacement-password"
+            }
+        }))
+        .unwrap();
+
+        let result =
+            handlers::prepare_and_commit_config_update(&state, &config_file.0, update).await;
+
+        assert!(matches!(
+            result,
+            Err(handlers::ConfigUpdateError::Unauthorized(_))
+        ));
+        assert_eq!(std::fs::read(&config_file.0).unwrap(), before);
+        assert_eq!(state.config.read().await.limits.max_concurrent_requests, 1);
+        assert_eq!(state.concurrency_limiter.limit(), 1);
+    }
+
+    #[tokio::test]
+    async fn full_config_update_persists_two_and_reloads_it_after_restart() {
+        let state = make_test_state_with_limit(1);
+        let config_file = TempFileGuard::new("reload-two");
+        write_complete_test_config(&config_file.0, 1);
+        let update = serde_json::from_value(json!({
+            "limits": {"max_concurrent_requests": 2}
+        }))
+        .unwrap();
+
+        handlers::prepare_and_commit_config_update(&state, &config_file.0, update)
+            .await
+            .unwrap();
+
+        let reloaded = AppConfig::load_from_path(&config_file.0).unwrap();
+        assert_eq!(reloaded.limits.max_concurrent_requests, 2);
+        assert_eq!(state.config.read().await.limits.max_concurrent_requests, 2);
+        assert_eq!(state.concurrency_limiter.limit(), 2);
     }
 
     #[tokio::test]

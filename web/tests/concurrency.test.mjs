@@ -39,3 +39,29 @@ test('shows concurrency settings in an expanded dedicated config section', async
   assert.match(source, /<Section title=\{t\('config\.sections\.limits'\)\}[^>]*defaultOpen/);
   assert.match(source, /t\('config\.server\.maxConcurrentRequests'\)/);
 });
+
+test('saves only the concurrency limit and verifies the persisted value', async () => {
+  const apiSource = await readFile(new URL('../src/lib/api.ts', import.meta.url), 'utf8');
+  const pageSource = await readFile(new URL('../src/pages/ConfigPage.tsx', import.meta.url), 'utf8');
+
+  assert.match(
+    apiSource,
+    /apiSaveConfig\(\{ limits: \{ max_concurrent_requests: value \} \}\)/,
+  );
+  assert.match(apiSource, /const fresh = await apiFetchConfig\(\)/);
+  assert.match(
+    apiSource,
+    /fresh\.limits\.max_concurrent_requests !== value/,
+  );
+  assert.match(pageSource, /const \[persistedConcurrency, setPersistedConcurrency\]/);
+  assert.match(pageSource, /const \[savingConcurrency, setSavingConcurrency\]/);
+  assert.match(pageSource, /\{ \.\.\.prev, limits: fresh\.limits \}/);
+  assert.match(
+    pageSource,
+    /disabled=\{!valid \|\| !concurrencyDirty \|\| savingConcurrency \|\| saving\}/,
+  );
+  assert.match(
+    pageSource,
+    /disabled=\{saving \|\| savingConcurrency \|\| !valid\}/,
+  );
+});

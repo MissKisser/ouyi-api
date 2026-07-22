@@ -3,6 +3,7 @@ mod admin;
 mod client;
 mod concurrency;
 mod config;
+mod config_store;
 mod error;
 mod handler;
 mod model;

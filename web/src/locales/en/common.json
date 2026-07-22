@@ -129,7 +129,11 @@
       "maxConcurrentRequests": "Global Inference Concurrency Limit",
       "maxConcurrentRequestsUnlimited": "0 allows unlimited concurrent requests.",
       "maxConcurrentRequestsHotReloadHint": "Changes take effect immediately after saving; no restart is required.",
-      "maxConcurrentRequestsError": "Enter an integer from 0 to 1000."
+      "maxConcurrentRequestsError": "Enter an integer from 0 to 1000.",
+      "maxConcurrentRequestsSave": "Save concurrency limit",
+      "maxConcurrentRequestsDirty": "Concurrency value is not saved",
+      "maxConcurrentRequestsSaved": "Concurrency limit saved and active.",
+      "maxConcurrentRequestsSaveFailed": "Failed to save concurrency limit: {{error}}"
     },
     "deepseek": {
       "apiBase": "API Base",

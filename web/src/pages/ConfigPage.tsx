@@ -2,6 +2,7 @@ import { useEffect, useState } from 'react';
 import {
   apiFetchConfig,
   apiSaveConfig,
+  apiSaveConcurrencyLimit,
   apiTestToolRuntime,
   apiTestOpenAiToolRuntime,
   type FullConfig,
@@ -71,6 +72,9 @@ export function ConfigPage() {
   const { t } = useTranslation();
   const [config, setConfig] = useState<FullConfig | null>(null);
   const [saving, setSaving] = useState(false);
+  const [persistedConcurrency, setPersistedConcurrency] = useState<number | null>(null);
+  const [savingConcurrency, setSavingConcurrency] = useState(false);
+  const [concurrencyMessage, setConcurrencyMessage] = useState<{ type: 'ok' | 'err'; text: string } | null>(null);
   const [message, setMessage] = useState<{ type: 'ok' | 'err'; text: string } | null>(null);
   const [oldPassword, setOldPassword] = useState('');
   const [newPassword, setNewPassword] = useState('');
@@ -97,7 +101,11 @@ export function ConfigPage() {
 
   const loadConfig = () => {
     apiFetchConfig()
-      .then(setConfig)
+      .then((fresh) => {
+        setConfig(fresh);
+        setPersistedConcurrency(fresh.limits.max_concurrent_requests);
+        setConcurrencyMessage(null);
+      })
       .catch(() => setMessage({ type: 'err', text: t('config.loadFailed') }));
   };
 
@@ -108,6 +116,8 @@ export function ConfigPage() {
   }
 
   const valid = isValidMaxConcurrentRequests(config.limits.max_concurrent_requests);
+  const concurrencyDirty =
+    persistedConcurrency !== null && persistedConcurrency !== config.limits.max_concurrent_requests;
 
   const update = <T,>(path: string[], value: T) => {
     setConfig((prev) => {
@@ -160,7 +170,11 @@ export function ConfigPage() {
       setOldPassword('');
       setNewPassword('');
       const fresh = await apiFetchConfig();
+      if (fresh.limits.max_concurrent_requests !== config.limits.max_concurrent_requests) {
+        throw new Error('Concurrency limit was not persisted');
+      }
       setConfig(fresh);
+      setPersistedConcurrency(fresh.limits.max_concurrent_requests);
     } catch (e: unknown) {
       setMessage({
         type: 'err',
@@ -168,6 +182,31 @@ export function ConfigPage() {
       });
     } finally {
       setSaving(false);
+    }
+  };
+
+  const handleSaveConcurrency = async () => {
+    const value = config.limits.max_concurrent_requests;
+    if (!valid) {
+      setConcurrencyMessage({ type: 'err', text: t('config.server.maxConcurrentRequestsError') });
+      return;
+    }
+    setSavingConcurrency(true);
+    setConcurrencyMessage(null);
+    try {
+      const fresh = await apiSaveConcurrencyLimit(value);
+      setConfig((prev) => (prev ? { ...prev, limits: fresh.limits } : prev));
+      setPersistedConcurrency(value);
+      setConcurrencyMessage({ type: 'ok', text: t('config.server.maxConcurrentRequestsSaved') });
+    } catch (e: unknown) {
+      setConcurrencyMessage({
+        type: 'err',
+        text: t('config.server.maxConcurrentRequestsSaveFailed', {
+          error: e instanceof Error ? e.message : String(e),
+        }),
+      });
+    } finally {
+      setSavingConcurrency(false);
     }
   };
 
@@ -420,6 +459,25 @@ export function ConfigPage() {
                   ? t('config.server.maxConcurrentRequestsUnlimited')
                   : t('config.server.maxConcurrentRequestsHotReloadHint')}
             </p>
+            <div className="mt-2 flex items-center gap-2">
+              <Button
+                type="button"
+                size="sm"
+                onClick={handleSaveConcurrency}
+                disabled={!valid || !concurrencyDirty || savingConcurrency || saving}
+              >
+                <Save className="h-4 w-4 mr-1" />
+                {savingConcurrency ? t('config.saving') : t('config.server.maxConcurrentRequestsSave')}
+              </Button>
+              {concurrencyDirty && !savingConcurrency && (
+                <span className="text-xs text-amber-600">{t('config.server.maxConcurrentRequestsDirty')}</span>
+              )}
+            </div>
+            {concurrencyMessage && (
+              <p className={`mt-2 text-xs ${concurrencyMessage.type === 'err' ? 'text-destructive' : 'text-green-700'}`}>
+                {concurrencyMessage.text}
+              </p>
+            )}
           </div>
         </div>
       </Section>
@@ -819,10 +877,10 @@ export function ConfigPage() {
 
       {/* Action buttons */}
       <div className="flex justify-end gap-3">
-        <Button variant="outline" onClick={handleCancel} disabled={saving}>
+        <Button variant="outline" onClick={handleCancel} disabled={saving || savingConcurrency}>
           {t('config.cancel')}
         </Button>
-        <Button onClick={handleSave} disabled={saving || !valid}>
+        <Button onClick={handleSave} disabled={saving || savingConcurrency || !valid}>
           <Save className="h-5 w-5 mr-2" />
           {saving ? t('config.saving') : t('config.save')}
         </Button>
