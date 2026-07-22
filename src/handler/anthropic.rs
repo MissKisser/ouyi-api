@@ -1608,6 +1608,7 @@ async fn collect_ouyi_output(resp: reqwest::Response) -> Result<(String, u64, u6
     let mut prompt_tokens: u64 = 0;
     let mut completion_tokens: u64 = 0;
     let mut sse_buffer = SseLineBuffer::new();
+    let mut partial = Vec::new();
 
     let byte_stream = resp.bytes_stream();
     futures::pin_mut!(byte_stream);
@@ -1622,7 +1623,19 @@ async fn collect_ouyi_output(resp: reqwest::Response) -> Result<(String, u64, u6
             }
         };
 
-        let text = String::from_utf8_lossy(&chunk).to_string();
+        let mut bytes = chunk.to_vec();
+        if !partial.is_empty() {
+            let mut combined = std::mem::take(&mut partial);
+            combined.extend_from_slice(&bytes);
+            bytes = combined;
+        }
+        let text = match String::from_utf8(bytes) {
+            Ok(text) => text,
+            Err(error) => {
+                partial = error.into_bytes();
+                continue;
+            }
+        };
         let lines = sse_buffer.push_chunk(&text);
 
         for line in lines {
@@ -2825,6 +2838,26 @@ mod tests {
             .unwrap()
     }
 
+    async fn ouyi_split_utf8_application_error_handler() -> axum::response::Response {
+        let body = concat!(
+            "data: {\"id\":\"quota\",\"type\":\"\",\"data\":null,\"err\":\"您的套餐余量不足，请购买后重试\",\"code\":1}\n\n",
+            "data: [DONE]\n\n"
+        );
+        let split_at = body.find("套").unwrap() + 1;
+        let chunks = vec![
+            Ok::<_, std::convert::Infallible>(bytes::Bytes::copy_from_slice(
+                &body.as_bytes()[..split_at],
+            )),
+            Ok(bytes::Bytes::copy_from_slice(&body.as_bytes()[split_at..])),
+        ];
+
+        axum::response::Response::builder()
+            .status(StatusCode::OK)
+            .header(axum::http::header::CONTENT_TYPE, "text/event-stream")
+            .body(Body::from_stream(tokio_stream::iter(chunks)))
+            .unwrap()
+    }
+
     async fn ouyi_tool_then_final_handler(
         State(counter): State<Arc<AtomicUsize>>,
     ) -> axum::response::Response {
@@ -2987,6 +3020,38 @@ mod tests {
         assert!(
             matches!(err, AppError::Upstream(message) if message.contains("您的套餐余量不足，请购买后重试"))
         );
+        assert_eq!(tool_requests.load(Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
+    async fn test_anthropic_tools_preserve_split_utf8_application_error() {
+        let tool_requests = Arc::new(AtomicUsize::new(0));
+        let ouyi_base_url = spawn_mock_router(
+            Router::new()
+                .route("/api/chat/session", post(ouyi_session_handler))
+                .route(
+                    "/api/chat/completions",
+                    post(ouyi_split_utf8_application_error_handler),
+                ),
+        )
+        .await;
+        let tool_base_url = spawn_mock_router(
+            Router::new()
+                .route("/chat/completions", post(tool_compiler_handler))
+                .with_state(tool_requests.clone()),
+        )
+        .await;
+        let state = make_test_state(test_config(ouyi_base_url, tool_base_url));
+        let mut req = make_request_with_tools();
+        req.stream = Some(false);
+
+        let err = messages(State(state), Json(req)).await.unwrap_err();
+        let AppError::Upstream(message) = err else {
+            panic!("expected upstream error");
+        };
+
+        assert_eq!(message, "您的套餐余量不足，请购买后重试 (code=1)");
+        assert!(!message.contains('�'));
         assert_eq!(tool_requests.load(Ordering::SeqCst), 0);
     }
 

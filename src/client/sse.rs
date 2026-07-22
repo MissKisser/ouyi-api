@@ -61,6 +61,10 @@ fn sanitize_ouyi_error_message(message: &str) -> String {
         "token",
         "api_key",
         "apikey",
+        "x-api-key",
+        "password",
+        "cookie",
+        "secret",
         "jwt",
     ]
     .iter()
@@ -185,6 +189,38 @@ mod tests {
         let message = ouyi_application_error(&event).unwrap();
         assert!(message.contains("敏感信息已隐藏"));
         assert!(!message.contains("secret-token-value"));
+    }
+
+    #[test]
+    fn test_ouyi_application_error_redacts_all_sensitive_markers() {
+        let cases = [
+            ("x-api-key", "x-api-key=leak-key-123", "leak-key-123"),
+            (
+                "password",
+                "password=leak-password-456",
+                "leak-password-456",
+            ),
+            ("cookie", "cookie=leak-cookie-789", "leak-cookie-789"),
+            ("secret", "secret=leak-value-abc", "leak-value-abc"),
+        ];
+
+        for (marker, upstream_message, sensitive_value) in cases {
+            let line = format!(
+                "data: {}",
+                serde_json::json!({
+                    "id": marker,
+                    "type": "",
+                    "data": null,
+                    "err": upstream_message,
+                    "code": 1
+                })
+            );
+            let event = parse_sse_line(&line).unwrap();
+            let message = ouyi_application_error(&event).unwrap();
+
+            assert!(message.contains("敏感信息已隐藏"), "marker={marker}");
+            assert!(!message.contains(sensitive_value), "marker={marker}");
+        }
     }
 
     #[test]
