@@ -1,24 +1,34 @@
 use std::sync::Arc;
 
 use axum::Router;
+use axum::middleware;
 use axum::routing::{get, post};
 
 use crate::AppState;
+use crate::concurrency::{ConcurrencyLimiter, limit_inference_requests};
 use crate::handler;
 
-pub fn app() -> Router<Arc<AppState>> {
-    Router::new()
+pub fn app(limiter: ConcurrencyLimiter) -> Router<Arc<AppState>> {
+    let models = Router::new()
         .route("/v1/models", get(handler::models::list_models))
+        .route("/openai/v1/models", get(handler::models::list_models))
+        .route("/anthropic/v1/models", get(handler::anthropic::list_models));
+
+    let inference = Router::new()
         .route(
             "/v1/chat/completions",
             post(handler::chat::chat_completions),
         )
-        .route("/openai/v1/models", get(handler::models::list_models))
         .route("/openai/v1/responses", post(handler::responses::responses))
         .route("/v1/responses", post(handler::responses::responses))
-        .route("/anthropic/v1/models", get(handler::anthropic::list_models))
         .route("/anthropic/v1/messages", post(handler::anthropic::messages))
         .route("/anthropic/messages", post(handler::anthropic::messages))
+        .route_layer(middleware::from_fn_with_state(
+            limiter,
+            limit_inference_requests,
+        ));
+
+    models.merge(inference)
 }
 
 #[cfg(test)]
@@ -55,7 +65,7 @@ mod tests {
     }
 
     async fn spawn_protocol_app(state: Arc<AppState>) -> String {
-        let app = super::app()
+        let app = super::app(state.concurrency_limiter.clone())
             .merge(crate::admin::admin_routes(state.clone()))
             .with_state(state);
         spawn_http_server(app).await
@@ -381,6 +391,59 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn production_inference_routes_share_limiter_but_model_routes_do_not() {
+        let state = make_state(
+            OuyiPlatform::Ouyi8,
+            "http://127.0.0.1:9".to_string(),
+            "http://127.0.0.1:9".to_string(),
+        );
+        state.concurrency_limiter.set_limit(1);
+        let _permit = state
+            .concurrency_limiter
+            .try_acquire()
+            .expect("the only permit should be available");
+        let base_url = spawn_protocol_app(state).await;
+        let client = reqwest::Client::builder().no_proxy().build().unwrap();
+
+        for path in [
+            "/v1/chat/completions",
+            "/openai/v1/responses",
+            "/v1/responses",
+            "/anthropic/v1/messages",
+            "/anthropic/messages",
+        ] {
+            let response = client
+                .post(format!("{base_url}{path}"))
+                .send()
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::TOO_MANY_REQUESTS, "{path}");
+            assert_eq!(response.headers().get(header::RETRY_AFTER).unwrap(), "1");
+
+            let body: Value = response.json().await.unwrap();
+            if path.starts_with("/anthropic") {
+                assert_eq!(body["type"], "error", "{path}");
+                assert_eq!(body["error"]["type"], "rate_limit_error", "{path}");
+            } else {
+                assert_eq!(body["error"]["type"], "rate_limit_error", "{path}");
+                assert_eq!(
+                    body["error"]["code"], "concurrency_limit_exceeded",
+                    "{path}"
+                );
+            }
+        }
+
+        for path in ["/v1/models", "/openai/v1/models", "/anthropic/v1/models"] {
+            let response = client
+                .get(format!("{base_url}{path}"))
+                .send()
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::OK, "{path}");
+        }
+    }
+
+    #[tokio::test]
     async fn protocol_routes_v8_smoke_with_mocked_ouyi_and_tool_runtime() {
         let tool_requests = Arc::new(AtomicUsize::new(0));
         let ouyi_base_url = spawn_http_server(v8_ouyi_mock_router()).await;
@@ -467,10 +530,22 @@ mod tests {
         assert_eq!(resp.status(), 200);
         let body = resp.text().await.unwrap();
         // 验证关键事件存在
-        assert!(body.contains("response.created"), "应有 response.created 事件");
-        assert!(body.contains("response.output_item.added"), "应有 output_item.added 事件");
-        assert!(body.contains("response.function_call_arguments"), "应有 function_call_arguments 事件");
-        assert!(body.contains("response.completed"), "应有 response.completed 事件");
+        assert!(
+            body.contains("response.created"),
+            "应有 response.created 事件"
+        );
+        assert!(
+            body.contains("response.output_item.added"),
+            "应有 output_item.added 事件"
+        );
+        assert!(
+            body.contains("response.function_call_arguments"),
+            "应有 function_call_arguments 事件"
+        );
+        assert!(
+            body.contains("response.completed"),
+            "应有 response.completed 事件"
+        );
 
         assert_eq!(tool_requests.load(Ordering::SeqCst), 5);
     }
