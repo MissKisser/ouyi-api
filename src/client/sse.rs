@@ -27,6 +27,55 @@ pub fn parse_sse_line(line: &str) -> Option<OuyiSseEvent> {
     serde_json::from_str::<OuyiSseEvent>(data).ok()
 }
 
+const MAX_OUYI_ERROR_CHARS: usize = 256;
+
+/// 识别 Ouyi 8.0 SSE 中 HTTP 200 包裹的应用层错误。
+///
+/// 只返回上游提供的错误摘要与错误码；不拼接鉴权 token 或请求正文。
+pub fn ouyi_application_error(event: &OuyiSseEvent) -> Option<String> {
+    let code = event.code.unwrap_or_default();
+    let message = event
+        .err
+        .as_deref()
+        .map(sanitize_ouyi_error_message)
+        .filter(|message| !message.is_empty());
+
+    if code == 0 && message.is_none() {
+        return None;
+    }
+
+    let message = message.unwrap_or_else(|| "上游返回应用错误".to_string());
+    if code == 0 {
+        Some(message)
+    } else {
+        Some(format!("{message} (code={code})"))
+    }
+}
+
+fn sanitize_ouyi_error_message(message: &str) -> String {
+    let message = message.split_whitespace().collect::<Vec<_>>().join(" ");
+    let lower = message.to_ascii_lowercase();
+    if [
+        "authorization",
+        "bearer",
+        "token",
+        "api_key",
+        "apikey",
+        "jwt",
+    ]
+    .iter()
+    .any(|marker| lower.contains(marker))
+    {
+        return "上游认证错误（敏感信息已隐藏）".to_string();
+    }
+
+    let mut sanitized: String = message.chars().take(MAX_OUYI_ERROR_CHARS).collect();
+    if message.chars().count() > MAX_OUYI_ERROR_CHARS {
+        sanitized.push('…');
+    }
+    sanitized
+}
+
 pub struct SseLineBuffer {
     buffer: String,
 }
@@ -92,6 +141,50 @@ mod tests {
         let line = r#"data:{"id":"1","type":"done"}"#;
         let event = parse_sse_line(line).unwrap();
         assert_eq!(event.event_type, "done");
+    }
+
+    #[test]
+    fn test_parse_sse_line_preserves_ouyi_application_error() {
+        let line = r#"data: {"id":"quota","type":"","data":null,"err":"您的套餐余量不足，请购买后重试","code":1}"#;
+        let event = parse_sse_line(line).unwrap();
+
+        assert_eq!(event.code, Some(1));
+        assert_eq!(event.err.as_deref(), Some("您的套餐余量不足，请购买后重试"));
+        assert_eq!(
+            ouyi_application_error(&event).as_deref(),
+            Some("您的套餐余量不足，请购买后重试 (code=1)")
+        );
+    }
+
+    #[test]
+    fn test_ouyi_application_error_detects_nonzero_code_without_message() {
+        let event = parse_sse_line(r#"data:{"id":"1","type":"","data":null,"code":7}"#).unwrap();
+
+        assert_eq!(
+            ouyi_application_error(&event).as_deref(),
+            Some("上游返回应用错误 (code=7)")
+        );
+    }
+
+    #[test]
+    fn test_ouyi_application_error_ignores_success_event() {
+        let event =
+            parse_sse_line(r#"data:{"id":"1","type":"string","data":"ok","err":"  ","code":0}"#)
+                .unwrap();
+
+        assert_eq!(ouyi_application_error(&event), None);
+    }
+
+    #[test]
+    fn test_ouyi_application_error_redacts_sensitive_message() {
+        let event = parse_sse_line(
+            r#"data:{"id":"1","type":"","data":null,"err":"Bearer secret-token-value expired","code":1}"#,
+        )
+        .unwrap();
+
+        let message = ouyi_application_error(&event).unwrap();
+        assert!(message.contains("敏感信息已隐藏"));
+        assert!(!message.contains("secret-token-value"));
     }
 
     #[test]

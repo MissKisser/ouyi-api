@@ -12,7 +12,7 @@ use crate::adapter::request::convert_request;
 use crate::adapter::response::SseCollector;
 use crate::client::http::OuyiHttpClient;
 use crate::client::session::{GuardedStream, spawn_session_cleanup};
-use crate::client::sse::{SseLineBuffer, parse_sse_line};
+use crate::client::sse::{SseLineBuffer, ouyi_application_error, parse_sse_line};
 use crate::error::AppError;
 use crate::model::openai::*;
 use crate::platform::OuyiPlatform;
@@ -286,8 +286,9 @@ async fn responses_v8_tools(
     let mut partial: Vec<u8> = Vec::new();
     let mut total_bytes = 0usize;
     let max_bytes = state.config.read().await.limits.max_response_bytes;
+    let mut application_error: Option<String> = None;
 
-    while let Some(chunk) = guarded.next().await {
+    'read_loop: while let Some(chunk) = guarded.next().await {
         let bytes = match chunk {
             Ok(b) => b,
             Err(e) => {
@@ -323,11 +324,16 @@ async fn responses_v8_tools(
         match String::from_utf8(v) {
             Ok(s) => {
                 for line in sse_buf.push_chunk(&s) {
-                    if let Some(event) = parse_sse_line(&line)
-                        && let Some(data) = &event.data
-                        && let Some(text) = data.as_str()
-                    {
-                        upstream_text.push_str(text);
+                    if let Some(event) = parse_sse_line(&line) {
+                        if let Some(msg) = ouyi_application_error(&event) {
+                            application_error = Some(msg);
+                            break 'read_loop;
+                        }
+                        if let Some(data) = &event.data
+                            && let Some(text) = data.as_str()
+                        {
+                            upstream_text.push_str(text);
+                        }
                     }
                 }
             }
@@ -336,17 +342,32 @@ async fn responses_v8_tools(
             }
         }
     }
-    if let Some(remaining) = sse_buf.drain_remaining()
+    if application_error.is_none()
+        && let Some(remaining) = sse_buf.drain_remaining()
         && let Some(event) = parse_sse_line(&remaining)
-        && let Some(data) = &event.data
-        && let Some(text) = data.as_str()
     {
-        upstream_text.push_str(text);
+        if let Some(msg) = ouyi_application_error(&event) {
+            application_error = Some(msg);
+        } else if let Some(data) = &event.data
+            && let Some(text) = data.as_str()
+        {
+            upstream_text.push_str(text);
+        }
     }
 
     guarded.as_mut().skip_cleanup();
     spawn_session_cleanup(client, session_data.id);
     state.active_sessions.remove(&session_data.id);
+
+    if let Some(msg) = application_error {
+        state.stats.record_error(
+            start_time.elapsed().as_millis() as u64,
+            &model_full,
+            &msg,
+            "ouyi8",
+        );
+        return Err(AppError::Upstream(msg));
+    }
 
     // pipeline 决策
     let pipeline_out = crate::tool_runtime::pipeline::run_openai_tool_pipeline(
@@ -700,6 +721,7 @@ async fn handle_responses_stream(
 
         futures::pin_mut!(guarded);
         let mut stream_error: Option<String> = None;
+        let mut application_error: Option<String> = None;
         let mut downstream_closed = false;
 
         'read_loop: while let Some(chunk_result) = guarded.next().await {
@@ -730,6 +752,10 @@ async fn handle_responses_stream(
             let lines = sse_buffer.push_chunk(&text);
             for line in lines {
                 if let Some(event) = parse_sse_line(&line) {
+                    if let Some(msg) = ouyi_application_error(&event) {
+                        application_error = Some(msg);
+                        break 'read_loop;
+                    }
                     let event_type =
                         crate::client::sse::OuyiEventType::from(event.event_type.as_str());
                     match event_type {
@@ -785,8 +811,46 @@ async fn handle_responses_stream(
             }
         }
 
+        if application_error.is_none()
+            && stream_error.is_none()
+            && let Some(remaining) = sse_buffer.drain_remaining()
+            && let Some(event) = parse_sse_line(&remaining)
+        {
+            application_error = ouyi_application_error(&event);
+        }
+
         if downstream_closed {
             state.active_sessions.remove(&session_id);
+            return;
+        }
+
+        if let Some(msg) = application_error {
+            state.stats.record_error(
+                start_time.elapsed().as_millis() as u64,
+                &model_for_stats,
+                &msg,
+                "ouyi8",
+            );
+            state.active_sessions.remove(&session_id);
+            let failed = serde_json::json!({
+                "type": "response.failed",
+                "response": {
+                    "id": &task_id_for_init,
+                    "object": "response",
+                    "created_at": created,
+                    "model": &model_for_stream,
+                    "status": "failed",
+                    "error": {
+                        "message": msg,
+                        "type": "upstream_error"
+                    }
+                }
+            });
+            let _ = tx
+                .send(Ok(Event::default()
+                    .event("response.failed")
+                    .data(failed.to_string())))
+                .await;
             return;
         }
 
@@ -949,8 +1013,9 @@ async fn handle_responses_non_stream(
     let max_bytes = state.config.read().await.limits.max_response_bytes;
     let mut partial = Vec::new();
     let mut stream_error: Option<String> = None;
+    let mut application_error: Option<String> = None;
 
-    while let Some(chunk_result) = guarded.next().await {
+    'read_loop: while let Some(chunk_result) = guarded.next().await {
         let chunk = match chunk_result {
             Ok(bytes) => bytes,
             Err(e) => {
@@ -984,15 +1049,34 @@ async fn handle_responses_non_stream(
         let lines = sse_buffer.push_chunk(&text);
         for line in lines {
             if let Some(event) = parse_sse_line(&line) {
+                if let Some(msg) = ouyi_application_error(&event) {
+                    application_error = Some(msg);
+                    break 'read_loop;
+                }
                 collector.push_event(&event);
             }
         }
     }
 
-    if let Some(remaining) = sse_buffer.drain_remaining()
+    if application_error.is_none()
+        && let Some(remaining) = sse_buffer.drain_remaining()
         && let Some(event) = parse_sse_line(&remaining)
     {
-        collector.push_event(&event);
+        if let Some(msg) = ouyi_application_error(&event) {
+            application_error = Some(msg);
+        } else {
+            collector.push_event(&event);
+        }
+    }
+
+    if let Some(msg) = application_error {
+        guarded.as_mut().skip_cleanup();
+        spawn_session_cleanup(client, session_id);
+        state.active_sessions.remove(&session_id);
+        state
+            .stats
+            .record_error(elapsed, &model_full, &msg, "ouyi8");
+        return Err(AppError::Upstream(msg));
     }
 
     if let Some(msg) = stream_error {
@@ -1373,6 +1457,11 @@ fn uuid_short() -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use axum::Router;
+    use axum::body::Body;
+    use axum::http::{StatusCode, header};
+    use axum::routing::post;
+    use http_body_util::BodyExt;
 
     #[test]
     fn test_function_call_output_converts_to_named_tool_message() {
@@ -1436,8 +1525,70 @@ mod tests {
     };
     use crate::model::mapper::ModelMapper;
 
+    async fn spawn_mock_router(router: Router) -> String {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            axum::serve(listener, router).await.unwrap();
+        });
+        format!("http://{}", addr)
+    }
+
+    async fn ouyi_session_handler() -> axum::Json<serde_json::Value> {
+        axum::Json(json!({
+            "code": 0,
+            "msg": "ok",
+            "data": {
+                "id": 42,
+                "model": "gpt-test",
+                "contextCount": 0,
+                "temperature": 0.0
+            }
+        }))
+    }
+
+    async fn ouyi_application_error_handler() -> axum::response::Response {
+        axum::response::Response::builder()
+            .status(StatusCode::OK)
+            .header(header::CONTENT_TYPE, "text/event-stream")
+            .body(Body::from(concat!(
+                "data: {\"id\":\"quota\",\"type\":\"\",\"data\":null,\"err\":\"您的套餐余量不足，请购买后重试\",\"code\":1}\n\n",
+                "data: [DONE]\n\n"
+            )))
+            .unwrap()
+    }
+
+    async fn application_error_state() -> Arc<AppState> {
+        let ouyi_base_url = spawn_mock_router(
+            Router::new()
+                .route("/api/chat/session", post(ouyi_session_handler))
+                .route(
+                    "/api/chat/completions",
+                    post(ouyi_application_error_handler),
+                ),
+        )
+        .await;
+        make_test_state(test_config(ouyi_base_url))
+    }
+
+    fn responses_request(stream: bool, tools: bool) -> ResponsesRequest {
+        serde_json::from_value(json!({
+            "model": "gpt-test",
+            "input": "hello",
+            "stream": stream,
+            "tools": if tools { json!([{
+                "type": "function",
+                "name": "Bash",
+                "description": "Run shell command",
+                "parameters": {"type": "object"}
+            }]) } else { json!(null) }
+        }))
+        .unwrap()
+    }
+
     fn make_test_state(config: AppConfig) -> Arc<AppState> {
         let http_client = reqwest::Client::builder()
+            .no_proxy()
             .timeout(std::time::Duration::from_secs(5))
             .build()
             .unwrap();
@@ -1516,6 +1667,7 @@ mod tests {
 
     fn make_v7_test_state(ouyi_base_url: String) -> Arc<AppState> {
         let http_client = reqwest::Client::builder()
+            .no_proxy()
             .timeout(std::time::Duration::from_secs(5))
             .build()
             .unwrap();
@@ -1591,6 +1743,47 @@ mod tests {
                 ouyi_base_url,
             )),
         })
+    }
+
+    #[tokio::test]
+    async fn test_responses_non_stream_rejects_ouyi_application_error() {
+        let state = application_error_state().await;
+
+        let err = responses(State(state), Json(responses_request(false, false)))
+            .await
+            .unwrap_err();
+
+        assert!(
+            matches!(err, AppError::Upstream(message) if message.contains("您的套餐余量不足，请购买后重试"))
+        );
+    }
+
+    #[tokio::test]
+    async fn test_responses_stream_emits_failed_without_completed_for_ouyi_application_error() {
+        let state = application_error_state().await;
+
+        let response = responses(State(state), Json(responses_request(true, false)))
+            .await
+            .unwrap();
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        let body_text = String::from_utf8(body.to_vec()).unwrap();
+
+        assert!(body_text.contains("response.failed"));
+        assert!(body_text.contains("您的套餐余量不足，请购买后重试"));
+        assert!(!body_text.contains("response.completed"));
+    }
+
+    #[tokio::test]
+    async fn test_responses_tools_reject_ouyi_application_error_before_pipeline() {
+        let state = application_error_state().await;
+
+        let err = responses(State(state), Json(responses_request(false, true)))
+            .await
+            .unwrap_err();
+
+        assert!(
+            matches!(err, AppError::Upstream(message) if message.contains("您的套餐余量不足，请购买后重试"))
+        );
     }
 
     #[tokio::test]

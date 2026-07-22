@@ -148,6 +148,7 @@ pub struct OuyiSseEvent {
     #[serde(rename = "type")]
     pub event_type: String,
     pub data: Option<serde_json::Value>,
+    pub err: Option<String>,
     #[allow(dead_code)]
     pub code: Option<i32>,
 }

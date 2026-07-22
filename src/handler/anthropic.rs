@@ -14,7 +14,7 @@ use crate::adapter::anthropic_response::{AnthropicCollector, AnthropicStreamConv
 use crate::admin::stats::{ToolRuntimeDecision, ToolRuntimeMode as StatsToolRuntimeMode};
 use crate::client::http::OuyiHttpClient;
 use crate::client::session::{GuardedStream, spawn_session_cleanup};
-use crate::client::sse::{SseLineBuffer, parse_sse_line};
+use crate::client::sse::{SseLineBuffer, ouyi_application_error, parse_sse_line};
 use crate::config::AppConfig;
 use crate::error::AppError;
 use crate::model::anthropic::{AnthropicContent, ContentBlock, MessagesRequest};
@@ -1599,7 +1599,9 @@ async fn handle_anthropic_tools_plain_output(
 
 /// 收集 Ouyi SSE 流的完整输出
 async fn collect_ouyi_output(resp: reqwest::Response) -> Result<(String, u64, u64), AppError> {
-    use crate::client::sse::{OuyiEventType, SseLineBuffer, parse_sse_line};
+    use crate::client::sse::{
+        OuyiEventType, SseLineBuffer, ouyi_application_error, parse_sse_line,
+    };
     use futures::StreamExt;
 
     let mut content_parts: Vec<String> = Vec::new();
@@ -1625,6 +1627,9 @@ async fn collect_ouyi_output(resp: reqwest::Response) -> Result<(String, u64, u6
 
         for line in lines {
             if let Some(event) = parse_sse_line(&line) {
+                if let Some(msg) = ouyi_application_error(&event) {
+                    return Err(AppError::Upstream(msg));
+                }
                 let event_type = OuyiEventType::from(event.event_type.as_str());
                 match event_type {
                     OuyiEventType::StringChunk => {
@@ -1649,6 +1654,13 @@ async fn collect_ouyi_output(resp: reqwest::Response) -> Result<(String, u64, u6
                 }
             }
         }
+    }
+
+    if let Some(remaining) = sse_buffer.drain_remaining()
+        && let Some(event) = parse_sse_line(&remaining)
+        && let Some(msg) = ouyi_application_error(&event)
+    {
+        return Err(AppError::Upstream(msg));
     }
 
     Ok((
@@ -1913,6 +1925,7 @@ async fn handle_anthropic_stream(
         let mut sse_buffer = SseLineBuffer::new();
         let mut partial = Vec::new();
         let mut stream_error: Option<String> = None;
+        let mut application_error: Option<String> = None;
         let mut downstream_closed = false;
 
         futures::pin_mut!(guarded);
@@ -1957,6 +1970,10 @@ async fn handle_anthropic_stream(
             let lines = sse_buffer.push_chunk(&text);
             for line in lines {
                 if let Some(event) = parse_sse_line(&line) {
+                    if let Some(msg) = ouyi_application_error(&event) {
+                        application_error = Some(msg);
+                        break 'read_loop;
+                    }
                     let event_type =
                         crate::client::sse::OuyiEventType::from(event.event_type.as_str());
                     let content = event.data.as_ref().and_then(|d| d.as_str()).unwrap_or("");
@@ -1995,8 +2012,39 @@ async fn handle_anthropic_stream(
             chunk_count += 1;
         }
 
+        if application_error.is_none()
+            && stream_error.is_none()
+            && let Some(remaining) = sse_buffer.drain_remaining()
+            && let Some(event) = parse_sse_line(&remaining)
+        {
+            application_error = ouyi_application_error(&event);
+        }
+
         if downstream_closed {
             state_for_stream.active_sessions.remove(&session_id);
+            return;
+        }
+
+        if let Some(msg) = application_error {
+            state_for_stream.stats.record_error(
+                start_time.elapsed().as_millis() as u64,
+                &model_for_stats,
+                &msg,
+                "ouyi8",
+            );
+            state_for_stream.active_sessions.remove(&session_id);
+            if let Some(key) = &cache_key {
+                state_for_stream.tool_sessions.remove(key);
+            }
+            let error = serde_json::json!({
+                "type": "error",
+                "error": {
+                    "type": "api_error",
+                    "message": msg
+                }
+            });
+            let payload = format!("event: error\ndata: {}\n\n", error);
+            let _ = tx.send(Bytes::from(payload)).await;
             return;
         }
 
@@ -2121,8 +2169,9 @@ async fn handle_anthropic_non_stream(
     let max_bytes = state.config.read().await.limits.max_response_bytes;
     let mut partial = Vec::new();
     let mut stream_error: Option<String> = None;
+    let mut application_error: Option<String> = None;
 
-    while let Some(chunk_result) = guarded.next().await {
+    'read_loop: while let Some(chunk_result) = guarded.next().await {
         let chunk = match chunk_result {
             Ok(bytes) => bytes,
             Err(e) => {
@@ -2156,15 +2205,35 @@ async fn handle_anthropic_non_stream(
         let lines = sse_buffer.push_chunk(&text);
         for line in lines {
             if let Some(event) = parse_sse_line(&line) {
+                if let Some(msg) = ouyi_application_error(&event) {
+                    application_error = Some(msg);
+                    break 'read_loop;
+                }
                 collector.push_event(&event);
             }
         }
     }
 
-    if let Some(remaining) = sse_buffer.drain_remaining()
+    if application_error.is_none()
+        && let Some(remaining) = sse_buffer.drain_remaining()
         && let Some(event) = parse_sse_line(&remaining)
     {
-        collector.push_event(&event);
+        if let Some(msg) = ouyi_application_error(&event) {
+            application_error = Some(msg);
+        } else {
+            collector.push_event(&event);
+        }
+    }
+
+    if let Some(msg) = application_error {
+        guarded.as_mut().skip_cleanup();
+        spawn_session_cleanup(client, session_id);
+        state.active_sessions.remove(&session_id);
+        if let Some(key) = &cache_key {
+            state.tool_sessions.remove(key);
+        }
+        state.stats.record_error(elapsed, &model, &msg, "ouyi8");
+        return Err(AppError::Upstream(msg));
     }
 
     if let Some(msg) = stream_error {
@@ -2508,6 +2577,7 @@ mod tests {
 
     fn make_test_state(config: AppConfig) -> Arc<AppState> {
         let http_client = reqwest::Client::builder()
+            .no_proxy()
             .timeout(std::time::Duration::from_secs(5))
             .build()
             .unwrap();
@@ -2556,6 +2626,7 @@ mod tests {
         use crate::client::ouyi_v7::Ouyi7HttpClient;
 
         let http_client = reqwest::Client::builder()
+            .no_proxy()
             .timeout(std::time::Duration::from_secs(5))
             .build()
             .unwrap();
@@ -2743,6 +2814,17 @@ mod tests {
         ouyi_sse_response("你好\n\n你好！有什么我可以帮你的吗？\n\n你好！有什么我可以帮你的吗？")
     }
 
+    async fn ouyi_application_error_handler() -> axum::response::Response {
+        axum::response::Response::builder()
+            .status(StatusCode::OK)
+            .header(axum::http::header::CONTENT_TYPE, "text/event-stream")
+            .body(Body::from(concat!(
+                "data: {\"id\":\"quota\",\"type\":\"\",\"data\":null,\"err\":\"您的套餐余量不足，请购买后重试\",\"code\":1}\n\n",
+                "data: [DONE]\n\n"
+            )))
+            .unwrap()
+    }
+
     async fn ouyi_tool_then_final_handler(
         State(counter): State<Arc<AtomicUsize>>,
     ) -> axum::response::Response {
@@ -2822,6 +2904,90 @@ mod tests {
                 "completion_tokens": 3
             }
         }))
+    }
+
+    #[tokio::test]
+    async fn test_anthropic_non_stream_rejects_ouyi_application_error() {
+        let ouyi_base_url = spawn_mock_router(
+            Router::new()
+                .route("/api/chat/session", post(ouyi_session_handler))
+                .route(
+                    "/api/chat/completions",
+                    post(ouyi_application_error_handler),
+                ),
+        )
+        .await;
+        let tool_base_url = spawn_mock_router(Router::new()).await;
+        let state = make_test_state(test_config(ouyi_base_url, tool_base_url));
+        let mut req = make_messages_request(vec![AnthropicMessage {
+            role: "user".to_string(),
+            content: AnthropicContent::Text("hello".to_string()),
+        }]);
+        req.stream = Some(false);
+
+        let err = messages(State(state), Json(req)).await.unwrap_err();
+
+        assert!(
+            matches!(err, AppError::Upstream(message) if message.contains("您的套餐余量不足，请购买后重试"))
+        );
+    }
+
+    #[tokio::test]
+    async fn test_anthropic_stream_emits_error_without_stop_for_ouyi_application_error() {
+        let ouyi_base_url = spawn_mock_router(
+            Router::new()
+                .route("/api/chat/session", post(ouyi_session_handler))
+                .route(
+                    "/api/chat/completions",
+                    post(ouyi_application_error_handler),
+                ),
+        )
+        .await;
+        let tool_base_url = spawn_mock_router(Router::new()).await;
+        let state = make_test_state(test_config(ouyi_base_url, tool_base_url));
+        let req = make_messages_request(vec![AnthropicMessage {
+            role: "user".to_string(),
+            content: AnthropicContent::Text("hello".to_string()),
+        }]);
+
+        let response = messages(State(state), Json(req)).await.unwrap();
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        let body_text = String::from_utf8(body.to_vec()).unwrap();
+
+        assert!(body_text.contains("event: error"));
+        assert!(body_text.contains(r#""type":"api_error""#));
+        assert!(body_text.contains("您的套餐余量不足，请购买后重试"));
+        assert!(!body_text.contains("message_stop"));
+    }
+
+    #[tokio::test]
+    async fn test_anthropic_tools_reject_ouyi_application_error_before_compiler() {
+        let tool_requests = Arc::new(AtomicUsize::new(0));
+        let ouyi_base_url = spawn_mock_router(
+            Router::new()
+                .route("/api/chat/session", post(ouyi_session_handler))
+                .route(
+                    "/api/chat/completions",
+                    post(ouyi_application_error_handler),
+                ),
+        )
+        .await;
+        let tool_base_url = spawn_mock_router(
+            Router::new()
+                .route("/chat/completions", post(tool_compiler_handler))
+                .with_state(tool_requests.clone()),
+        )
+        .await;
+        let state = make_test_state(test_config(ouyi_base_url, tool_base_url));
+        let mut req = make_request_with_tools();
+        req.stream = Some(false);
+
+        let err = messages(State(state), Json(req)).await.unwrap_err();
+
+        assert!(
+            matches!(err, AppError::Upstream(message) if message.contains("您的套餐余量不足，请购买后重试"))
+        );
+        assert_eq!(tool_requests.load(Ordering::SeqCst), 0);
     }
 
     async fn tool_compiler_final_handler(

@@ -17,7 +17,7 @@ use crate::adapter::request::convert_request;
 use crate::adapter::response::{SseCollector, StreamConverter};
 use crate::client::http::OuyiHttpClient;
 use crate::client::session::{GuardedStream, spawn_session_cleanup};
-use crate::client::sse::{SseLineBuffer, parse_sse_line};
+use crate::client::sse::{SseLineBuffer, ouyi_application_error, parse_sse_line};
 use crate::error::AppError;
 use crate::model::openai::ChatCompletionRequest;
 use crate::platform::OuyiPlatform;
@@ -363,6 +363,7 @@ async fn handle_stream_response(
 
         let mut partial = Vec::new();
         let mut stream_error: Option<String> = None;
+        let mut application_error: Option<String> = None;
         let mut downstream_closed = false;
         futures::pin_mut!(guarded);
 
@@ -394,9 +395,14 @@ async fn handle_stream_response(
             let lines = sse_buffer.push_chunk(&text);
 
             for line in lines {
-                if let Some(event) = parse_sse_line(&line)
-                    && let Some(chunks) = converter.convert_event(&event)
-                {
+                let Some(event) = parse_sse_line(&line) else {
+                    continue;
+                };
+                if let Some(msg) = ouyi_application_error(&event) {
+                    application_error = Some(msg);
+                    break 'read_loop;
+                }
+                if let Some(chunks) = converter.convert_event(&event) {
                     for chunk in chunks {
                         let json = match serde_json::to_string(&chunk) {
                             Ok(j) => j,
@@ -414,6 +420,27 @@ async fn handle_stream_response(
 
         if downstream_closed {
             state.active_sessions.remove(&session_id);
+            return;
+        }
+
+        if let Some(msg) = application_error {
+            let platform_key = state.platform.read().await.config_key();
+            state.stats.record_error(
+                start_time.elapsed().as_millis() as u64,
+                &model_for_stats,
+                &msg,
+                platform_key,
+            );
+            state.active_sessions.remove(&session_id);
+            let data = serde_json::json!({
+                "error": {
+                    "message": msg,
+                    "type": "upstream_error"
+                }
+            });
+            let _ = tx
+                .send(Ok(Event::default().event("error").data(data.to_string())))
+                .await;
             return;
         }
 
@@ -441,15 +468,36 @@ async fn handle_stream_response(
         // 处理剩余缓冲
         if let Some(remaining) = sse_buffer.drain_remaining()
             && let Some(event) = parse_sse_line(&remaining)
-            && let Some(chunks) = converter.convert_event(&event)
         {
-            for chunk in chunks {
-                let json = match serde_json::to_string(&chunk) {
-                    Ok(j) => j,
-                    Err(_) => continue,
-                };
-                let sse_event = Event::default().data(json);
-                let _ = tx.send(Ok(sse_event)).await;
+            if let Some(msg) = ouyi_application_error(&event) {
+                let platform_key = state.platform.read().await.config_key();
+                state.stats.record_error(
+                    start_time.elapsed().as_millis() as u64,
+                    &model_for_stats,
+                    &msg,
+                    platform_key,
+                );
+                state.active_sessions.remove(&session_id);
+                let data = serde_json::json!({
+                    "error": {
+                        "message": msg,
+                        "type": "upstream_error"
+                    }
+                });
+                let _ = tx
+                    .send(Ok(Event::default().event("error").data(data.to_string())))
+                    .await;
+                return;
+            }
+            if let Some(chunks) = converter.convert_event(&event) {
+                for chunk in chunks {
+                    let json = match serde_json::to_string(&chunk) {
+                        Ok(j) => j,
+                        Err(_) => continue,
+                    };
+                    let sse_event = Event::default().data(json);
+                    let _ = tx.send(Ok(sse_event)).await;
+                }
             }
         }
 
@@ -505,7 +553,9 @@ async fn handle_non_stream_response(
     let mut partial = Vec::new();
     let mut stream_error: Option<String> = None;
 
-    while let Some(chunk_result) = guarded.next().await {
+    let mut application_error: Option<String> = None;
+
+    'read_loop: while let Some(chunk_result) = guarded.next().await {
         let chunk = match chunk_result {
             Ok(bytes) => bytes,
             Err(e) => {
@@ -542,15 +592,35 @@ async fn handle_non_stream_response(
 
         for line in lines {
             if let Some(event) = parse_sse_line(&line) {
+                if let Some(msg) = ouyi_application_error(&event) {
+                    application_error = Some(msg);
+                    break 'read_loop;
+                }
                 collector.push_event(&event);
             }
         }
     }
 
-    if let Some(remaining) = sse_buffer.drain_remaining()
+    if application_error.is_none()
+        && let Some(remaining) = sse_buffer.drain_remaining()
         && let Some(event) = parse_sse_line(&remaining)
     {
-        collector.push_event(&event);
+        if let Some(msg) = ouyi_application_error(&event) {
+            application_error = Some(msg);
+        } else {
+            collector.push_event(&event);
+        }
+    }
+
+    if let Some(msg) = application_error {
+        guarded.as_mut().skip_cleanup();
+        spawn_session_cleanup(client, session_id);
+        state.active_sessions.remove(&session_id);
+        let platform_key = state.platform.read().await.config_key();
+        state
+            .stats
+            .record_error(elapsed, &model, &msg, platform_key);
+        return Err(AppError::Upstream(msg));
     }
 
     if let Some(msg) = stream_error {
@@ -760,8 +830,9 @@ async fn handle_openai_tools_response(
     let mut total_bytes: usize = 0;
     let mut partial = Vec::new();
     let mut stream_error: Option<String> = None;
+    let mut application_error: Option<String> = None;
 
-    while let Some(chunk_result) = guarded.next().await {
+    'read_loop: while let Some(chunk_result) = guarded.next().await {
         let chunk = match chunk_result {
             Ok(bytes) => bytes,
             Err(e) => {
@@ -797,15 +868,38 @@ async fn handle_openai_tools_response(
         let lines = sse_buffer.push_chunk(&text);
         for line in lines {
             if let Some(event) = parse_sse_line(&line) {
+                if let Some(msg) = ouyi_application_error(&event) {
+                    application_error = Some(msg);
+                    break 'read_loop;
+                }
                 collector.push_event(&event);
             }
         }
     }
 
-    if let Some(remaining) = sse_buffer.drain_remaining()
+    if application_error.is_none()
+        && let Some(remaining) = sse_buffer.drain_remaining()
         && let Some(event) = parse_sse_line(&remaining)
     {
-        collector.push_event(&event);
+        if let Some(msg) = ouyi_application_error(&event) {
+            application_error = Some(msg);
+        } else {
+            collector.push_event(&event);
+        }
+    }
+
+    if let Some(msg) = application_error {
+        guarded.as_mut().skip_cleanup();
+        spawn_session_cleanup(client, session_id);
+        state.active_sessions.remove(&session_id);
+        let platform_key = state.platform.read().await.config_key();
+        state.stats.record_error(
+            start_time.elapsed().as_millis() as u64,
+            &model_full,
+            &msg,
+            platform_key,
+        );
+        return Err(AppError::Upstream(msg));
     }
 
     if let Some(msg) = stream_error {
@@ -971,6 +1065,7 @@ mod tests {
 
     fn make_test_state(config: AppConfig) -> Arc<AppState> {
         let http_client = reqwest::Client::builder()
+            .no_proxy()
             .timeout(std::time::Duration::from_secs(5))
             .build()
             .unwrap();
@@ -1096,6 +1191,17 @@ mod tests {
         ouyi_sse_response("需要查看当前目录。")
     }
 
+    async fn ouyi_application_error_handler() -> axum::response::Response {
+        axum::response::Response::builder()
+            .status(StatusCode::OK)
+            .header(header::CONTENT_TYPE, "text/event-stream")
+            .body(Body::from(concat!(
+                "data: {\"id\":\"quota\",\"type\":\"\",\"data\":null,\"err\":\"您的套餐余量不足，请购买后重试\",\"code\":1}\n\n",
+                "data: [DONE]\n\n"
+            )))
+            .unwrap()
+    }
+
     async fn tool_compiler_handler(
         axum::extract::State(counter): axum::extract::State<Arc<AtomicUsize>>,
     ) -> axum::Json<serde_json::Value> {
@@ -1174,6 +1280,74 @@ mod tests {
         )
         .await;
         make_test_state(test_config(ouyi_base_url, tool_base_url))
+    }
+
+    async fn setup_application_error_state(tool_requests: Arc<AtomicUsize>) -> Arc<AppState> {
+        let ouyi_base_url = spawn_mock_router(
+            Router::new()
+                .route("/api/chat/session", post(ouyi_session_handler))
+                .route(
+                    "/api/chat/session/{id}",
+                    delete(ouyi_delete_session_handler),
+                )
+                .route(
+                    "/api/chat/completions",
+                    post(ouyi_application_error_handler),
+                ),
+        )
+        .await;
+        let tool_base_url = spawn_mock_router(
+            Router::new()
+                .route("/chat/completions", post(tool_compiler_handler))
+                .with_state(tool_requests),
+        )
+        .await;
+        make_test_state(test_config(ouyi_base_url, tool_base_url))
+    }
+
+    #[tokio::test]
+    async fn test_openai_non_stream_rejects_ouyi_application_error() {
+        let state = setup_application_error_state(Arc::new(AtomicUsize::new(0))).await;
+        let mut req = openai_request(false);
+        req.tools = None;
+        req.tool_choice = None;
+
+        let err = chat_completions(State(state), Json(req)).await.unwrap_err();
+
+        assert!(
+            matches!(err, AppError::Upstream(message) if message.contains("您的套餐余量不足，请购买后重试"))
+        );
+    }
+
+    #[tokio::test]
+    async fn test_openai_stream_emits_error_without_done_for_ouyi_application_error() {
+        let state = setup_application_error_state(Arc::new(AtomicUsize::new(0))).await;
+        let mut req = openai_request(true);
+        req.tools = None;
+        req.tool_choice = None;
+
+        let response = chat_completions(State(state), Json(req)).await.unwrap();
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        let body_text = String::from_utf8(body.to_vec()).unwrap();
+
+        assert!(body_text.contains("event: error"));
+        assert!(body_text.contains("您的套餐余量不足，请购买后重试"));
+        assert!(!body_text.contains("[DONE]"));
+    }
+
+    #[tokio::test]
+    async fn test_openai_tools_reject_ouyi_application_error_before_compiler() {
+        let tool_requests = Arc::new(AtomicUsize::new(0));
+        let state = setup_application_error_state(tool_requests.clone()).await;
+
+        let err = chat_completions(State(state), Json(openai_request(false)))
+            .await
+            .unwrap_err();
+
+        assert!(
+            matches!(err, AppError::Upstream(message) if message.contains("您的套餐余量不足，请购买后重试"))
+        );
+        assert_eq!(tool_requests.load(Ordering::SeqCst), 0);
     }
 
     #[tokio::test]
@@ -1311,6 +1485,7 @@ mod tests {
         use crate::client::ouyi_v7::Ouyi7HttpClient;
 
         let http_client = reqwest::Client::builder()
+            .no_proxy()
             .timeout(std::time::Duration::from_secs(5))
             .build()
             .unwrap();
@@ -1387,6 +1562,7 @@ mod tests {
         use crate::client::ouyi_v7::Ouyi7HttpClient;
 
         let http_client = reqwest::Client::builder()
+            .no_proxy()
             .timeout(std::time::Duration::from_secs(5))
             .build()
             .unwrap();

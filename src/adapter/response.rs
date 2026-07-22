@@ -270,6 +270,7 @@ mod tests {
             id: Some("1".to_string()),
             event_type: "string".to_string(),
             data: Some(json!(text)),
+            err: None,
             code: None,
         }
     }
@@ -279,6 +280,7 @@ mod tests {
             id: Some("1".to_string()),
             event_type: "done".to_string(),
             data: None,
+            err: None,
             code: None,
         }
     }
