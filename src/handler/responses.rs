@@ -246,10 +246,7 @@ async fn responses_v8_tools(
         }
     };
 
-    let resp = match client
-        .create_completion(&session_data.id, &ouyi_req)
-        .await
-    {
+    let resp = match client.create_completion(&session_data.id, &ouyi_req).await {
         Ok(r) => r,
         Err(e) => {
             let msg = format!("创建补全失败: {}", e);
@@ -358,9 +355,8 @@ async fn responses_v8_tools(
     let task_id = format!("resp_{}", crate::tool_runtime::uuid_short());
 
     if is_stream {
-        let events = responses_stream::events_for_pipeline_output(
-            &task_id, &short_model, &pipeline_out,
-        );
+        let events =
+            responses_stream::events_for_pipeline_output(&task_id, &short_model, &pipeline_out);
         let sse_events: Vec<Result<axum::response::sse::Event, axum::Error>> =
             events.into_iter().map(Ok).collect();
         let sse = axum::response::sse::Sse::new(tokio_stream::iter(sse_events));
@@ -368,7 +364,10 @@ async fn responses_v8_tools(
     } else {
         // Ouyi 上游不发 usage 块，目前没有上游 token 计数可填；传 None 让函数读 pipeline meta
         let resp_json = responses_non_stream::build_responses_response_from_pipeline(
-            &task_id, &short_model, &pipeline_out, None,
+            &task_id,
+            &short_model,
+            &pipeline_out,
+            None,
         );
         Ok(Json(resp_json).into_response())
     }
@@ -517,11 +516,7 @@ async fn responses_v7_tools(
     };
 
     let pipeline_out = crate::tool_runtime::pipeline::run_openai_tool_pipeline(
-        &state,
-        &chat_req,
-        text,
-        "ouyi7",
-        start_time,
+        &state, &chat_req, text, "ouyi7", start_time,
     )
     .await;
 
@@ -530,16 +525,18 @@ async fn responses_v7_tools(
     let is_stream = req.stream;
 
     if is_stream {
-        let events = responses_stream::events_for_pipeline_output(
-            &task_id, &short_model, &pipeline_out,
-        );
+        let events =
+            responses_stream::events_for_pipeline_output(&task_id, &short_model, &pipeline_out);
         let sse_events: Vec<Result<axum::response::sse::Event, axum::Error>> =
             events.into_iter().map(Ok).collect();
         let sse = axum::response::sse::Sse::new(tokio_stream::iter(sse_events));
         Ok(sse.into_response())
     } else {
         let resp_json = responses_non_stream::build_responses_response_from_pipeline(
-            &task_id, &short_model, &pipeline_out, None,
+            &task_id,
+            &short_model,
+            &pipeline_out,
+            None,
         );
         Ok(Json(resp_json).into_response())
     }

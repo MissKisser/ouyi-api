@@ -137,7 +137,9 @@ pub async fn run_openai_tool_pipeline(
             }
             // 阶段 D：记录 stats（tool_runtime 自身）
             if dmeta.mode != ToolDecisionMode::None {
-                use crate::admin::stats::{ToolRuntimeDecision, ToolRuntimeMode as StatsToolRuntimeMode};
+                use crate::admin::stats::{
+                    ToolRuntimeDecision, ToolRuntimeMode as StatsToolRuntimeMode,
+                };
                 let mode = match dmeta.mode {
                     ToolDecisionMode::Broker => StatsToolRuntimeMode::Broker,
                     ToolDecisionMode::Compiler => StatsToolRuntimeMode::Compiler,
@@ -184,7 +186,9 @@ pub async fn run_openai_tool_pipeline(
             );
             // 复刻 chat 路径原行为：Compiler 模式下额外记一次 tool_runtime stats
             if dmeta.mode == ToolDecisionMode::Compiler {
-                use crate::admin::stats::{ToolRuntimeDecision, ToolRuntimeMode as StatsToolRuntimeMode};
+                use crate::admin::stats::{
+                    ToolRuntimeDecision, ToolRuntimeMode as StatsToolRuntimeMode,
+                };
                 let runtime_started = Instant::now();
                 state.stats.record_tool_runtime_success(
                     "",
@@ -218,15 +222,15 @@ pub async fn run_openai_tool_pipeline(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::admin::auth::AdminStore;
+    use crate::admin::stats::StatsCollector;
     use crate::config::{
         AppConfig, LimitsConfig, Ouyi7Config, OuyiConfig, ServerConfig, ToolCallConfig,
         ToolRuntimeConfig, ToolRuntimeMode, ToolRuntimeProvider,
     };
+    use crate::model::mapper::ModelMapper;
     use crate::platform::{OuyiPlatform, PlatformStatus};
     use crate::tool_runtime::ToolLedger;
-    use crate::admin::auth::AdminStore;
-    use crate::admin::stats::StatsCollector;
-    use crate::model::mapper::ModelMapper;
     use dashmap::DashMap;
     use std::sync::Arc;
     use tokio::sync::RwLock as AsyncRwLock;

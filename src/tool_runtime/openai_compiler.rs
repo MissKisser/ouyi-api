@@ -786,20 +786,6 @@ fn materialize_compiled_calls(
 mod tests {
     use super::*;
 
-    fn make_test_tool(name: &str) -> AnthropicTool {
-        AnthropicTool {
-            name: name.to_string(),
-            description: "测试工具".to_string(),
-            input_schema: serde_json::json!({
-                "type": "object",
-                "properties": {
-                    "query": {"type": "string"}
-                },
-                "required": ["query"]
-            }),
-        }
-    }
-
     #[test]
     fn test_parse_openai_tool_calls_valid() {
         let tool_calls = vec![OpenAiToolCall {

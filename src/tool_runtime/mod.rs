@@ -9,8 +9,8 @@ pub mod broker;
 pub mod decision;
 pub mod materialize;
 pub mod openai_compiler;
-pub mod pipeline;
 pub mod payload;
+pub mod pipeline;
 pub mod protocol;
 pub mod schema;
 

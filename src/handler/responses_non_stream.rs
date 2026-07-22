@@ -2,7 +2,7 @@
 //! 输出符合 OpenAI Responses API 规范的 `ResponsesResponse` 结构。
 
 use crate::model::openai::{
-    ResponseContentPart, ResponseOutputItem, ResponsesResponse, ResponseUsage,
+    ResponseContentPart, ResponseOutputItem, ResponseUsage, ResponsesResponse,
 };
 use crate::tool_runtime::openai_compiler::CompiledToolCall;
 use crate::tool_runtime::pipeline::PipelineOutput;
@@ -28,7 +28,9 @@ pub fn build_responses_response_from_pipeline(
 
     let (input_tokens, output_tokens) = usage_override.unwrap_or_else(|| {
         let meta = match output {
-            PipelineOutput::ToolCalls { meta, .. } | PipelineOutput::FinalAnswer { meta, .. } => meta,
+            PipelineOutput::ToolCalls { meta, .. } | PipelineOutput::FinalAnswer { meta, .. } => {
+                meta
+            }
         };
         (meta.prompt_tokens, meta.completion_tokens)
     });
@@ -130,7 +132,8 @@ mod tests {
             calls,
             meta: meta_dummy(),
         };
-        let resp = build_responses_response_from_pipeline("resp_1", "gpt-test", &out, Some((10, 5)));
+        let resp =
+            build_responses_response_from_pipeline("resp_1", "gpt-test", &out, Some((10, 5)));
         assert_eq!(resp.output.len(), 2);
         for item in &resp.output {
             assert_eq!(item.item_type, "function_call");

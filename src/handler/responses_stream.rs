@@ -150,7 +150,11 @@ pub fn build_final_answer_events(task_id: &str, model: &str, text: &str) -> Vec<
 }
 
 /// 构造 function_call 路径的全部事件序列。每个 call 一组 added → deltas → done → output_item.done。
-pub fn build_tool_call_events(task_id: &str, model: &str, calls: &[CompiledToolCall]) -> Vec<Event> {
+pub fn build_tool_call_events(
+    task_id: &str,
+    model: &str,
+    calls: &[CompiledToolCall],
+) -> Vec<Event> {
     let created = now_unix_secs();
 
     let mut events = Vec::new();
@@ -307,12 +311,13 @@ mod tests {
         use futures::stream;
 
         let owned = ev.clone();
-        let sse = Sse::new(stream::once(async move { Ok::<_, std::convert::Infallible>(owned) }));
+        let sse = Sse::new(stream::once(async move {
+            Ok::<_, std::convert::Infallible>(owned)
+        }));
         let resp = sse.into_response();
-        let bytes = futures::executor::block_on(async {
-            to_bytes(resp.into_body(), 64 * 1024).await
-        })
-        .expect("读取 SSE body 应成功");
+        let bytes =
+            futures::executor::block_on(async { to_bytes(resp.into_body(), 64 * 1024).await })
+                .expect("读取 SSE body 应成功");
         let text = std::str::from_utf8(&bytes).expect("SSE body 应为 UTF-8");
         let mut data_lines: Vec<&str> = Vec::new();
         for line in text.lines() {
