@@ -1027,6 +1027,7 @@ mod tests {
                 no_data_timeout_secs: 5,
                 max_response_bytes: 1024 * 1024,
                 max_messages_bytes: 1024 * 1024,
+                max_concurrent_requests: 0,
             },
             admin: Some(AdminConfig {
                 jwt_secret: Some("test-secret".to_string()),
@@ -1339,6 +1340,7 @@ mod tests {
                     no_data_timeout_secs: 5,
                     max_response_bytes: 1024 * 1024,
                     max_messages_bytes: 1024 * 1024,
+                    max_concurrent_requests: 0,
                 },
                 admin: Some(AdminConfig {
                     jwt_secret: Some("test-secret".to_string()),
@@ -1412,6 +1414,7 @@ mod tests {
                     no_data_timeout_secs: 5,
                     max_response_bytes: 1024 * 1024,
                     max_messages_bytes: 1024 * 1024,
+                    max_concurrent_requests: 0,
                 },
                 admin: Some(AdminConfig {
                     jwt_secret: Some("test-secret".to_string()),

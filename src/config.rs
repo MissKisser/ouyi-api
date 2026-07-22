@@ -1,6 +1,7 @@
 use serde::Deserialize;
 use std::path::Path;
 
+use crate::error::AppError;
 use crate::platform::OuyiPlatform;
 
 #[derive(Debug, Clone, Deserialize)]
@@ -172,6 +173,8 @@ pub struct LimitsConfig {
     pub no_data_timeout_secs: u64,
     pub max_response_bytes: usize,
     pub max_messages_bytes: usize,
+    #[serde(default)]
+    pub max_concurrent_requests: usize,
 }
 
 impl AppConfig {
@@ -264,6 +267,27 @@ pub fn write_admin_config(
         .map_err(|e| crate::error::AppError::Config(format!("写入配置失败: {}", e)))?;
 
     tracing::info!("Admin 配置已更新");
+    Ok(())
+}
+
+pub fn write_limits_config(path: &Path, config: &LimitsConfig) -> Result<(), AppError> {
+    let content = std::fs::read_to_string(path)
+        .map_err(|e| AppError::Config(format!("读取配置失败: {}", e)))?;
+
+    let mut doc = content
+        .parse::<toml_edit::DocumentMut>()
+        .map_err(|e| AppError::Config(format!("解析配置失败: {}", e)))?;
+
+    if !doc.contains_key("limits") {
+        doc["limits"] = toml_edit::Item::Table(toml_edit::Table::new());
+    }
+    doc["limits"]["max_concurrent_requests"] =
+        toml_edit::value(config.max_concurrent_requests as i64);
+
+    std::fs::write(path, doc.to_string())
+        .map_err(|e| AppError::Config(format!("写入配置失败: {}", e)))?;
+
+    tracing::info!("Limits 配置已更新");
     Ok(())
 }
 
@@ -479,6 +503,77 @@ pub fn remove_openai_tool_runtime_config(path: &Path) -> Result<(), crate::error
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_max_concurrent_requests_defaults_to_unlimited() {
+        let limits: LimitsConfig = toml::from_str(
+            r#"
+request_timeout_secs = 30
+no_data_timeout_secs = 30
+max_response_bytes = 1048576
+max_messages_bytes = 1048576
+"#,
+        )
+        .unwrap();
+
+        assert_eq!(limits.max_concurrent_requests, 0);
+    }
+
+    #[test]
+    fn test_write_limits_config_preserves_other_sections() {
+        struct TempFileGuard(std::path::PathBuf);
+
+        impl Drop for TempFileGuard {
+            fn drop(&mut self) {
+                let _ = std::fs::remove_file(&self.0);
+            }
+        }
+
+        let temp_file = TempFileGuard(std::env::temp_dir().join(format!(
+            "ouyi-limits-config-test-{}.toml",
+            uuid::Uuid::new_v4()
+        )));
+        std::fs::write(
+            &temp_file.0,
+            r#"# 保留顶层注释
+[server]
+host = "127.0.0.1"
+port = 3000
+
+[limits]
+request_timeout_secs = 30
+no_data_timeout_secs = 20
+max_response_bytes = 1048576
+max_messages_bytes = 524288
+custom_limit = "keep-me"
+"#,
+        )
+        .unwrap();
+
+        write_limits_config(
+            &temp_file.0,
+            &LimitsConfig {
+                request_timeout_secs: 180,
+                no_data_timeout_secs: 60,
+                max_response_bytes: 2097152,
+                max_messages_bytes: 2097152,
+                max_concurrent_requests: 42,
+            },
+        )
+        .unwrap();
+
+        let content = std::fs::read_to_string(&temp_file.0).unwrap();
+        let doc = content.parse::<toml_edit::DocumentMut>().unwrap();
+        assert!(content.contains("# 保留顶层注释"));
+        assert_eq!(doc["server"]["host"].as_str(), Some("127.0.0.1"));
+        assert_eq!(doc["server"]["port"].as_integer(), Some(3000));
+        assert_eq!(doc["limits"]["request_timeout_secs"].as_integer(), Some(30));
+        assert_eq!(doc["limits"]["custom_limit"].as_str(), Some("keep-me"));
+        assert_eq!(
+            doc["limits"]["max_concurrent_requests"].as_integer(),
+            Some(42)
+        );
+    }
 
     #[test]
     fn test_openai_tool_runtime_config() {

@@ -16,6 +16,8 @@ app_version = "3.0.3"
 model_refresh_interval_secs = 1800
 
 [limits]
+# 全局最大并发请求数（0 表示不限流，合法范围 0..=1000）
+max_concurrent_requests = 0
 # 请求超时时间（秒）
 request_timeout_secs = 180
 # 无数据超时时间（秒）
