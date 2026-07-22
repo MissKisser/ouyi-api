@@ -124,7 +124,11 @@
     "server": {
       "host": "Listen Address",
       "port": "Port",
-      "corsOrigins": "CORS Origins (comma separated)"
+      "corsOrigins": "CORS Origins (comma separated)",
+      "maxConcurrentRequests": "Global Inference Concurrency Limit",
+      "maxConcurrentRequestsUnlimited": "0 allows unlimited concurrent requests.",
+      "maxConcurrentRequestsHotReloadHint": "Changes take effect immediately after saving; no restart is required.",
+      "maxConcurrentRequestsError": "Enter an integer from 0 to 1000."
     },
     "deepseek": {
       "apiBase": "API Base",

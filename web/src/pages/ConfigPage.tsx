@@ -31,6 +31,7 @@ import {
   Globe,
 } from 'lucide-react';
 import { useTranslation } from 'react-i18next';
+import { MAX_CONCURRENT_REQUESTS, isValidMaxConcurrentRequests } from '@/lib/concurrency';
 
 /** Collapsible section wrapper */
 function Section({
@@ -101,6 +102,8 @@ export function ConfigPage() {
     return <div className="p-4 text-muted-foreground">{t('config.loading')}</div>;
   }
 
+  const valid = isValidMaxConcurrentRequests(config.limits.max_concurrent_requests);
+
   const update = <T,>(path: string[], value: T) => {
     setConfig((prev) => {
       if (!prev) return prev;
@@ -115,6 +118,11 @@ export function ConfigPage() {
   };
 
   const handleSave = async () => {
+    if (!valid) {
+      setMessage({ type: 'err', text: t('config.server.maxConcurrentRequestsError') });
+      return;
+    }
+
     setSaving(true);
     setMessage(null);
     try {
@@ -123,6 +131,7 @@ export function ConfigPage() {
           host: config.server.host,
           port: config.server.port,
         },
+        limits: config.limits,
         deepseek: config.deepseek,
         platform: config.platform,
         ouyi_v7: config.ouyi_v7,
@@ -738,6 +747,27 @@ export function ConfigPage() {
               onChange={(e) => update(['server', 'port'], Number(e.target.value))}
             />
           </div>
+          <div className="md:col-span-2">
+            <label className="text-sm text-muted-foreground block mb-1">
+              {t('config.server.maxConcurrentRequests')}
+            </label>
+            <Input
+              type="number"
+              min={0}
+              max={MAX_CONCURRENT_REQUESTS}
+              step={1}
+              value={config.limits.max_concurrent_requests}
+              onChange={(e) => update(['limits', 'max_concurrent_requests'], Number(e.target.value))}
+              aria-invalid={!valid}
+            />
+            <p className={`mt-1 text-xs ${valid ? 'text-muted-foreground' : 'text-destructive'}`}>
+              {!valid
+                ? t('config.server.maxConcurrentRequestsError')
+                : config.limits.max_concurrent_requests === 0
+                  ? t('config.server.maxConcurrentRequestsUnlimited')
+                  : t('config.server.maxConcurrentRequestsHotReloadHint')}
+            </p>
+          </div>
         </div>
       </Section>
 
@@ -779,7 +809,7 @@ export function ConfigPage() {
         <Button variant="outline" onClick={handleCancel} disabled={saving}>
           {t('config.cancel')}
         </Button>
-        <Button onClick={handleSave} disabled={saving}>
+        <Button onClick={handleSave} disabled={saving || !valid}>
           <Save className="h-5 w-5 mr-2" />
           {saving ? t('config.saving') : t('config.save')}
         </Button>

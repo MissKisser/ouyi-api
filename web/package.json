@@ -8,6 +8,7 @@
     "dev": "vite",
     "build": "tsc -b && vite build",
     "lint": "eslint .",
+    "test:concurrency": "node --experimental-strip-types --test tests/concurrency.test.mjs",
     "preview": "vite preview"
   },
   "dependencies": {

@@ -124,7 +124,11 @@
     "server": {
       "host": "监听地址",
       "port": "端口",
-      "corsOrigins": "CORS 来源（逗号分隔）"
+      "corsOrigins": "CORS 来源（逗号分隔）",
+      "maxConcurrentRequests": "全局推理并发上限",
+      "maxConcurrentRequestsUnlimited": "0 表示不限制并发请求。",
+      "maxConcurrentRequestsHotReloadHint": "保存后立即热更新，无需重启服务。",
+      "maxConcurrentRequestsError": "请输入 0 到 1000 之间的整数。"
     },
     "deepseek": {
       "apiBase": "API Base",

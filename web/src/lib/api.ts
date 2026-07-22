@@ -219,6 +219,10 @@ export interface ServerConfig {
   cors_origins: string[];
 }
 
+export interface LimitsConfig {
+  max_concurrent_requests: number;
+}
+
 export interface ToolCallTagConfig {
   extra_starts: string[];
   extra_ends: string[];
@@ -286,6 +290,7 @@ export interface PlatformConfig {
 
 export interface FullConfig {
   server: ServerConfig;
+  limits: LimitsConfig;
   deepseek: DeepSeekConfig;
   proxy: ProxyConfig;
   admin: AdminConfigResponse;
