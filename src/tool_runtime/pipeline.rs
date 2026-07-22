@@ -69,7 +69,7 @@ pub async fn run_openai_tool_pipeline(
     upstream_output: String,
     platform_key: &str,
     start_time: Instant,
-) -> PipelineOutput {
+) -> Result<PipelineOutput, crate::error::AppError> {
     use crate::tool_runtime::decision::{
         ToolDecisionMode, ToolTextDecision, decide_openai_tools_from_text,
     };
@@ -78,47 +78,27 @@ pub async fn run_openai_tool_pipeline(
     let runtime_cfg = state.config.read().await.openai_tool_runtime.clone();
 
     // 阶段 A：决策
-    let decision = match decide_openai_tools_from_text(
+    let decision = decide_openai_tools_from_text(
         state.http_client.clone(),
         runtime_cfg.as_ref(),
         request,
         &upstream_output,
     )
-    .await
-    {
-        Ok(d) => d,
-        Err(e) => {
-            tracing::error!(error = %e, "openai tool pipeline: decision failed");
-            return PipelineOutput::FinalAnswer {
-                text: upstream_output,
-                meta: PipelineMeta {
-                    provider: "error".into(),
-                    model: "error".into(),
-                    base_url: None,
-                    prompt_tokens: 0,
-                    completion_tokens: 0,
-                    platform_key: platform_key.into(),
-                    short_model: short_model.clone(),
-                },
-            };
-        }
-    };
+    .await?;
 
     match decision {
         ToolTextDecision::ToolCalls { calls, meta: dmeta } => {
             // 阶段 B：ledger 写入
             for call in &calls {
                 let call_key = format!("{}:{}", short_model, call.id);
-                if let Err(e) = state
+                state
                     .tool_ledger
                     .record_tool_use(&call_key, &call.id, &call.name)
-                {
-                    tracing::warn!(error = %e, call_id = %call.id, "ledger.record_tool_use failed; degrading to FinalAnswer");
-                    return PipelineOutput::FinalAnswer {
-                        text: upstream_output,
-                        meta: PipelineMeta::from_decision(&dmeta, platform_key, &short_model),
-                    };
-                }
+                    .map_err(|error| {
+                        crate::error::AppError::ToolProtocol(format!(
+                            "工具调用 ledger 写入失败: {error}"
+                        ))
+                    })?;
                 let broker_call = crate::tool_runtime::broker::BrokerToolCall {
                     id: call.id.clone(),
                     name: call.name.clone(),
@@ -170,10 +150,10 @@ pub async fn run_openai_tool_pipeline(
                 call_count = calls.len(),
                 "openai tool pipeline: tool calls"
             );
-            PipelineOutput::ToolCalls {
+            Ok(PipelineOutput::ToolCalls {
                 calls,
                 meta: PipelineMeta::from_decision(&dmeta, platform_key, &short_model),
-            }
+            })
         }
         ToolTextDecision::FinalAnswer { meta: dmeta } => {
             tracing::info!(
@@ -211,10 +191,10 @@ pub async fn run_openai_tool_pipeline(
                 &short_model,
                 platform_key,
             );
-            PipelineOutput::FinalAnswer {
+            Ok(PipelineOutput::FinalAnswer {
                 text: upstream_output,
                 meta: PipelineMeta::from_decision(&dmeta, platform_key, &short_model),
-            }
+            })
         }
     }
 }
@@ -374,7 +354,11 @@ mod tests {
                 function: crate::model::openai::ToolFunction {
                     name: "Bash".into(),
                     description: Some("Run shell".into()),
-                    parameters: Some(serde_json::json!({"type": "object"})),
+                    parameters: Some(serde_json::json!({
+                        "type": "object",
+                        "properties": {"command": {"type": "string"}},
+                        "required": ["command"]
+                    })),
                 },
             }]),
             tool_choice: None,
@@ -394,7 +378,8 @@ mod tests {
             "ouyi8",
             Instant::now(),
         )
-        .await;
+        .await
+        .unwrap();
         match out {
             PipelineOutput::FinalAnswer { text, meta } => {
                 assert_eq!(text, "我不调用任何工具");
@@ -403,5 +388,22 @@ mod tests {
             }
             _ => panic!("expected FinalAnswer"),
         }
+    }
+
+    #[tokio::test]
+    async fn pipeline_propagates_explicit_tool_protocol_failures() {
+        let state = test_state(Some(disabled_cfg()));
+        let req = chat_req_with_tools();
+        let error = run_openai_tool_pipeline(
+            &state,
+            &req,
+            r#"<tool_call>Bash▁command▁params▁{"description":"missing command"}"#.into(),
+            "ouyi8",
+            Instant::now(),
+        )
+        .await
+        .unwrap_err();
+
+        assert!(matches!(error, crate::error::AppError::ToolProtocol(_)));
     }
 }

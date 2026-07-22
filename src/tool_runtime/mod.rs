@@ -14,7 +14,9 @@ pub mod openai_compiler;
 pub mod payload;
 pub mod pipeline;
 pub mod protocol;
+pub mod provider;
 pub mod schema;
+pub mod validation;
 
 #[cfg(test)]
 mod broker_probe;

@@ -1,7 +1,10 @@
 use std::sync::Arc;
 
 use axum::Router;
+use axum::extract::Request;
 use axum::middleware;
+use axum::middleware::Next;
+use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
 
 use crate::AppState;
@@ -26,9 +29,23 @@ pub fn app(limiter: ConcurrencyLimiter) -> Router<Arc<AppState>> {
         .route_layer(middleware::from_fn_with_state(
             limiter,
             limit_inference_requests,
-        ));
+        ))
+        .route_layer(middleware::from_fn(reject_tool_runtime_recursion));
 
     models.merge(inference)
+}
+
+async fn reject_tool_runtime_recursion(request: Request, next: Next) -> Response {
+    let hop = request
+        .headers()
+        .get(crate::tool_runtime::provider::TOOL_RUNTIME_HOP_HEADER)
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| value.parse::<u32>().ok());
+    if hop.is_some_and(|hop| hop >= 1) {
+        return crate::error::AppError::ToolRecursion("内部工具编译请求回到了推理入口".to_string())
+            .into_response();
+    }
+    next.run(request).await
 }
 
 #[cfg(test)]
@@ -444,6 +461,36 @@ mod tests {
                 .await
                 .unwrap();
             assert_eq!(response.status(), StatusCode::OK, "{path}");
+        }
+    }
+
+    #[tokio::test]
+    async fn tool_runtime_hop_is_rejected_before_upstream_for_all_inference_routes() {
+        let state = make_state(
+            OuyiPlatform::Ouyi8,
+            "http://127.0.0.1:9".to_string(),
+            "http://127.0.0.1:9".to_string(),
+        );
+        let base_url = spawn_protocol_app(state).await;
+        let client = reqwest::Client::builder().no_proxy().build().unwrap();
+
+        for (path, body) in [
+            ("/v1/chat/completions", openai_text_body()),
+            ("/openai/v1/responses", responses_text_body()),
+            ("/v1/responses", responses_text_body()),
+            ("/anthropic/v1/messages", anthropic_text_body()),
+            ("/anthropic/messages", anthropic_text_body()),
+        ] {
+            let response = client
+                .post(format!("{base_url}{path}"))
+                .header(crate::tool_runtime::provider::TOOL_RUNTIME_HOP_HEADER, "1")
+                .json(&body)
+                .send()
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::BAD_GATEWAY, "{path}");
+            let body: Value = response.json().await.unwrap();
+            assert_eq!(body["error"]["type"], "tool_runtime_recursion", "{path}");
         }
     }
 

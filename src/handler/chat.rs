@@ -867,7 +867,7 @@ async fn handle_openai_tools_plain_output(
         platform_key,
         start_time,
     )
-    .await;
+    .await?;
 
     match pipeline_out {
         crate::tool_runtime::pipeline::PipelineOutput::ToolCalls { calls, meta: _ } => {

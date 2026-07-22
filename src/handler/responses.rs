@@ -349,7 +349,7 @@ async fn responses_v8_tools(
         "ouyi8",
         start_time,
     )
-    .await;
+    .await?;
 
     let short_model = chat_req.model.clone();
     let task_id = format!("resp_{}", crate::tool_runtime::uuid_short());
@@ -518,7 +518,7 @@ async fn responses_v7_tools(
     let pipeline_out = crate::tool_runtime::pipeline::run_openai_tool_pipeline(
         &state, &chat_req, text, "ouyi7", start_time,
     )
-    .await;
+    .await?;
 
     let short_model = chat_req.model.clone();
     let task_id = format!("resp_{}", crate::tool_runtime::uuid_short());

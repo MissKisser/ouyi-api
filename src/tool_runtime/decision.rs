@@ -88,13 +88,14 @@ pub async fn decide_openai_tools_from_text(
 
     let payload_extraction = crate::tool_runtime::payload::extract_payloads(main_model_output);
     let decision_text = payload_extraction.sanitized_text.as_str();
+    let explicit_intent = crate::tool_runtime::dialect::has_explicit_tool_intent(decision_text);
 
     let marked_calls =
         crate::tool_runtime::broker::parse_marked_tool_calls(decision_text, &tool_specs)
-            .map_err(AppError::BadRequest)?;
+            .map_err(AppError::ToolProtocol)?;
     let rule_calls = if marked_calls.is_empty() {
         crate::tool_runtime::broker::parse_rule_tool_intent(decision_text, &tool_specs)
-            .map_err(AppError::BadRequest)?
+            .map_err(AppError::ToolProtocol)?
     } else {
         Vec::new()
     };
@@ -122,6 +123,11 @@ pub async fn decide_openai_tools_from_text(
     }
 
     let Some(config) = runtime_config.filter(|cfg| cfg.enabled) else {
+        if explicit_intent {
+            return Err(AppError::ToolProtocol(
+                "检测到明确工具意图，但没有生成合法工具调用".to_string(),
+            ));
+        }
         return Ok(ToolTextDecision::FinalAnswer {
             meta: ToolDecisionMeta {
                 mode: ToolDecisionMode::None,
@@ -158,7 +164,20 @@ pub async fn decide_openai_tools_from_text(
     };
 
     match compiled.decision {
-        CompilerDecision::ToolCalls(calls) => Ok(ToolTextDecision::ToolCalls { calls, meta }),
+        CompilerDecision::ToolCalls(calls) => {
+            for call in &calls {
+                crate::tool_runtime::validation::validate_tool_call(
+                    &context.tools,
+                    &call.name,
+                    &call.input,
+                )
+                .map_err(AppError::ToolProtocol)?;
+            }
+            Ok(ToolTextDecision::ToolCalls { calls, meta })
+        }
+        CompilerDecision::FinalAnswer if explicit_intent => Err(AppError::ToolProtocol(
+            "编译器未能转换明确的工具意图".to_string(),
+        )),
         CompilerDecision::FinalAnswer => Ok(ToolTextDecision::FinalAnswer { meta }),
     }
 }
@@ -223,5 +242,20 @@ mod tests {
             }
             ToolTextDecision::FinalAnswer { .. } => panic!("expected tool calls"),
         }
+    }
+
+    #[tokio::test]
+    async fn test_explicit_invalid_glm_call_returns_tool_protocol_error() {
+        let req = openai_req_with_bash_tool();
+        let error = decide_openai_tools_from_text(
+            reqwest::Client::new(),
+            None,
+            &req,
+            r#"<tool_call>Bash▁command▁params▁{"description":"missing command"}"#,
+        )
+        .await
+        .unwrap_err();
+
+        assert!(matches!(error, AppError::ToolProtocol(_)));
     }
 }

@@ -321,6 +321,8 @@ async fn compile_for_openai_endpoint(
         .base_url
         .as_ref()
         .ok_or_else(|| AppError::Config("openai_tool_runtime.base_url 未配置".to_string()))?;
+    crate::tool_runtime::provider::validate_compiler_base_url(base_url)
+        .map_err(AppError::ToolRecursion)?;
 
     let api_key = config.get_api_key()?;
 
@@ -347,6 +349,10 @@ async fn compile_for_openai_endpoint(
     let response = http_client
         .post(&url)
         .header("Authorization", format!("Bearer {}", api_key))
+        .header(
+            crate::tool_runtime::provider::TOOL_RUNTIME_HOP_HEADER,
+            crate::tool_runtime::provider::TOOL_RUNTIME_HOP_VALUE,
+        )
         .header("Content-Type", "application/json")
         .json(&openai_request)
         .timeout(std::time::Duration::from_secs(config.timeout_secs))
@@ -360,7 +366,7 @@ async fn compile_for_openai_endpoint(
         .await
         .map_err(|e| AppError::Upstream(format!("读取编译器响应失败: {}", e)))?;
 
-    tracing::debug!(body = %body, "编译器响应原文");
+    tracing::debug!(response_bytes = body.len(), "已读取编译器响应");
 
     let openai_response: OpenAiChatResponse = serde_json::from_str(&body)
         .map_err(|e| AppError::Upstream(format!("编译器响应解析失败: {}", e)))?;
@@ -457,6 +463,8 @@ async fn compile_for_anthropic_provider(
         .unwrap_or("https://api.anthropic.com")
         .trim_end_matches('/');
     let base_url = base_url.strip_suffix("/v1").unwrap_or(base_url);
+    crate::tool_runtime::provider::validate_compiler_base_url(base_url)
+        .map_err(AppError::ToolRecursion)?;
     let api_key = config.get_api_key()?;
 
     let compiler_specs = crate::tool_runtime::schema::compiler_tool_specs(&context.tools);
@@ -479,6 +487,10 @@ async fn compile_for_anthropic_provider(
     let response = http_client
         .post(&url)
         .header("x-api-key", api_key)
+        .header(
+            crate::tool_runtime::provider::TOOL_RUNTIME_HOP_HEADER,
+            crate::tool_runtime::provider::TOOL_RUNTIME_HOP_VALUE,
+        )
         .header("anthropic-version", "2023-06-01")
         .header("Content-Type", "application/json")
         .json(&request)
@@ -493,7 +505,7 @@ async fn compile_for_anthropic_provider(
         .await
         .map_err(|e| AppError::Upstream(format!("读取编译器响应失败: {}", e)))?;
 
-    tracing::debug!(body = %body, "Anthropic 编译器响应原文");
+    tracing::debug!(response_bytes = body.len(), "已读取 Anthropic 编译器响应");
 
     let anthropic_response: AnthropicCompilerResponse = serde_json::from_str(&body)
         .map_err(|e| AppError::Upstream(format!("编译器响应解析失败: {}", e)))?;
@@ -633,6 +645,8 @@ async fn retry_with_structured_prompt(
         .base_url
         .as_ref()
         .ok_or_else(|| AppError::Config("tool_runtime.base_url 未配置".to_string()))?;
+    crate::tool_runtime::provider::validate_compiler_base_url(base_url)
+        .map_err(AppError::ToolRecursion)?;
 
     let api_key = config.get_api_key()?;
 
@@ -641,6 +655,10 @@ async fn retry_with_structured_prompt(
     let response = http_client
         .post(&url)
         .header("Authorization", format!("Bearer {}", api_key))
+        .header(
+            crate::tool_runtime::provider::TOOL_RUNTIME_HOP_HEADER,
+            crate::tool_runtime::provider::TOOL_RUNTIME_HOP_VALUE,
+        )
         .header("Content-Type", "application/json")
         .json(&retry_request)
         .timeout(std::time::Duration::from_secs(config.timeout_secs))
@@ -654,7 +672,7 @@ async fn retry_with_structured_prompt(
         .await
         .map_err(|e| AppError::Upstream(format!("读取编译器重试响应失败: {}", e)))?;
 
-    tracing::debug!(body = %body, "编译器重试响应原文");
+    tracing::debug!(response_bytes = body.len(), "已读取编译器重试响应");
 
     let openai_response: OpenAiChatResponse = serde_json::from_str(&body)
         .map_err(|e| AppError::Upstream(format!("编译器重试响应解析失败: {}", e)))?;
@@ -918,7 +936,13 @@ mod tests {
         use axum::{Json, Router, routing::post};
         use tokio::net::TcpListener;
 
-        async fn handler() -> Json<serde_json::Value> {
+        async fn handler(headers: axum::http::HeaderMap) -> Json<serde_json::Value> {
+            assert_eq!(
+                headers
+                    .get(crate::tool_runtime::provider::TOOL_RUNTIME_HOP_HEADER)
+                    .and_then(|value| value.to_str().ok()),
+                Some(crate::tool_runtime::provider::TOOL_RUNTIME_HOP_VALUE)
+            );
             Json(serde_json::json!({
                 "choices": [{
                     "message": {

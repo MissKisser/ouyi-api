@@ -40,10 +40,7 @@ pub fn parse_marked_tool_calls(
 
     for parsed_call in parsed {
         let name = parsed_call.name;
-        if find_tool(tools, &name).is_none() {
-            tracing::warn!(%name, "主模型输出未知工具，已跳过");
-            continue;
-        }
+        crate::tool_runtime::validation::validate_tool_call(tools, &name, &parsed_call.input)?;
         calls.push(BrokerToolCall {
             id: broker_id(),
             name,
@@ -286,42 +283,49 @@ pub async fn decide_with_broker(
 
     let payload_extraction = crate::tool_runtime::payload::extract_payloads(ouyi_output);
     let decision_text = payload_extraction.sanitized_text.as_str();
+    let explicit_intent = crate::tool_runtime::dialect::has_explicit_tool_intent(decision_text);
 
     let marked =
-        parse_marked_tool_calls(decision_text, &tool_specs).map_err(AppError::BadRequest)?;
+        parse_marked_tool_calls(decision_text, &tool_specs).map_err(AppError::ToolProtocol)?;
     if !marked.is_empty() {
         return Ok(BrokerDecision::ToolCalls(marked));
     }
 
     let rule_calls =
-        parse_rule_tool_intent(decision_text, &tool_specs).map_err(AppError::BadRequest)?;
+        parse_rule_tool_intent(decision_text, &tool_specs).map_err(AppError::ToolProtocol)?;
     if !rule_calls.is_empty() {
         return Ok(BrokerDecision::ToolCalls(rule_calls));
     }
 
-    let Some(config) = tool_runtime_config else {
+    let Some(config) = tool_runtime_config.filter(|config| config.enabled) else {
+        if explicit_intent {
+            return Err(AppError::ToolProtocol(
+                "检测到明确工具意图，但没有生成合法工具调用".to_string(),
+            ));
+        }
         return Ok(BrokerDecision::FinalAnswer { usage: None });
     };
 
     let compiled =
-        match crate::tool_runtime::openai_compiler::compile_tool_decision_with_usage_and_payloads(
+        crate::tool_runtime::openai_compiler::compile_tool_decision_with_usage_and_payloads(
             http_client,
             config,
             req,
             decision_text,
             payload_extraction.payloads,
         )
-        .await
-        {
-            Ok(compiled) => compiled,
-            Err(e) => {
-                tracing::warn!(error = %e, "工具协议编译失败，降级为主脑文本");
-                return Ok(BrokerDecision::FinalAnswer { usage: None });
-            }
-        };
+        .await?;
 
     match compiled.decision {
         crate::tool_runtime::openai_compiler::CompilerDecision::ToolCalls(calls) => {
+            for call in &calls {
+                crate::tool_runtime::validation::validate_tool_call(
+                    &tool_specs,
+                    &call.name,
+                    &call.input,
+                )
+                .map_err(AppError::ToolProtocol)?;
+            }
             Ok(BrokerDecision::ToolCalls(
                 calls
                     .into_iter()
@@ -331,6 +335,11 @@ pub async fn decide_with_broker(
                         input: call.input,
                     })
                     .collect(),
+            ))
+        }
+        crate::tool_runtime::openai_compiler::CompilerDecision::FinalAnswer if explicit_intent => {
+            Err(AppError::ToolProtocol(
+                "编译器未能转换明确的工具意图".to_string(),
             ))
         }
         crate::tool_runtime::openai_compiler::CompilerDecision::FinalAnswer => {
@@ -400,7 +409,7 @@ mod tests {
     }
 
     #[test]
-    fn test_parse_marked_tool_call_skips_unknown_tool() {
+    fn test_parse_marked_tool_call_rejects_unknown_tool() {
         let tools = vec![bash_spec()];
         let output = concat!(
             "<|tool▁calls▁begin|>",
@@ -408,9 +417,19 @@ mod tests {
             "<|tool▁calls▁end|>"
         );
 
-        let calls = parse_marked_tool_calls(output, &tools).unwrap();
+        let error = parse_marked_tool_calls(output, &tools).unwrap_err();
 
-        assert!(calls.is_empty());
+        assert!(error.contains("Nope"));
+    }
+
+    #[test]
+    fn test_parse_marked_tool_call_rejects_schema_violation() {
+        let tools = vec![bash_spec()];
+        let output = r#"<tool_call>Bash▁command▁params▁{"description":"missing command"}"#;
+
+        let error = parse_marked_tool_calls(output, &tools).unwrap_err();
+
+        assert!(error.contains("command"));
     }
 
     #[test]

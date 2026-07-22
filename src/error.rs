@@ -10,6 +10,12 @@ pub enum AppError {
     #[error("上游请求失败: {0}")]
     Upstream(String),
 
+    #[error("工具协议编译失败: {0}")]
+    ToolProtocol(String),
+
+    #[error("工具运行时递归调用: {0}")]
+    ToolRecursion(String),
+
     #[error("SSE流异常: {0}")]
     SseStream(String),
 
@@ -34,6 +40,8 @@ impl IntoResponse for AppError {
         let (status, error_type) = match &self {
             AppError::Config(_) => (StatusCode::INTERNAL_SERVER_ERROR, "config_error"),
             AppError::Upstream(_) => (StatusCode::BAD_GATEWAY, "upstream_error"),
+            AppError::ToolProtocol(_) => (StatusCode::BAD_GATEWAY, "tool_protocol_compile_failed"),
+            AppError::ToolRecursion(_) => (StatusCode::BAD_GATEWAY, "tool_runtime_recursion"),
             AppError::SseStream(_) => (StatusCode::BAD_GATEWAY, "stream_error"),
             AppError::ModelNotFound(_) => (StatusCode::NOT_FOUND, "model_not_found"),
             AppError::PayloadTooLarge(_) => (StatusCode::PAYLOAD_TOO_LARGE, "payload_too_large"),
