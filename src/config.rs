@@ -271,6 +271,9 @@ pub fn write_admin_config(
 }
 
 pub fn write_limits_config(path: &Path, config: &LimitsConfig) -> Result<(), AppError> {
+    let max_concurrent_requests = i64::try_from(config.max_concurrent_requests)
+        .map_err(|_| AppError::Config("max_concurrent_requests 超出可持久化范围".to_string()))?;
+
     let content = std::fs::read_to_string(path)
         .map_err(|e| AppError::Config(format!("读取配置失败: {}", e)))?;
 
@@ -281,8 +284,11 @@ pub fn write_limits_config(path: &Path, config: &LimitsConfig) -> Result<(), App
     if !doc.contains_key("limits") {
         doc["limits"] = toml_edit::Item::Table(toml_edit::Table::new());
     }
-    doc["limits"]["max_concurrent_requests"] =
-        toml_edit::value(config.max_concurrent_requests as i64);
+    let limits = doc
+        .get_mut("limits")
+        .and_then(toml_edit::Item::as_table_mut)
+        .ok_or_else(|| AppError::Config("配置 [limits] 必须是普通 table".to_string()))?;
+    limits["max_concurrent_requests"] = toml_edit::value(max_concurrent_requests);
 
     std::fs::write(path, doc.to_string())
         .map_err(|e| AppError::Config(format!("写入配置失败: {}", e)))?;
@@ -573,6 +579,81 @@ custom_limit = "keep-me"
             doc["limits"]["max_concurrent_requests"].as_integer(),
             Some(42)
         );
+    }
+
+    #[test]
+    fn test_write_limits_config_rejects_oversized_concurrency_without_rewriting_file() {
+        struct TempFileGuard(std::path::PathBuf);
+
+        impl Drop for TempFileGuard {
+            fn drop(&mut self) {
+                let _ = std::fs::remove_file(&self.0);
+            }
+        }
+
+        let temp_file = TempFileGuard(std::env::temp_dir().join(format!(
+            "ouyi-limits-oversized-test-{}.toml",
+            uuid::Uuid::new_v4()
+        )));
+        let original = r#"[limits]
+request_timeout_secs = 30
+no_data_timeout_secs = 20
+max_response_bytes = 1048576
+max_messages_bytes = 524288
+max_concurrent_requests = 7
+"#;
+        std::fs::write(&temp_file.0, original).unwrap();
+
+        let result = write_limits_config(
+            &temp_file.0,
+            &LimitsConfig {
+                request_timeout_secs: 30,
+                no_data_timeout_secs: 20,
+                max_response_bytes: 1048576,
+                max_messages_bytes: 524288,
+                max_concurrent_requests: usize::MAX,
+            },
+        );
+
+        assert!(result.is_err());
+        assert_eq!(std::fs::read_to_string(&temp_file.0).unwrap(), original);
+    }
+
+    #[test]
+    fn test_write_limits_config_rejects_non_table_limits_without_rewriting_file() {
+        struct TempFileGuard(std::path::PathBuf);
+
+        impl Drop for TempFileGuard {
+            fn drop(&mut self) {
+                let _ = std::fs::remove_file(&self.0);
+            }
+        }
+
+        let temp_file = TempFileGuard(std::env::temp_dir().join(format!(
+            "ouyi-limits-non-table-test-{}.toml",
+            uuid::Uuid::new_v4()
+        )));
+        let original = r#"limits = []
+
+[server]
+host = "127.0.0.1"
+port = 3000
+"#;
+        std::fs::write(&temp_file.0, original).unwrap();
+
+        let result = write_limits_config(
+            &temp_file.0,
+            &LimitsConfig {
+                request_timeout_secs: 30,
+                no_data_timeout_secs: 20,
+                max_response_bytes: 1048576,
+                max_messages_bytes: 524288,
+                max_concurrent_requests: 8,
+            },
+        );
+
+        assert!(result.is_err());
+        assert_eq!(std::fs::read_to_string(&temp_file.0).unwrap(), original);
     }
 
     #[test]
