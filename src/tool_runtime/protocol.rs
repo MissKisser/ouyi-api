@@ -31,8 +31,7 @@ pub struct ToolRuntimeRequestContext {
     pub endpoint: ToolEndpointKind,
     #[allow(dead_code)]
     pub model: String,
-    pub latest_user_text: Option<String>,
-    pub latest_tool_result: Option<String>,
+    pub transcript: Vec<crate::tool_runtime::context::TranscriptItem>,
     pub tools: Vec<ToolSpec>,
     pub tool_choice: Option<ToolChoiceSpec>,
     pub payloads: Vec<crate::tool_runtime::payload::ToolPayload>,
@@ -71,20 +70,9 @@ pub fn anthropic_tools_to_specs(tools: &[AnthropicTool]) -> Vec<ToolSpec> {
 pub fn openai_request_to_context(
     req: &crate::model::openai::ChatCompletionRequest,
     tools: Vec<ToolSpec>,
-) -> ToolRuntimeRequestContext {
-    let latest_user_text = req
-        .messages
-        .iter()
-        .rev()
-        .find(|msg| msg.role == "user")
-        .and_then(|msg| msg.content.clone());
-
-    let latest_tool_result = req
-        .messages
-        .iter()
-        .rev()
-        .find(|msg| msg.role == "tool")
-        .and_then(|msg| msg.content.clone());
+) -> Result<ToolRuntimeRequestContext, crate::error::AppError> {
+    let transcript = crate::tool_runtime::context::from_openai_chat(req)
+        .map_err(crate::error::AppError::BadRequest)?;
 
     let tool_choice = req.tool_choice.as_ref().and_then(|tc| {
         if let Some(str_val) = tc.as_str() {
@@ -108,15 +96,14 @@ pub fn openai_request_to_context(
         }
     });
 
-    ToolRuntimeRequestContext {
+    Ok(ToolRuntimeRequestContext {
         endpoint: ToolEndpointKind::OpenAi,
         model: req.model.clone(),
-        latest_user_text,
-        latest_tool_result,
+        transcript,
         tools,
         tool_choice,
         payloads: Vec::new(),
-    }
+    })
 }
 
 #[cfg(test)]
@@ -235,11 +222,14 @@ mod tests {
             parallel_tool_calls: None,
         };
 
-        let ctx = openai_request_to_context(&req, Vec::new());
+        let ctx = openai_request_to_context(&req, Vec::new()).unwrap();
         assert_eq!(ctx.endpoint, ToolEndpointKind::OpenAi);
         assert_eq!(ctx.model, "gpt-test");
-        assert_eq!(ctx.latest_user_text.as_deref(), Some("hello"));
-        assert!(ctx.latest_tool_result.is_none());
+        assert!(matches!(
+            &ctx.transcript[0],
+            crate::tool_runtime::context::TranscriptItem::UserText { content }
+                if content == "hello"
+        ));
     }
 
     #[test]
@@ -270,10 +260,14 @@ mod tests {
             parallel_tool_calls: None,
         };
 
-        let ctx = openai_request_to_context(&req, Vec::new());
+        let ctx = openai_request_to_context(&req, Vec::new()).unwrap();
         assert_eq!(ctx.endpoint, ToolEndpointKind::OpenAi);
         assert_eq!(ctx.model, "gpt-test");
-        assert_eq!(ctx.latest_tool_result.as_deref(), Some("PENDING"));
+        assert!(matches!(
+            &ctx.transcript[1],
+            crate::tool_runtime::context::TranscriptItem::ToolResult { output, .. }
+                if output == "PENDING"
+        ));
     }
 
     #[test]
@@ -295,7 +289,7 @@ mod tests {
             parallel_tool_calls: None,
         };
 
-        let ctx = openai_request_to_context(&req, Vec::new());
+        let ctx = openai_request_to_context(&req, Vec::new()).unwrap();
         assert_eq!(ctx.tool_choice, Some(ToolChoiceSpec::Auto));
     }
 
@@ -318,7 +312,7 @@ mod tests {
             parallel_tool_calls: None,
         };
 
-        let ctx = openai_request_to_context(&req, Vec::new());
+        let ctx = openai_request_to_context(&req, Vec::new()).unwrap();
         assert_eq!(ctx.tool_choice, Some(ToolChoiceSpec::Required));
     }
 
@@ -344,7 +338,7 @@ mod tests {
             parallel_tool_calls: None,
         };
 
-        let ctx = openai_request_to_context(&req, Vec::new());
+        let ctx = openai_request_to_context(&req, Vec::new()).unwrap();
         assert_eq!(
             ctx.tool_choice,
             Some(ToolChoiceSpec::Tool("Read".to_string()))
@@ -356,8 +350,9 @@ mod tests {
         let mut ctx = ToolRuntimeRequestContext {
             endpoint: ToolEndpointKind::OpenAi,
             model: "claude-test".to_string(),
-            latest_user_text: Some("write report".to_string()),
-            latest_tool_result: None,
+            transcript: vec![crate::tool_runtime::context::TranscriptItem::UserText {
+                content: "write report".to_string(),
+            }],
             tool_choice: None,
             tools: vec![],
             payloads: vec![crate::tool_runtime::payload::ToolPayload {

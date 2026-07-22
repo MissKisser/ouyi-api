@@ -6,6 +6,7 @@ use crate::error::AppError;
 use crate::model::anthropic::{AnthropicContent, ContentBlock, MessagesRequest};
 
 pub mod broker;
+pub mod context;
 pub mod decision;
 pub mod dialect;
 pub mod materialize;
@@ -391,6 +392,7 @@ mod tests {
                     content: AnthropicContent::Blocks(vec![ContentBlock::ToolResult {
                         tool_use_id: "call_0".to_string(),
                         content: "contents".to_string(),
+                        is_error: false,
                     }]),
                 },
             ],
@@ -430,6 +432,7 @@ mod tests {
                     content: AnthropicContent::Blocks(vec![ContentBlock::ToolResult {
                         tool_use_id: "call_7".to_string(),
                         content: "contents".to_string(),
+                        is_error: false,
                     }]),
                 },
             ],

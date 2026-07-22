@@ -219,6 +219,7 @@ pub fn convert_anthropic_request(
                         ContentBlock::ToolResult {
                             tool_use_id,
                             content,
+                            ..
                         } => {
                             let tool_name = tool_id_to_name
                                 .get(tool_use_id)
@@ -352,6 +353,7 @@ mod tests {
         let req = make_req(AnthropicContent::Blocks(vec![ContentBlock::ToolResult {
             tool_use_id: "tool_1".to_string(),
             content: "方".repeat(1000),
+            is_error: false,
         }]));
 
         let result = convert_anthropic_request(&req, "test", false).unwrap();
@@ -365,6 +367,7 @@ mod tests {
         let req = make_req(AnthropicContent::Blocks(vec![ContentBlock::ToolResult {
             tool_use_id: "tool_1".to_string(),
             content: "x".repeat(TOOL_RESULT_CONTENT_MAX_BYTES + 1),
+            is_error: false,
         }]));
 
         let result = convert_anthropic_request(&req, "test", false).unwrap();

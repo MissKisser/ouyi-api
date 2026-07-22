@@ -111,6 +111,7 @@ pub fn convert_request(
 
     let mut system_parts: Vec<String> = Vec::new();
     let mut text_parts: Vec<String> = Vec::new();
+    let tool_names = crate::tool_runtime::context::openai_tool_name_index(openai_req);
 
     for msg in messages {
         let content = match &msg.content {
@@ -156,7 +157,21 @@ pub fn convert_request(
                 }
             }
             "tool" => {
-                let tool_name = msg.name.as_deref().unwrap_or("unknown");
+                let tool_name = msg
+                    .name
+                    .as_deref()
+                    .or_else(|| {
+                        msg.tool_call_id
+                            .as_ref()
+                            .and_then(|id| tool_names.get(id))
+                            .map(String::as_str)
+                    })
+                    .ok_or_else(|| {
+                        format!(
+                            "工具结果 {} 找不到对应工具名",
+                            msg.tool_call_id.as_deref().unwrap_or("<missing>")
+                        )
+                    })?;
                 text_parts.push(format!(
                     "<tool_result name=\"{}\">{}</tool_result>",
                     tool_name, content
@@ -202,6 +217,26 @@ pub fn convert_request(
 mod tests {
     use super::*;
     use crate::model::openai::{ChatMessage, ToolDef, ToolFunction};
+
+    #[test]
+    fn test_tool_result_resolves_name_from_prior_call_id() {
+        let req: ChatCompletionRequest = serde_json::from_value(serde_json::json!({
+            "model":"test",
+            "messages":[
+                {"role":"assistant","tool_calls":[{
+                    "id":"call_1","type":"function",
+                    "function":{"name":"Read","arguments":"{\"file_path\":\"a.rs\"}"}
+                }]},
+                {"role":"tool","tool_call_id":"call_1","content":"contents"}
+            ]
+        }))
+        .unwrap();
+
+        let converted = convert_request(&req, "test", false).unwrap();
+
+        assert!(converted.text.contains("<tool_result name=\"Read\">"));
+        assert!(!converted.text.contains("name=\"unknown\""));
+    }
 
     fn make_simple_request(role: &str, content: &str) -> ChatCompletionRequest {
         ChatCompletionRequest {

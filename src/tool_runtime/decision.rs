@@ -136,7 +136,7 @@ pub async fn decide_openai_tools_from_text(
         });
     };
 
-    let mut context = openai_request_to_context(req, tool_specs);
+    let mut context = openai_request_to_context(req, tool_specs)?;
     context.payloads = payload_extraction.payloads;
     let compiled = crate::tool_runtime::openai_compiler::compile_tool_decision_for_context(
         http_client,

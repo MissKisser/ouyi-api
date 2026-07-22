@@ -251,53 +251,13 @@ pub async fn compile_tool_decision_with_usage_and_payloads(
         .map(|tools| crate::tool_runtime::protocol::anthropic_tools_to_specs(tools.as_slice()))
         .unwrap_or_default();
 
-    let latest_user_text = req
-        .messages
-        .iter()
-        .rev()
-        .find(|m| m.role == "user")
-        .and_then(|m| match &m.content {
-            crate::model::anthropic::AnthropicContent::Text(t) => Some(t.clone()),
-            crate::model::anthropic::AnthropicContent::Blocks(blocks) => {
-                blocks.iter().rev().find_map(|b| {
-                    if let crate::model::anthropic::ContentBlock::Text { text } = b {
-                        Some(text.clone())
-                    } else {
-                        None
-                    }
-                })
-            }
-        });
-
-    let latest_tool_result = crate::tool_runtime::latest_tool_result_id(req).and_then(|id| {
-        req.messages.iter().rev().find_map(|m| {
-            if let crate::model::anthropic::AnthropicContent::Blocks(blocks) = &m.content {
-                blocks.iter().rev().find_map(|b| {
-                    if let crate::model::anthropic::ContentBlock::ToolResult {
-                        tool_use_id,
-                        content,
-                    } = b
-                    {
-                        if tool_use_id == &id {
-                            Some(content.clone())
-                        } else {
-                            None
-                        }
-                    } else {
-                        None
-                    }
-                })
-            } else {
-                None
-            }
-        })
-    });
+    let transcript =
+        crate::tool_runtime::context::from_anthropic_messages(req).map_err(AppError::BadRequest)?;
 
     let context = ToolRuntimeRequestContext {
         endpoint: ToolEndpointKind::Anthropic,
         model: req.model.clone(),
-        latest_user_text,
-        latest_tool_result,
+        transcript,
         tools: tool_specs,
         tool_choice: None,
         payloads,
@@ -626,15 +586,10 @@ fn build_compiler_user_message_from_context(
 
     content.push_str("以下是当前对话上下文：\n\n");
 
-    if let Some(user_text) = &context.latest_user_text {
-        content.push_str("用户最新消息：\n");
-        content.push_str(user_text);
-        content.push('\n');
-    }
-
-    if let Some(tool_result) = &context.latest_tool_result {
-        content.push_str("\n最近的工具返回结果：\n");
-        content.push_str(tool_result);
+    if !context.transcript.is_empty() {
+        content.push_str(&crate::tool_runtime::context::render_for_compiler(
+            &context.transcript,
+        ));
         content.push('\n');
     }
 
@@ -884,8 +839,9 @@ mod tests {
         let context = crate::tool_runtime::protocol::ToolRuntimeRequestContext {
             endpoint: crate::tool_runtime::protocol::ToolEndpointKind::Anthropic,
             model: "claude-test".to_string(),
-            latest_user_text: Some("写报告".to_string()),
-            latest_tool_result: None,
+            transcript: vec![crate::tool_runtime::context::TranscriptItem::UserText {
+                content: "写报告".to_string(),
+            }],
             tool_choice: None,
             tools: vec![],
             payloads: vec![crate::tool_runtime::payload::ToolPayload {

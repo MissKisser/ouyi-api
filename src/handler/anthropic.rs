@@ -235,6 +235,7 @@ fn format_tool_results_for_reuse(req: &MessagesRequest) -> String {
                 if let ContentBlock::ToolResult {
                     tool_use_id,
                     content,
+                    ..
                 } = block
                 {
                     let tool_name = tool_id_to_name
@@ -305,6 +306,7 @@ fn latest_tool_result_content(req: &MessagesRequest) -> Option<(String, String)>
                 if let ContentBlock::ToolResult {
                     tool_use_id,
                     content,
+                    ..
                 } = block
                 {
                     Some((tool_use_id.clone(), content.clone()))
@@ -2263,6 +2265,7 @@ mod tests {
             content: AnthropicContent::Blocks(vec![ContentBlock::ToolResult {
                 tool_use_id: tool_use_id.to_string(),
                 content: content.to_string(),
+                is_error: false,
             }]),
         }
     }
@@ -2308,10 +2311,12 @@ mod tests {
                 ContentBlock::ToolResult {
                     tool_use_id: "call_0".to_string(),
                     content: "result A".to_string(),
+                    is_error: false,
                 },
                 ContentBlock::ToolResult {
                     tool_use_id: "call_1".to_string(),
                     content: "result B".to_string(),
+                    is_error: false,
                 },
             ]),
         };
@@ -2400,10 +2405,12 @@ mod tests {
                 ContentBlock::ToolResult {
                     tool_use_id: "call_0".to_string(),
                     content: "first".to_string(),
+                    is_error: false,
                 },
                 ContentBlock::ToolResult {
                     tool_use_id: "call_1".to_string(),
                     content: "last".to_string(),
+                    is_error: false,
                 },
             ]),
         };

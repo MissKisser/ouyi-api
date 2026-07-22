@@ -28,6 +28,7 @@ pub fn from_openai_chat(
 
     let mut system_parts: Vec<String> = Vec::new();
     let mut conversation: Vec<Ouyi7HistoryMessage> = Vec::new();
+    let tool_names = crate::tool_runtime::context::openai_tool_name_index(req);
 
     for msg in &req.messages {
         let msg_content = get_openai_message_content(msg);
@@ -62,7 +63,21 @@ pub fn from_openai_chat(
                 }
             }
             "tool" => {
-                let tool_name = msg.name.as_deref().unwrap_or("unknown");
+                let tool_name = msg
+                    .name
+                    .as_deref()
+                    .or_else(|| {
+                        msg.tool_call_id
+                            .as_ref()
+                            .and_then(|id| tool_names.get(id))
+                            .map(String::as_str)
+                    })
+                    .ok_or_else(|| {
+                        AppError::BadRequest(format!(
+                            "工具结果 {} 找不到对应工具名",
+                            msg.tool_call_id.as_deref().unwrap_or("<missing>")
+                        ))
+                    })?;
                 let tool_result_text = format!(
                     "<tool_result name=\"{}\">{}</tool_result>",
                     tool_name, msg_content
@@ -288,6 +303,7 @@ fn extract_anthropic_content_text(content: &AnthropicContent) -> String {
                     ContentBlock::ToolResult {
                         tool_use_id,
                         content,
+                        ..
                     } => Some(format!(
                         "<tool_result name=\"{}\">{}</tool_result>",
                         tool_use_id, content
@@ -327,6 +343,26 @@ mod tests {
     use super::*;
     use crate::model::anthropic::{AnthropicMessage, SystemContent};
     use crate::model::openai::{ChatCompletionRequest, ChatMessage};
+
+    #[test]
+    fn test_openai_tool_result_resolves_name_from_prior_call_id() {
+        let req: ChatCompletionRequest = serde_json::from_value(serde_json::json!({
+            "model":"test",
+            "messages":[
+                {"role":"assistant","tool_calls":[{
+                    "id":"call_1","type":"function",
+                    "function":{"name":"Read","arguments":"{\"file_path\":\"a.rs\"}"}
+                }]},
+                {"role":"tool","tool_call_id":"call_1","content":"contents"}
+            ]
+        }))
+        .unwrap();
+
+        let converted = from_openai_chat(&req, "test".to_string(), 20).unwrap();
+
+        assert!(converted.content.contains("<tool_result name=\"Read\">"));
+        assert!(!converted.content.contains("name=\"unknown\""));
+    }
 
     fn make_openai_request(messages: Vec<ChatMessage>) -> ChatCompletionRequest {
         ChatCompletionRequest {

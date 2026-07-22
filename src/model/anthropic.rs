@@ -95,6 +95,7 @@ pub enum ContentBlock {
     ToolResult {
         tool_use_id: String,
         content: String,
+        is_error: bool,
     },
 }
 
@@ -129,10 +130,12 @@ impl Serialize for ContentBlock {
             ContentBlock::ToolResult {
                 tool_use_id,
                 content,
+                is_error,
             } => serde_json::json!({
                 "type": "tool_result",
                 "tool_use_id": tool_use_id,
-                "content": content
+                "content": content,
+                "is_error": is_error
             })
             .serialize(serializer),
         }
@@ -221,9 +224,14 @@ impl<'de> Deserialize<'de> for ContentBlock {
                     .unwrap_or("")
                     .to_string();
                 let content_str = extract_tool_result_text(value.get("content"));
+                let is_error = value
+                    .get("is_error")
+                    .and_then(|value| value.as_bool())
+                    .unwrap_or(false);
                 Ok(ContentBlock::ToolResult {
                     tool_use_id,
                     content: content_str,
+                    is_error,
                 })
             }
             _ => Err(de::Error::custom(format!(
