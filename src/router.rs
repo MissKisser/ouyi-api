@@ -421,6 +421,10 @@ mod tests {
             assert_eq!(response.headers().get(header::RETRY_AFTER).unwrap(), "1");
 
             let body: Value = response.json().await.unwrap();
+            assert_eq!(
+                body["error"]["message"], "Global concurrency limit reached",
+                "{path}"
+            );
             if path.starts_with("/anthropic") {
                 assert_eq!(body["type"], "error", "{path}");
                 assert_eq!(body["error"]["type"], "rate_limit_error", "{path}");

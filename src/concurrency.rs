@@ -63,13 +63,13 @@ pub async fn limit_inference_requests(
                 "type": "error",
                 "error": {
                     "type": "rate_limit_error",
-                    "message": "Too many concurrent inference requests"
+                    "message": "Global concurrency limit reached"
                 }
             })
         } else {
             json!({
                 "error": {
-                    "message": "Too many concurrent inference requests",
+                    "message": "Global concurrency limit reached",
                     "type": "rate_limit_error",
                     "code": "concurrency_limit_exceeded"
                 }
@@ -281,7 +281,7 @@ mod tests {
             second_body,
             json!({
                 "error": {
-                    "message": "Too many concurrent inference requests",
+                    "message": "Global concurrency limit reached",
                     "type": "rate_limit_error",
                     "code": "concurrency_limit_exceeded"
                 }
@@ -332,7 +332,7 @@ mod tests {
                 "type": "error",
                 "error": {
                     "type": "rate_limit_error",
-                    "message": "Too many concurrent inference requests"
+                    "message": "Global concurrency limit reached"
                 }
             })
         );
