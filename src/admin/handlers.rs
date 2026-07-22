@@ -18,6 +18,7 @@ use crate::config::{
     write_admin_config, write_limits_config, write_openai_tool_runtime_config, write_ouyi_config,
     write_ouyi_v7_config, write_platform_config, write_server_config, write_tool_runtime_config,
 };
+use crate::error::AppError;
 use crate::handler::models::list_models as list_openai_models;
 use crate::model::mapper::ModelCategory;
 use bcrypt::{DEFAULT_COST, hash};
@@ -965,11 +966,12 @@ fn build_account_entry_from_raw(
 }
 
 const MAX_CONCURRENT_REQUESTS: usize = 1000;
+pub(super) static CONFIG_UPDATE_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 
 #[derive(Debug)]
 pub(super) enum LimitsConfigUpdateError {
     Invalid(String),
-    Persistence(crate::error::AppError),
+    Persistence(AppError),
 }
 
 pub(super) async fn apply_limits_config_update(
@@ -983,11 +985,22 @@ pub(super) async fn apply_limits_config_update(
         )));
     }
 
-    let mut config = state.config.write().await;
-    let mut limits = config.limits.clone();
-    limits.max_concurrent_requests = max_concurrent_requests;
-    write_limits_config(config_path, &limits).map_err(LimitsConfigUpdateError::Persistence)?;
-    config.limits.max_concurrent_requests = max_concurrent_requests;
+    let limits = {
+        let config = state.config.read().await;
+        let mut limits = config.limits.clone();
+        limits.max_concurrent_requests = max_concurrent_requests;
+        limits
+    };
+    let config_path = config_path.to_path_buf();
+    tokio::task::spawn_blocking(move || write_limits_config(&config_path, &limits))
+        .await
+        .map_err(|error| {
+            LimitsConfigUpdateError::Persistence(AppError::Internal(format!(
+                "Limits config write task failed: {error}"
+            )))
+        })?
+        .map_err(LimitsConfigUpdateError::Persistence)?;
+    state.config.write().await.limits.max_concurrent_requests = max_concurrent_requests;
     state.concurrency_limiter.set_limit(max_concurrent_requests);
     Ok(())
 }
@@ -1008,6 +1021,7 @@ pub async fn admin_put_config(
                 .into_response();
         }
     };
+    let _config_update_guard = CONFIG_UPDATE_LOCK.lock().await;
 
     if let Some(limits) = update.limits
         && let Some(max_concurrent_requests) = limits.max_concurrent_requests

@@ -398,4 +398,24 @@ mod tests {
             assert_eq!(state.concurrency_limiter.limit(), 9, "{label}");
         }
     }
+
+    #[tokio::test]
+    async fn config_update_lock_serializes_admin_put_mutations() {
+        let first_guard = handlers::CONFIG_UPDATE_LOCK.lock().await;
+        let mut second_task = tokio::spawn(async {
+            let _second_guard = handlers::CONFIG_UPDATE_LOCK.lock().await;
+        });
+
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(50), &mut second_task)
+                .await
+                .is_err()
+        );
+
+        drop(first_guard);
+        tokio::time::timeout(std::time::Duration::from_secs(1), second_task)
+            .await
+            .unwrap()
+            .unwrap();
+    }
 }
