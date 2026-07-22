@@ -17,7 +17,7 @@ use crate::adapter::request::convert_request;
 use crate::adapter::response::{SseCollector, StreamConverter};
 use crate::client::http::OuyiHttpClient;
 use crate::client::session::{GuardedStream, spawn_session_cleanup};
-use crate::client::sse::{SseLineBuffer, ouyi_application_error, parse_sse_line};
+use crate::client::sse::{SseLineBuffer, Utf8ChunkDecoder, ouyi_application_error, parse_sse_line};
 use crate::error::AppError;
 use crate::model::openai::ChatCompletionRequest;
 use crate::platform::OuyiPlatform;
@@ -361,7 +361,7 @@ async fn handle_stream_response(
         let mut converter = StreamConverter::new(model_for_task, task_id_for_task);
         let mut sse_buffer = SseLineBuffer::new();
 
-        let mut partial = Vec::new();
+        let mut utf8_decoder = Utf8ChunkDecoder::new();
         let mut stream_error: Option<String> = None;
         let mut application_error: Option<String> = None;
         let mut downstream_closed = false;
@@ -378,44 +378,45 @@ async fn handle_stream_response(
                 }
             };
 
-            let mut bytes = chunk.to_vec();
-            if !partial.is_empty() {
-                let mut combined = std::mem::take(&mut partial);
-                combined.extend_from_slice(&bytes);
-                bytes = combined;
+            let mut decoded = Vec::new();
+            if let Err(error) = utf8_decoder.push_chunk(&chunk, |text| {
+                decoded.push(text.to_string());
+            }) {
+                stream_error = Some(format!("SSE UTF-8 解码错误: {error}"));
+                break 'read_loop;
             }
-            let text = match String::from_utf8(bytes) {
-                Ok(t) => t,
-                Err(e) => {
-                    partial = e.into_bytes();
-                    continue;
-                }
-            };
 
-            let lines = sse_buffer.push_chunk(&text);
-
-            for line in lines {
-                let Some(event) = parse_sse_line(&line) else {
-                    continue;
-                };
-                if let Some(msg) = ouyi_application_error(&event) {
-                    application_error = Some(msg);
-                    break 'read_loop;
-                }
-                if let Some(chunks) = converter.convert_event(&event) {
-                    for chunk in chunks {
-                        let json = match serde_json::to_string(&chunk) {
-                            Ok(j) => j,
-                            Err(_) => continue,
-                        };
-                        let sse_event = Event::default().data(json);
-                        if tx.send(Ok(sse_event)).await.is_err() {
-                            downstream_closed = true;
-                            break 'read_loop;
+            for text in decoded {
+                let lines = sse_buffer.push_chunk(&text);
+                for line in lines {
+                    let Some(event) = parse_sse_line(&line) else {
+                        continue;
+                    };
+                    if let Some(msg) = ouyi_application_error(&event) {
+                        application_error = Some(msg);
+                        break 'read_loop;
+                    }
+                    if let Some(chunks) = converter.convert_event(&event) {
+                        for chunk in chunks {
+                            let json = match serde_json::to_string(&chunk) {
+                                Ok(j) => j,
+                                Err(_) => continue,
+                            };
+                            let sse_event = Event::default().data(json);
+                            if tx.send(Ok(sse_event)).await.is_err() {
+                                downstream_closed = true;
+                                break 'read_loop;
+                            }
                         }
                     }
                 }
             }
+        }
+
+        if stream_error.is_none()
+            && let Err(error) = utf8_decoder.finish()
+        {
+            stream_error = Some(format!("SSE UTF-8 解码错误: {error}"));
         }
 
         if downstream_closed {
@@ -423,7 +424,9 @@ async fn handle_stream_response(
             return;
         }
 
-        if let Some(msg) = application_error {
+        if stream_error.is_none()
+            && let Some(msg) = application_error
+        {
             let platform_key = state.platform.read().await.config_key();
             state.stats.record_error(
                 start_time.elapsed().as_millis() as u64,
@@ -550,7 +553,7 @@ async fn handle_non_stream_response(
 
     let mut total_bytes: usize = 0;
     let max_bytes = state.config.read().await.limits.max_response_bytes;
-    let mut partial = Vec::new();
+    let mut utf8_decoder = Utf8ChunkDecoder::new();
     let mut stream_error: Option<String> = None;
 
     let mut application_error: Option<String> = None;
@@ -574,31 +577,32 @@ async fn handle_non_stream_response(
             break;
         }
 
-        let mut bytes = chunk.to_vec();
-        if !partial.is_empty() {
-            let mut combined = std::mem::take(&mut partial);
-            combined.extend_from_slice(&bytes);
-            bytes = combined;
+        let mut decoded = Vec::new();
+        if let Err(error) = utf8_decoder.push_chunk(&chunk, |text| {
+            decoded.push(text.to_string());
+        }) {
+            stream_error = Some(format!("SSE UTF-8 解码错误: {error}"));
+            break 'read_loop;
         }
-        let text = match String::from_utf8(bytes) {
-            Ok(t) => t,
-            Err(e) => {
-                partial = e.into_bytes();
-                continue;
-            }
-        };
 
-        let lines = sse_buffer.push_chunk(&text);
-
-        for line in lines {
-            if let Some(event) = parse_sse_line(&line) {
-                if let Some(msg) = ouyi_application_error(&event) {
-                    application_error = Some(msg);
-                    break 'read_loop;
+        for text in decoded {
+            let lines = sse_buffer.push_chunk(&text);
+            for line in lines {
+                if let Some(event) = parse_sse_line(&line) {
+                    if let Some(msg) = ouyi_application_error(&event) {
+                        application_error = Some(msg);
+                        break 'read_loop;
+                    }
+                    collector.push_event(&event);
                 }
-                collector.push_event(&event);
             }
         }
+    }
+
+    if stream_error.is_none()
+        && let Err(error) = utf8_decoder.finish()
+    {
+        stream_error = Some(format!("SSE UTF-8 解码错误: {error}"));
     }
 
     if application_error.is_none()
@@ -612,7 +616,9 @@ async fn handle_non_stream_response(
         }
     }
 
-    if let Some(msg) = application_error {
+    if stream_error.is_none()
+        && let Some(msg) = application_error
+    {
         guarded.as_mut().skip_cleanup();
         spawn_session_cleanup(client, session_id);
         state.active_sessions.remove(&session_id);
@@ -828,7 +834,7 @@ async fn handle_openai_tools_response(
 
     let max_bytes = state.config.read().await.limits.max_response_bytes;
     let mut total_bytes: usize = 0;
-    let mut partial = Vec::new();
+    let mut utf8_decoder = Utf8ChunkDecoder::new();
     let mut stream_error: Option<String> = None;
     let mut application_error: Option<String> = None;
 
@@ -851,30 +857,32 @@ async fn handle_openai_tools_response(
             break;
         }
 
-        let mut bytes = chunk.to_vec();
-        if !partial.is_empty() {
-            let mut combined = std::mem::take(&mut partial);
-            combined.extend_from_slice(&bytes);
-            bytes = combined;
+        let mut decoded = Vec::new();
+        if let Err(error) = utf8_decoder.push_chunk(&chunk, |text| {
+            decoded.push(text.to_string());
+        }) {
+            stream_error = Some(format!("SSE UTF-8 解码错误: {error}"));
+            break 'read_loop;
         }
-        let text = match String::from_utf8(bytes) {
-            Ok(t) => t,
-            Err(e) => {
-                partial = e.into_bytes();
-                continue;
-            }
-        };
 
-        let lines = sse_buffer.push_chunk(&text);
-        for line in lines {
-            if let Some(event) = parse_sse_line(&line) {
-                if let Some(msg) = ouyi_application_error(&event) {
-                    application_error = Some(msg);
-                    break 'read_loop;
+        for text in decoded {
+            let lines = sse_buffer.push_chunk(&text);
+            for line in lines {
+                if let Some(event) = parse_sse_line(&line) {
+                    if let Some(msg) = ouyi_application_error(&event) {
+                        application_error = Some(msg);
+                        break 'read_loop;
+                    }
+                    collector.push_event(&event);
                 }
-                collector.push_event(&event);
             }
         }
+    }
+
+    if stream_error.is_none()
+        && let Err(error) = utf8_decoder.finish()
+    {
+        stream_error = Some(format!("SSE UTF-8 解码错误: {error}"));
     }
 
     if application_error.is_none()
@@ -888,7 +896,9 @@ async fn handle_openai_tools_response(
         }
     }
 
-    if let Some(msg) = application_error {
+    if stream_error.is_none()
+        && let Some(msg) = application_error
+    {
         guarded.as_mut().skip_cleanup();
         spawn_session_cleanup(client, session_id);
         state.active_sessions.remove(&session_id);
@@ -1341,6 +1351,21 @@ mod tests {
         let state = setup_application_error_state(tool_requests.clone()).await;
 
         let err = chat_completions(State(state), Json(openai_request(false)))
+            .await
+            .unwrap_err();
+
+        assert!(
+            matches!(err, AppError::Upstream(message) if message.contains("您的套餐余量不足，请购买后重试"))
+        );
+        assert_eq!(tool_requests.load(Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
+    async fn test_openai_tools_stream_rejects_ouyi_application_error_before_sse() {
+        let tool_requests = Arc::new(AtomicUsize::new(0));
+        let state = setup_application_error_state(tool_requests.clone()).await;
+
+        let err = chat_completions(State(state), Json(openai_request(true)))
             .await
             .unwrap_err();
 

@@ -14,7 +14,7 @@ use crate::adapter::anthropic_response::{AnthropicCollector, AnthropicStreamConv
 use crate::admin::stats::{ToolRuntimeDecision, ToolRuntimeMode as StatsToolRuntimeMode};
 use crate::client::http::OuyiHttpClient;
 use crate::client::session::{GuardedStream, spawn_session_cleanup};
-use crate::client::sse::{SseLineBuffer, ouyi_application_error, parse_sse_line};
+use crate::client::sse::{SseLineBuffer, Utf8ChunkDecoder, ouyi_application_error, parse_sse_line};
 use crate::config::AppConfig;
 use crate::error::AppError;
 use crate::model::anthropic::{AnthropicContent, ContentBlock, MessagesRequest};
@@ -1600,7 +1600,7 @@ async fn handle_anthropic_tools_plain_output(
 /// 收集 Ouyi SSE 流的完整输出
 async fn collect_ouyi_output(resp: reqwest::Response) -> Result<(String, u64, u64), AppError> {
     use crate::client::sse::{
-        OuyiEventType, SseLineBuffer, ouyi_application_error, parse_sse_line,
+        OuyiEventType, SseLineBuffer, Utf8ChunkDecoder, ouyi_application_error, parse_sse_line,
     };
     use futures::StreamExt;
 
@@ -1608,7 +1608,8 @@ async fn collect_ouyi_output(resp: reqwest::Response) -> Result<(String, u64, u6
     let mut prompt_tokens: u64 = 0;
     let mut completion_tokens: u64 = 0;
     let mut sse_buffer = SseLineBuffer::new();
-    let mut partial = Vec::new();
+    let mut utf8_decoder = Utf8ChunkDecoder::new();
+    let mut application_error: Option<String> = None;
 
     let byte_stream = resp.bytes_stream();
     futures::pin_mut!(byte_stream);
@@ -1623,56 +1624,65 @@ async fn collect_ouyi_output(resp: reqwest::Response) -> Result<(String, u64, u6
             }
         };
 
-        let mut bytes = chunk.to_vec();
-        if !partial.is_empty() {
-            let mut combined = std::mem::take(&mut partial);
-            combined.extend_from_slice(&bytes);
-            bytes = combined;
-        }
-        let text = match String::from_utf8(bytes) {
-            Ok(text) => text,
-            Err(error) => {
-                partial = error.into_bytes();
-                continue;
-            }
-        };
-        let lines = sse_buffer.push_chunk(&text);
+        let mut decoded = Vec::new();
+        let decode_error = utf8_decoder
+            .push_chunk(&chunk, |text| decoded.push(text.to_string()))
+            .err();
 
-        for line in lines {
-            if let Some(event) = parse_sse_line(&line) {
-                if let Some(msg) = ouyi_application_error(&event) {
-                    return Err(AppError::Upstream(msg));
-                }
-                let event_type = OuyiEventType::from(event.event_type.as_str());
-                match event_type {
-                    OuyiEventType::StringChunk => {
-                        if let Some(data) = &event.data
-                            && let Some(text) = data.as_str()
-                            && !text.is_empty()
-                        {
-                            content_parts.push(text.to_string());
-                        }
+        for text in decoded {
+            let lines = sse_buffer.push_chunk(&text);
+            for line in lines {
+                if let Some(event) = parse_sse_line(&line) {
+                    if let Some(msg) = ouyi_application_error(&event) {
+                        application_error = Some(msg);
+                        continue;
                     }
-                    OuyiEventType::Object => {
-                        if let Some(data) = &event.data
-                            && let Ok(usage) = serde_json::from_value::<crate::model::ouyi::OuyiUsage>(
-                                data.clone(),
-                            )
-                        {
-                            prompt_tokens = usage.prompt_tokens;
-                            completion_tokens = usage.completion_tokens;
-                        }
+                    if application_error.is_some() {
+                        continue;
                     }
-                    _ => {}
+                    let event_type = OuyiEventType::from(event.event_type.as_str());
+                    match event_type {
+                        OuyiEventType::StringChunk => {
+                            if let Some(data) = &event.data
+                                && let Some(text) = data.as_str()
+                                && !text.is_empty()
+                            {
+                                content_parts.push(text.to_string());
+                            }
+                        }
+                        OuyiEventType::Object => {
+                            if let Some(data) = &event.data
+                                && let Ok(usage) = serde_json::from_value::<
+                                    crate::model::ouyi::OuyiUsage,
+                                >(data.clone())
+                            {
+                                prompt_tokens = usage.prompt_tokens;
+                                completion_tokens = usage.completion_tokens;
+                            }
+                        }
+                        _ => {}
+                    }
                 }
             }
+        }
+
+        if let Some(error) = decode_error {
+            return Err(AppError::SseStream(format!("Ouyi UTF-8 解码错误: {error}")));
         }
     }
+
+    utf8_decoder
+        .finish()
+        .map_err(|error| AppError::SseStream(format!("Ouyi UTF-8 解码错误: {error}")))?;
 
     if let Some(remaining) = sse_buffer.drain_remaining()
         && let Some(event) = parse_sse_line(&remaining)
         && let Some(msg) = ouyi_application_error(&event)
     {
+        application_error = Some(msg);
+    }
+
+    if let Some(msg) = application_error {
         return Err(AppError::Upstream(msg));
     }
 
@@ -1936,7 +1946,7 @@ async fn handle_anthropic_stream(
     tokio::spawn(async move {
         let mut converter = AnthropicStreamConverter::new(model_for_task, task_id_for_task);
         let mut sse_buffer = SseLineBuffer::new();
-        let mut partial = Vec::new();
+        let mut utf8_decoder = Utf8ChunkDecoder::new();
         let mut stream_error: Option<String> = None;
         let mut application_error: Option<String> = None;
         let mut downstream_closed = false;
@@ -1966,63 +1976,66 @@ async fn handle_anthropic_stream(
                 tracing::debug!(chunk_count, chunk_len = chunk.len(), "读取上游数据块");
             }
 
-            let mut bytes = chunk.to_vec();
-            if !partial.is_empty() {
-                let mut combined = std::mem::take(&mut partial);
-                combined.extend_from_slice(&bytes);
-                bytes = combined;
+            let mut decoded = Vec::new();
+            if let Err(error) = utf8_decoder.push_chunk(&chunk, |text| {
+                decoded.push(text.to_string());
+            }) {
+                stream_error = Some(format!("上游 UTF-8 解码错误: {error}"));
+                break 'read_loop;
             }
-            let text = match String::from_utf8(bytes) {
-                Ok(t) => t,
-                Err(e) => {
-                    partial = e.into_bytes();
-                    continue;
-                }
-            };
 
-            let lines = sse_buffer.push_chunk(&text);
-            for line in lines {
-                if let Some(event) = parse_sse_line(&line) {
-                    if let Some(msg) = ouyi_application_error(&event) {
-                        application_error = Some(msg);
-                        break 'read_loop;
-                    }
-                    let event_type =
-                        crate::client::sse::OuyiEventType::from(event.event_type.as_str());
-                    let content = event.data.as_ref().and_then(|d| d.as_str()).unwrap_or("");
-                    let is_done = event_type == crate::client::sse::OuyiEventType::Done;
+            for text in decoded {
+                let lines = sse_buffer.push_chunk(&text);
+                for line in lines {
+                    if let Some(event) = parse_sse_line(&line) {
+                        if let Some(msg) = ouyi_application_error(&event) {
+                            application_error = Some(msg);
+                            break 'read_loop;
+                        }
+                        let event_type =
+                            crate::client::sse::OuyiEventType::from(event.event_type.as_str());
+                        let content = event.data.as_ref().and_then(|d| d.as_str()).unwrap_or("");
+                        let is_done = event_type == crate::client::sse::OuyiEventType::Done;
 
-                    tracing::debug!(
-                        event_type = event.event_type,
-                        is_done,
-                        content_len = content.len(),
-                        "上游事件"
-                    );
+                        tracing::debug!(
+                            event_type = event.event_type,
+                            is_done,
+                            content_len = content.len(),
+                            "上游事件"
+                        );
 
-                    if event_type == crate::client::sse::OuyiEventType::Object {
-                        if let Some(data) = &event.data {
-                            if let Ok(usage) = serde_json::from_value::<crate::model::ouyi::OuyiUsage>(
-                                data.clone(),
-                            ) {
-                                converter
-                                    .update_usage(usage.prompt_tokens, usage.completion_tokens);
+                        if event_type == crate::client::sse::OuyiEventType::Object {
+                            if let Some(data) = &event.data {
+                                if let Ok(usage) = serde_json::from_value::<
+                                    crate::model::ouyi::OuyiUsage,
+                                >(data.clone())
+                                {
+                                    converter
+                                        .update_usage(usage.prompt_tokens, usage.completion_tokens);
+                                }
                             }
                         }
-                    }
 
-                    for evt in converter.process_ouyi_event(content, is_done) {
-                        let evt_str = String::from_utf8_lossy(&evt);
-                        let preview: String = evt_str.chars().take(120).collect();
-                        tracing::debug!(preview = %preview, "发送 Anthropic SSE 事件");
-                        if tx.send(evt).await.is_err() {
-                            tracing::warn!("发送 SSE 事件失败，channel 已关闭");
-                            downstream_closed = true;
-                            break 'read_loop;
+                        for evt in converter.process_ouyi_event(content, is_done) {
+                            let evt_str = String::from_utf8_lossy(&evt);
+                            let preview: String = evt_str.chars().take(120).collect();
+                            tracing::debug!(preview = %preview, "发送 Anthropic SSE 事件");
+                            if tx.send(evt).await.is_err() {
+                                tracing::warn!("发送 SSE 事件失败，channel 已关闭");
+                                downstream_closed = true;
+                                break 'read_loop;
+                            }
                         }
                     }
                 }
             }
             chunk_count += 1;
+        }
+
+        if stream_error.is_none()
+            && let Err(error) = utf8_decoder.finish()
+        {
+            stream_error = Some(format!("上游 UTF-8 解码错误: {error}"));
         }
 
         if application_error.is_none()
@@ -2038,7 +2051,9 @@ async fn handle_anthropic_stream(
             return;
         }
 
-        if let Some(msg) = application_error {
+        if stream_error.is_none()
+            && let Some(msg) = application_error
+        {
             state_for_stream.stats.record_error(
                 start_time.elapsed().as_millis() as u64,
                 &model_for_stats,
@@ -2180,7 +2195,7 @@ async fn handle_anthropic_non_stream(
 
     let mut total_bytes: usize = 0;
     let max_bytes = state.config.read().await.limits.max_response_bytes;
-    let mut partial = Vec::new();
+    let mut utf8_decoder = Utf8ChunkDecoder::new();
     let mut stream_error: Option<String> = None;
     let mut application_error: Option<String> = None;
 
@@ -2201,30 +2216,32 @@ async fn handle_anthropic_non_stream(
             break;
         }
 
-        let mut bytes = chunk.to_vec();
-        if !partial.is_empty() {
-            let mut combined = std::mem::take(&mut partial);
-            combined.extend_from_slice(&bytes);
-            bytes = combined;
+        let mut decoded = Vec::new();
+        if let Err(error) = utf8_decoder.push_chunk(&chunk, |text| {
+            decoded.push(text.to_string());
+        }) {
+            stream_error = Some(format!("SSE UTF-8 解码错误: {error}"));
+            break 'read_loop;
         }
-        let text = match String::from_utf8(bytes) {
-            Ok(t) => t,
-            Err(e) => {
-                partial = e.into_bytes();
-                continue;
-            }
-        };
 
-        let lines = sse_buffer.push_chunk(&text);
-        for line in lines {
-            if let Some(event) = parse_sse_line(&line) {
-                if let Some(msg) = ouyi_application_error(&event) {
-                    application_error = Some(msg);
-                    break 'read_loop;
+        for text in decoded {
+            let lines = sse_buffer.push_chunk(&text);
+            for line in lines {
+                if let Some(event) = parse_sse_line(&line) {
+                    if let Some(msg) = ouyi_application_error(&event) {
+                        application_error = Some(msg);
+                        break 'read_loop;
+                    }
+                    collector.push_event(&event);
                 }
-                collector.push_event(&event);
             }
         }
+    }
+
+    if stream_error.is_none()
+        && let Err(error) = utf8_decoder.finish()
+    {
+        stream_error = Some(format!("SSE UTF-8 解码错误: {error}"));
     }
 
     if application_error.is_none()
@@ -2238,7 +2255,9 @@ async fn handle_anthropic_non_stream(
         }
     }
 
-    if let Some(msg) = application_error {
+    if stream_error.is_none()
+        && let Some(msg) = application_error
+    {
         guarded.as_mut().skip_cleanup();
         spawn_session_cleanup(client, session_id);
         state.active_sessions.remove(&session_id);
@@ -2858,6 +2877,22 @@ mod tests {
             .unwrap()
     }
 
+    async fn ouyi_quota_then_incomplete_utf8_handler() -> axum::response::Response {
+        let mut body = concat!(
+            "data: {\"id\":\"quota\",\"type\":\"\",\"data\":null,",
+            "\"err\":\"您的套餐余量不足，请购买后重试\",\"code\":1}\n\n"
+        )
+        .as_bytes()
+        .to_vec();
+        body.extend_from_slice(&[0xE5, 0xA5]);
+
+        axum::response::Response::builder()
+            .status(StatusCode::OK)
+            .header(axum::http::header::CONTENT_TYPE, "text/event-stream")
+            .body(Body::from(body))
+            .unwrap()
+    }
+
     async fn ouyi_tool_then_final_handler(
         State(counter): State<Arc<AtomicUsize>>,
     ) -> axum::response::Response {
@@ -3024,6 +3059,36 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_anthropic_tools_stream_reject_ouyi_application_error_before_sse() {
+        let tool_requests = Arc::new(AtomicUsize::new(0));
+        let ouyi_base_url = spawn_mock_router(
+            Router::new()
+                .route("/api/chat/session", post(ouyi_session_handler))
+                .route(
+                    "/api/chat/completions",
+                    post(ouyi_application_error_handler),
+                ),
+        )
+        .await;
+        let tool_base_url = spawn_mock_router(
+            Router::new()
+                .route("/chat/completions", post(tool_compiler_handler))
+                .with_state(tool_requests.clone()),
+        )
+        .await;
+        let state = make_test_state(test_config(ouyi_base_url, tool_base_url));
+        let mut req = make_request_with_tools();
+        req.stream = Some(true);
+
+        let err = messages(State(state), Json(req)).await.unwrap_err();
+
+        assert!(
+            matches!(err, AppError::Upstream(message) if message.contains("您的套餐余量不足，请购买后重试"))
+        );
+        assert_eq!(tool_requests.load(Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
     async fn test_anthropic_tools_preserve_split_utf8_application_error() {
         let tool_requests = Arc::new(AtomicUsize::new(0));
         let ouyi_base_url = spawn_mock_router(
@@ -3052,6 +3117,34 @@ mod tests {
 
         assert_eq!(message, "您的套餐余量不足，请购买后重试 (code=1)");
         assert!(!message.contains('�'));
+        assert_eq!(tool_requests.load(Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
+    async fn test_anthropic_tools_quota_then_incomplete_utf8_returns_stream_error() {
+        let tool_requests = Arc::new(AtomicUsize::new(0));
+        let ouyi_base_url = spawn_mock_router(
+            Router::new()
+                .route("/api/chat/session", post(ouyi_session_handler))
+                .route(
+                    "/api/chat/completions",
+                    post(ouyi_quota_then_incomplete_utf8_handler),
+                ),
+        )
+        .await;
+        let tool_base_url = spawn_mock_router(
+            Router::new()
+                .route("/chat/completions", post(tool_compiler_handler))
+                .with_state(tool_requests.clone()),
+        )
+        .await;
+        let state = make_test_state(test_config(ouyi_base_url, tool_base_url));
+        let mut req = make_request_with_tools();
+        req.stream = Some(false);
+
+        let err = messages(State(state), Json(req)).await.unwrap_err();
+
+        assert!(matches!(err, AppError::SseStream(message) if message.contains("UTF-8")));
         assert_eq!(tool_requests.load(Ordering::SeqCst), 0);
     }
 

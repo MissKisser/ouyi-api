@@ -145,7 +145,7 @@ mod tests {
 pub struct OuyiSseEvent {
     #[allow(dead_code)]
     pub id: Option<String>,
-    #[serde(rename = "type")]
+    #[serde(rename = "type", default)]
     pub event_type: String,
     pub data: Option<serde_json::Value>,
     pub err: Option<String>,
