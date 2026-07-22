@@ -142,6 +142,7 @@ mod tests {
         };
 
         Arc::new(AppState {
+            concurrency_limiter: crate::concurrency::ConcurrencyLimiter::new(0),
             config: RwLock::new(config),
             http_client,
             ouyi_client: RwLock::new(ouyi_client),

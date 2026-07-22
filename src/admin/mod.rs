@@ -204,6 +204,7 @@ mod tests {
         };
 
         Arc::new(AppState {
+            concurrency_limiter: crate::concurrency::ConcurrencyLimiter::new(0),
             config: tokio::sync::RwLock::new(config),
             http_client: http_client.clone(),
             ouyi_client: tokio::sync::RwLock::new(crate::client::OuyiClient::V8(

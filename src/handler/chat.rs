@@ -983,6 +983,7 @@ mod tests {
             .unwrap_or(crate::platform::OuyiPlatform::Ouyi8);
         let base_url = config.ouyi.base_url.clone();
         Arc::new(AppState {
+            concurrency_limiter: crate::concurrency::ConcurrencyLimiter::new(0),
             ouyi_client: tokio::sync::RwLock::new(crate::client::OuyiClient::V8(
                 OuyiHttpClient::new(
                     http_client.clone(),
@@ -1316,6 +1317,7 @@ mod tests {
         mapper.load_fallback();
         let platform = OuyiPlatform::Ouyi7;
         Arc::new(AppState {
+            concurrency_limiter: crate::concurrency::ConcurrencyLimiter::new(0),
             ouyi_client: tokio::sync::RwLock::new(crate::client::OuyiClient::V7(
                 Ouyi7HttpClient::new(
                     http_client.clone(),
@@ -1390,6 +1392,7 @@ mod tests {
         mapper.load_fallback();
         let platform = OuyiPlatform::Ouyi7;
         Arc::new(AppState {
+            concurrency_limiter: crate::concurrency::ConcurrencyLimiter::new(0),
             ouyi_client: tokio::sync::RwLock::new(crate::client::OuyiClient::V7(
                 Ouyi7HttpClient::new(
                     http_client.clone(),

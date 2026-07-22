@@ -313,6 +313,7 @@ mod tests {
         };
         let mapper = ModelMapper::new();
         Arc::new(AppState {
+            concurrency_limiter: crate::concurrency::ConcurrencyLimiter::new(0),
             config: AsyncRwLock::new(config),
             http_client: http_client.clone(),
             ouyi_client: AsyncRwLock::new(crate::client::OuyiClient::V8(

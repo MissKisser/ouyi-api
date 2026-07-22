@@ -1,6 +1,7 @@
 mod adapter;
 mod admin;
 mod client;
+mod concurrency;
 mod config;
 mod error;
 mod handler;
@@ -27,6 +28,7 @@ use admin::stats::StatsCollector;
 use client::OuyiClient;
 use client::http::OuyiHttpClient;
 use client::ouyi_v7::Ouyi7HttpClient;
+use concurrency::ConcurrencyLimiter;
 use config::{AppConfig, update_ouyi_jwt_token, update_ouyi_v7_jwt_token};
 use error::AppError;
 use model::catalog::ModelCatalog;
@@ -41,6 +43,7 @@ pub struct CachedToolSession {
 }
 
 pub struct AppState {
+    pub concurrency_limiter: ConcurrencyLimiter,
     pub config: RwLock<AppConfig>,
     pub http_client: reqwest::Client,
     /// 平台客户端：根据启动时选择的平台动态切换
@@ -154,6 +157,7 @@ async fn main() -> Result<(), AppError> {
     let stats = StatsCollector::new();
 
     let state = Arc::new(AppState {
+        concurrency_limiter: ConcurrencyLimiter::new(config.limits.max_concurrent_requests),
         config: RwLock::new(config.clone()),
         http_client,
         ouyi_client: RwLock::new(ouyi_client),
