@@ -400,11 +400,25 @@ async fn compile_for_openai_endpoint(
 
         match parse_openai_tool_calls(tool_calls, &valid_tool_names) {
             Ok(calls) if !calls.is_empty() => {
-                let calls = materialize_compiled_calls(calls, &context.payloads)?;
-                Ok(CompilerResult {
-                    decision: CompilerDecision::ToolCalls(calls),
-                    usage,
-                })
+                match materialize_compiled_calls(calls, &context.payloads)
+                    .and_then(|calls| validate_compiled_calls(calls, &context.tools))
+                {
+                    Ok(calls) => Ok(CompilerResult {
+                        decision: CompilerDecision::ToolCalls(calls),
+                        usage,
+                    }),
+                    Err(error) => {
+                        tracing::warn!(%error, "首次 tool_calls 参数不符合工具 schema，尝试结构化重试");
+                        retry_with_structured_prompt(
+                            http_client,
+                            config,
+                            &openai_request,
+                            &context.tools,
+                            &context.payloads,
+                        )
+                        .await
+                    }
+                }
             }
             Ok(_) => Ok(CompilerResult {
                 decision: CompilerDecision::FinalAnswer,
@@ -416,7 +430,7 @@ async fn compile_for_openai_endpoint(
                     http_client,
                     config,
                     &openai_request,
-                    &valid_tool_names,
+                    &context.tools,
                     &context.payloads,
                 )
                 .await
@@ -638,10 +652,14 @@ async fn retry_with_structured_prompt(
     http_client: reqwest::Client,
     config: &ToolRuntimeConfig,
     original_request: &OpenAiChatRequest,
-    valid_tool_names: &[String],
+    tool_specs: &[ToolSpec],
     payloads: &[crate::tool_runtime::payload::ToolPayload],
 ) -> Result<CompilerResult, AppError> {
-    let retry_request = build_retry_request(original_request, valid_tool_names);
+    let valid_tool_names = tool_specs
+        .iter()
+        .map(|tool| tool.name.clone())
+        .collect::<Vec<_>>();
+    let retry_request = build_retry_request(original_request, &valid_tool_names);
 
     let base_url = config
         .base_url
@@ -704,7 +722,7 @@ async fn retry_with_structured_prompt(
             });
         }
 
-        let compiled_calls = parse_openai_tool_calls(tool_calls, valid_tool_names)?;
+        let compiled_calls = parse_openai_tool_calls(tool_calls, &valid_tool_names)?;
         if compiled_calls.is_empty() {
             Ok(CompilerResult {
                 decision: CompilerDecision::FinalAnswer,
@@ -712,6 +730,7 @@ async fn retry_with_structured_prompt(
             })
         } else {
             let compiled_calls = materialize_compiled_calls(compiled_calls, payloads)?;
+            let compiled_calls = validate_compiled_calls(compiled_calls, tool_specs)?;
             Ok(CompilerResult {
                 decision: CompilerDecision::ToolCalls(compiled_calls),
                 usage,
@@ -753,6 +772,17 @@ fn materialize_compiled_calls(
     for call in &mut calls {
         crate::tool_runtime::materialize::materialize_payload_refs(&mut call.input, payloads)
             .map_err(|e| AppError::Upstream(format!("工具参数 payload 物化失败: {e}")))?;
+    }
+    Ok(calls)
+}
+
+fn validate_compiled_calls(
+    calls: Vec<CompiledToolCall>,
+    tool_specs: &[ToolSpec],
+) -> Result<Vec<CompiledToolCall>, AppError> {
+    for call in &calls {
+        crate::tool_runtime::validation::validate_tool_call(tool_specs, &call.name, &call.input)
+            .map_err(AppError::ToolProtocol)?;
     }
     Ok(calls)
 }
@@ -972,24 +1002,27 @@ mod tests {
             .unwrap();
         });
 
+        let tool_specs = vec![ToolSpec {
+            name: "Write".to_string(),
+            description: "Write file".to_string(),
+            input_schema: serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "file_path": {"type": "string"},
+                    "content": {"type": "string"}
+                },
+                "required": ["file_path", "content"]
+            }),
+        }];
         let original = OpenAiChatRequest {
             model: "tool-model".to_string(),
             messages: vec![OpenAiMessage {
                 role: "user".to_string(),
                 content: "Ouyi 主脑输出：<ouyi_payload_ref id=\"p1\" bytes=\"1500\" />".to_string(),
             }],
-            tools: convert_tool_specs_to_openai(&[ToolSpec {
-                name: "Write".to_string(),
-                description: "Write file".to_string(),
-                input_schema: serde_json::json!({
-                    "type": "object",
-                    "properties": {
-                        "file_path": {"type": "string"},
-                        "content_ref": {"type": "string"}
-                    },
-                    "required": ["file_path", "content_ref"]
-                }),
-            }]),
+            tools: convert_tool_specs_to_openai(&crate::tool_runtime::schema::compiler_tool_specs(
+                &tool_specs,
+            )),
             tool_choice: OpenAiToolChoice::String("auto".to_string()),
         };
         let body = "x".repeat(1500);
@@ -1010,10 +1043,10 @@ mod tests {
         };
 
         let result = retry_with_structured_prompt(
-            reqwest::Client::new(),
+            reqwest::Client::builder().no_proxy().build().unwrap(),
             &config,
             &original,
-            &["Write".to_string()],
+            &tool_specs,
             &payloads,
         )
         .await
@@ -1025,6 +1058,103 @@ mod tests {
                 assert!(calls[0].input.get("content_ref").is_none());
             }
             CompilerDecision::FinalAnswer => panic!("expected retry tool call"),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_schema_invalid_compiler_call_is_retried_once() {
+        use axum::{Json, Router, extract::State, routing::post};
+        use std::sync::Arc;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use tokio::net::TcpListener;
+
+        async fn handler(State(requests): State<Arc<AtomicUsize>>) -> Json<serde_json::Value> {
+            let attempt = requests.fetch_add(1, Ordering::SeqCst);
+            let arguments = if attempt == 0 {
+                r#"{"file_path":"alpha无法调用工具"}"#
+            } else {
+                r#"{"file_path":"alpha"}"#
+            };
+            Json(serde_json::json!({
+                "choices": [{
+                    "message": {
+                        "tool_calls": [{
+                            "id": "call_retry",
+                            "function": {
+                                "name": "Read",
+                                "arguments": arguments
+                            }
+                        }]
+                    }
+                }],
+                "usage": {"prompt_tokens": 1, "completion_tokens": 1}
+            }))
+        }
+
+        let requests = Arc::new(AtomicUsize::new(0));
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn({
+            let requests = requests.clone();
+            async move {
+                axum::serve(
+                    listener,
+                    Router::new()
+                        .route("/chat/completions", post(handler))
+                        .with_state(requests),
+                )
+                .await
+                .unwrap();
+            }
+        });
+
+        let context = ToolRuntimeRequestContext {
+            endpoint: ToolEndpointKind::Anthropic,
+            model: "gpt-test".to_string(),
+            transcript: vec![crate::tool_runtime::context::TranscriptItem::UserText {
+                content: "读取 alpha".to_string(),
+            }],
+            tools: vec![ToolSpec {
+                name: "Read".to_string(),
+                description: "Read deterministic input".to_string(),
+                input_schema: serde_json::json!({
+                    "type": "object",
+                    "properties": {
+                        "file_path": {"type": "string", "enum": ["alpha"]}
+                    },
+                    "required": ["file_path"],
+                    "additionalProperties": false
+                }),
+            }],
+            tool_choice: Some(ToolChoiceSpec::Required),
+            payloads: Vec::new(),
+        };
+        let config = ToolRuntimeConfig {
+            enabled: true,
+            mode: crate::config::ToolRuntimeMode::Compiler,
+            provider: ToolRuntimeProvider::OpenaiCompatible,
+            base_url: Some(format!("http://{}", addr)),
+            api_key: Some("test-key".to_string()),
+            api_key_env: None,
+            model: Some("tool-model".to_string()),
+            timeout_secs: 5,
+        };
+
+        let result = compile_tool_decision_for_context(
+            reqwest::Client::builder().no_proxy().build().unwrap(),
+            &config,
+            &context,
+            "需要读取 alpha。",
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(requests.load(Ordering::SeqCst), 2);
+        match result.decision {
+            CompilerDecision::ToolCalls(calls) => {
+                assert_eq!(calls[0].input["file_path"], "alpha");
+            }
+            CompilerDecision::FinalAnswer => panic!("expected repaired tool call"),
         }
     }
 
