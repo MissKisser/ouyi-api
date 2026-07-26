@@ -392,6 +392,18 @@ async fn compile_for_openai_endpoint(
 
     if let Some(tool_calls) = &choice.message.tool_calls {
         if tool_calls.is_empty() {
+            if tool_choice_requires_call(context.tool_choice.as_ref()) {
+                tracing::warn!("首次编译器响应未返回强制工具调用，尝试结构化重试");
+                return retry_with_structured_prompt(
+                    http_client,
+                    config,
+                    &openai_request,
+                    &context.tools,
+                    context.tool_choice.as_ref(),
+                    &context.payloads,
+                )
+                .await;
+            }
             return Ok(CompilerResult {
                 decision: CompilerDecision::FinalAnswer,
                 usage,
@@ -400,9 +412,9 @@ async fn compile_for_openai_endpoint(
 
         match parse_openai_tool_calls(tool_calls, &valid_tool_names) {
             Ok(calls) if !calls.is_empty() => {
-                match materialize_compiled_calls(calls, &context.payloads)
-                    .and_then(|calls| validate_compiled_calls(calls, &context.tools))
-                {
+                match materialize_compiled_calls(calls, &context.payloads).and_then(|calls| {
+                    validate_compiled_calls(calls, &context.tools, context.tool_choice.as_ref())
+                }) {
                     Ok(calls) => Ok(CompilerResult {
                         decision: CompilerDecision::ToolCalls(calls),
                         usage,
@@ -414,11 +426,24 @@ async fn compile_for_openai_endpoint(
                             config,
                             &openai_request,
                             &context.tools,
+                            context.tool_choice.as_ref(),
                             &context.payloads,
                         )
                         .await
                     }
                 }
+            }
+            Ok(_) if tool_choice_requires_call(context.tool_choice.as_ref()) => {
+                tracing::warn!("首次编译器响应未返回强制工具调用，尝试结构化重试");
+                retry_with_structured_prompt(
+                    http_client,
+                    config,
+                    &openai_request,
+                    &context.tools,
+                    context.tool_choice.as_ref(),
+                    &context.payloads,
+                )
+                .await
             }
             Ok(_) => Ok(CompilerResult {
                 decision: CompilerDecision::FinalAnswer,
@@ -431,11 +456,23 @@ async fn compile_for_openai_endpoint(
                     config,
                     &openai_request,
                     &context.tools,
+                    context.tool_choice.as_ref(),
                     &context.payloads,
                 )
                 .await
             }
         }
+    } else if tool_choice_requires_call(context.tool_choice.as_ref()) {
+        tracing::warn!("首次编译器响应未返回强制工具调用，尝试结构化重试");
+        retry_with_structured_prompt(
+            http_client,
+            config,
+            &openai_request,
+            &context.tools,
+            context.tool_choice.as_ref(),
+            &context.payloads,
+        )
+        .await
     } else {
         Ok(CompilerResult {
             decision: CompilerDecision::FinalAnswer,
@@ -538,14 +575,139 @@ async fn compile_for_anthropic_provider(
             .unwrap_or(0),
     };
 
+    match parse_anthropic_tool_uses(&anthropic_response.content, &valid_tool_names) {
+        Ok(calls) if !calls.is_empty() => {
+            match materialize_compiled_calls(calls, &context.payloads).and_then(|calls| {
+                validate_compiled_calls(calls, &context.tools, context.tool_choice.as_ref())
+            }) {
+                Ok(calls) => Ok(CompilerResult {
+                    decision: CompilerDecision::ToolCalls(calls),
+                    usage,
+                }),
+                Err(error) => {
+                    tracing::warn!(
+                        %error,
+                        "首次 Anthropic tool_use 参数不符合工具 schema，尝试结构化重试"
+                    );
+                    retry_anthropic_with_structured_prompt(
+                        http_client,
+                        config,
+                        &request,
+                        &context.tools,
+                        context.tool_choice.as_ref(),
+                        &context.payloads,
+                    )
+                    .await
+                }
+            }
+        }
+        Ok(_) if tool_choice_requires_call(context.tool_choice.as_ref()) => {
+            tracing::warn!("首次 Anthropic 编译器响应未返回强制工具调用，尝试结构化重试");
+            retry_anthropic_with_structured_prompt(
+                http_client,
+                config,
+                &request,
+                &context.tools,
+                context.tool_choice.as_ref(),
+                &context.payloads,
+            )
+            .await
+        }
+        Ok(_) => Ok(CompilerResult {
+            decision: CompilerDecision::FinalAnswer,
+            usage,
+        }),
+        Err(error) => {
+            tracing::warn!(%error, "首次解析 Anthropic tool_use 失败，尝试结构化重试");
+            retry_anthropic_with_structured_prompt(
+                http_client,
+                config,
+                &request,
+                &context.tools,
+                context.tool_choice.as_ref(),
+                &context.payloads,
+            )
+            .await
+        }
+    }
+}
+
+async fn retry_anthropic_with_structured_prompt(
+    http_client: reqwest::Client,
+    config: &ToolRuntimeConfig,
+    original_request: &AnthropicCompilerRequest,
+    tool_specs: &[ToolSpec],
+    tool_choice: Option<&ToolChoiceSpec>,
+    payloads: &[crate::tool_runtime::payload::ToolPayload],
+) -> Result<CompilerResult, AppError> {
+    let valid_tool_names = tool_specs
+        .iter()
+        .map(|tool| tool.name.clone())
+        .collect::<Vec<_>>();
+    let mut retry_request = original_request.clone();
+    retry_request.system.push_str(
+        "\n上一次 tool_use 不符合工具协议。请重新生成一次，并确保工具名来自可用工具，input 是严格满足对应 input_schema 的 JSON object。不要把解释、提示或引号说明拼接进字段值；enum 字段必须逐字匹配允许值。",
+    );
+    if let Some(message) = retry_request.messages.last_mut() {
+        message.content.push_str(
+            "\n\n校正要求：忽略上一次结构化结果，仅重新输出一个参数严格满足 input_schema 的 tool_use，不要添加解释。",
+        );
+    }
+
+    let base_url = config
+        .base_url
+        .as_deref()
+        .unwrap_or("https://api.anthropic.com")
+        .trim_end_matches('/');
+    let base_url = base_url.strip_suffix("/v1").unwrap_or(base_url);
+    crate::tool_runtime::provider::validate_compiler_base_url(base_url)
+        .map_err(AppError::ToolRecursion)?;
+    let api_key = config.get_api_key()?;
+    let url = format!("{}/v1/messages", base_url);
+    let response = http_client
+        .post(&url)
+        .header("x-api-key", api_key)
+        .header(
+            crate::tool_runtime::provider::TOOL_RUNTIME_HOP_HEADER,
+            crate::tool_runtime::provider::TOOL_RUNTIME_HOP_VALUE,
+        )
+        .header("anthropic-version", "2023-06-01")
+        .header("Content-Type", "application/json")
+        .json(&retry_request)
+        .timeout(std::time::Duration::from_secs(config.timeout_secs))
+        .send()
+        .await?
+        .error_for_status()
+        .map_err(|e| AppError::Upstream(format!("Anthropic 编译器重试请求失败: {}", e)))?;
+
+    let body = response
+        .text()
+        .await
+        .map_err(|e| AppError::Upstream(format!("读取 Anthropic 编译器重试响应失败: {}", e)))?;
+    let anthropic_response: AnthropicCompilerResponse = serde_json::from_str(&body)
+        .map_err(|e| AppError::Upstream(format!("Anthropic 编译器重试响应解析失败: {}", e)))?;
+    let usage = CompilerUsage {
+        prompt_tokens: anthropic_response
+            .usage
+            .as_ref()
+            .and_then(|usage| usage.input_tokens)
+            .unwrap_or(0),
+        completion_tokens: anthropic_response
+            .usage
+            .as_ref()
+            .and_then(|usage| usage.output_tokens)
+            .unwrap_or(0),
+    };
     let calls = parse_anthropic_tool_uses(&anthropic_response.content, &valid_tool_names)?;
     if calls.is_empty() {
+        crate::tool_runtime::protocol::validate_tool_choice(tool_choice, &[])?;
         Ok(CompilerResult {
             decision: CompilerDecision::FinalAnswer,
             usage,
         })
     } else {
-        let calls = materialize_compiled_calls(calls, &context.payloads)?;
+        let calls = materialize_compiled_calls(calls, payloads)?;
+        let calls = validate_compiled_calls(calls, tool_specs, tool_choice)?;
         Ok(CompilerResult {
             decision: CompilerDecision::ToolCalls(calls),
             usage,
@@ -653,6 +815,7 @@ async fn retry_with_structured_prompt(
     config: &ToolRuntimeConfig,
     original_request: &OpenAiChatRequest,
     tool_specs: &[ToolSpec],
+    tool_choice: Option<&ToolChoiceSpec>,
     payloads: &[crate::tool_runtime::payload::ToolPayload],
 ) -> Result<CompilerResult, AppError> {
     let valid_tool_names = tool_specs
@@ -716,6 +879,7 @@ async fn retry_with_structured_prompt(
 
     if let Some(tool_calls) = &choice.message.tool_calls {
         if tool_calls.is_empty() {
+            crate::tool_runtime::protocol::validate_tool_choice(tool_choice, &[])?;
             return Ok(CompilerResult {
                 decision: CompilerDecision::FinalAnswer,
                 usage,
@@ -724,19 +888,21 @@ async fn retry_with_structured_prompt(
 
         let compiled_calls = parse_openai_tool_calls(tool_calls, &valid_tool_names)?;
         if compiled_calls.is_empty() {
+            crate::tool_runtime::protocol::validate_tool_choice(tool_choice, &[])?;
             Ok(CompilerResult {
                 decision: CompilerDecision::FinalAnswer,
                 usage,
             })
         } else {
             let compiled_calls = materialize_compiled_calls(compiled_calls, payloads)?;
-            let compiled_calls = validate_compiled_calls(compiled_calls, tool_specs)?;
+            let compiled_calls = validate_compiled_calls(compiled_calls, tool_specs, tool_choice)?;
             Ok(CompilerResult {
                 decision: CompilerDecision::ToolCalls(compiled_calls),
                 usage,
             })
         }
     } else {
+        crate::tool_runtime::protocol::validate_tool_choice(tool_choice, &[])?;
         Ok(CompilerResult {
             decision: CompilerDecision::FinalAnswer,
             usage,
@@ -779,12 +945,25 @@ fn materialize_compiled_calls(
 fn validate_compiled_calls(
     calls: Vec<CompiledToolCall>,
     tool_specs: &[ToolSpec],
+    tool_choice: Option<&ToolChoiceSpec>,
 ) -> Result<Vec<CompiledToolCall>, AppError> {
     for call in &calls {
         crate::tool_runtime::validation::validate_tool_call(tool_specs, &call.name, &call.input)
             .map_err(AppError::ToolProtocol)?;
     }
+    let actual_names = calls
+        .iter()
+        .map(|call| call.name.clone())
+        .collect::<Vec<_>>();
+    crate::tool_runtime::protocol::validate_tool_choice(tool_choice, &actual_names)?;
     Ok(calls)
+}
+
+fn tool_choice_requires_call(tool_choice: Option<&ToolChoiceSpec>) -> bool {
+    matches!(
+        tool_choice,
+        Some(ToolChoiceSpec::Required | ToolChoiceSpec::Tool(_))
+    )
 }
 
 #[cfg(test)]
@@ -1047,6 +1226,7 @@ mod tests {
             &config,
             &original,
             &tool_specs,
+            None,
             &payloads,
         )
         .await
@@ -1159,6 +1339,206 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_forced_compiler_final_answer_is_retried_once() {
+        use axum::{Json, Router, extract::State, routing::post};
+        use std::sync::Arc;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use tokio::net::TcpListener;
+
+        async fn handler(State(requests): State<Arc<AtomicUsize>>) -> Json<serde_json::Value> {
+            let attempt = requests.fetch_add(1, Ordering::SeqCst);
+            if attempt == 0 {
+                return Json(serde_json::json!({
+                    "choices": [{"message": {"content": "I cannot call tools."}}],
+                    "usage": {"prompt_tokens": 1, "completion_tokens": 1}
+                }));
+            }
+            Json(serde_json::json!({
+                "choices": [{
+                    "message": {
+                        "tool_calls": [{
+                            "id": "call_retry",
+                            "function": {
+                                "name": "Read",
+                                "arguments": "{\"file_path\":\"alpha\"}"
+                            }
+                        }]
+                    }
+                }],
+                "usage": {"prompt_tokens": 1, "completion_tokens": 1}
+            }))
+        }
+
+        let requests = Arc::new(AtomicUsize::new(0));
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn({
+            let requests = requests.clone();
+            async move {
+                axum::serve(
+                    listener,
+                    Router::new()
+                        .route("/chat/completions", post(handler))
+                        .with_state(requests),
+                )
+                .await
+                .unwrap();
+            }
+        });
+
+        let context = ToolRuntimeRequestContext {
+            endpoint: ToolEndpointKind::OpenAi,
+            model: "gpt-test".to_string(),
+            transcript: vec![crate::tool_runtime::context::TranscriptItem::UserText {
+                content: "读取 alpha".to_string(),
+            }],
+            tools: vec![ToolSpec {
+                name: "Read".to_string(),
+                description: "Read deterministic input".to_string(),
+                input_schema: serde_json::json!({
+                    "type": "object",
+                    "properties": {
+                        "file_path": {"type": "string", "enum": ["alpha"]}
+                    },
+                    "required": ["file_path"],
+                    "additionalProperties": false
+                }),
+            }],
+            tool_choice: Some(ToolChoiceSpec::Tool("Read".to_string())),
+            payloads: Vec::new(),
+        };
+        let config = ToolRuntimeConfig {
+            enabled: true,
+            mode: crate::config::ToolRuntimeMode::Compiler,
+            provider: ToolRuntimeProvider::OpenaiCompatible,
+            base_url: Some(format!("http://{}", addr)),
+            api_key: Some("test-key".to_string()),
+            api_key_env: None,
+            model: Some("tool-model".to_string()),
+            timeout_secs: 5,
+        };
+
+        let result = compile_tool_decision_for_context(
+            reqwest::Client::builder().no_proxy().build().unwrap(),
+            &config,
+            &context,
+            "需要读取 alpha。",
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(requests.load(Ordering::SeqCst), 2);
+        match result.decision {
+            CompilerDecision::ToolCalls(calls) => {
+                assert_eq!(calls[0].name, "Read");
+                assert_eq!(calls[0].input["file_path"], "alpha");
+            }
+            CompilerDecision::FinalAnswer => panic!("expected repaired forced tool call"),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_schema_invalid_anthropic_compiler_call_is_retried_once() {
+        use axum::{Json, Router, extract::State, routing::post};
+        use std::sync::Arc;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use tokio::net::TcpListener;
+
+        async fn handler(
+            State(requests): State<Arc<AtomicUsize>>,
+            headers: axum::http::HeaderMap,
+        ) -> Json<serde_json::Value> {
+            assert_eq!(
+                headers
+                    .get(crate::tool_runtime::provider::TOOL_RUNTIME_HOP_HEADER)
+                    .and_then(|value| value.to_str().ok()),
+                Some(crate::tool_runtime::provider::TOOL_RUNTIME_HOP_VALUE)
+            );
+            let attempt = requests.fetch_add(1, Ordering::SeqCst);
+            let file_path = if attempt == 0 {
+                "alpha文件路径为 \"alpha\""
+            } else {
+                "alpha"
+            };
+            Json(serde_json::json!({
+                "content": [{
+                    "type": "tool_use",
+                    "id": "toolu_retry",
+                    "name": "Read",
+                    "input": {"file_path": file_path}
+                }],
+                "usage": {"input_tokens": 1, "output_tokens": 1}
+            }))
+        }
+
+        let requests = Arc::new(AtomicUsize::new(0));
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn({
+            let requests = requests.clone();
+            async move {
+                axum::serve(
+                    listener,
+                    Router::new()
+                        .route("/v1/messages", post(handler))
+                        .with_state(requests),
+                )
+                .await
+                .unwrap();
+            }
+        });
+
+        let context = ToolRuntimeRequestContext {
+            endpoint: ToolEndpointKind::Anthropic,
+            model: "glm-test".to_string(),
+            transcript: vec![crate::tool_runtime::context::TranscriptItem::UserText {
+                content: "读取 alpha".to_string(),
+            }],
+            tools: vec![ToolSpec {
+                name: "Read".to_string(),
+                description: "Read deterministic input".to_string(),
+                input_schema: serde_json::json!({
+                    "type": "object",
+                    "properties": {
+                        "file_path": {"type": "string", "enum": ["alpha"]}
+                    },
+                    "required": ["file_path"],
+                    "additionalProperties": false
+                }),
+            }],
+            tool_choice: Some(ToolChoiceSpec::Tool("Read".to_string())),
+            payloads: Vec::new(),
+        };
+        let config = ToolRuntimeConfig {
+            enabled: true,
+            mode: crate::config::ToolRuntimeMode::Compiler,
+            provider: ToolRuntimeProvider::Anthropic,
+            base_url: Some(format!("http://{}", addr)),
+            api_key: Some("test-key".to_string()),
+            api_key_env: None,
+            model: Some("tool-model".to_string()),
+            timeout_secs: 5,
+        };
+
+        let result = compile_tool_decision_for_context(
+            reqwest::Client::builder().no_proxy().build().unwrap(),
+            &config,
+            &context,
+            "需要读取 alpha。",
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(requests.load(Ordering::SeqCst), 2);
+        match result.decision {
+            CompilerDecision::ToolCalls(calls) => {
+                assert_eq!(calls[0].input["file_path"], "alpha");
+            }
+            CompilerDecision::FinalAnswer => panic!("expected repaired tool call"),
+        }
+    }
+
+    #[tokio::test]
     async fn test_anthropic_compiler_receives_real_forced_tool_choice() {
         use axum::{Json, Router, routing::post};
         use tokio::net::TcpListener;
@@ -1210,7 +1590,7 @@ mod tests {
             timeout_secs: 5,
         };
 
-        let result = compile_tool_decision_with_usage_and_payloads(
+        let error = compile_tool_decision_with_usage_and_payloads(
             reqwest::Client::builder().no_proxy().build().unwrap(),
             &config,
             &req,
@@ -1218,8 +1598,10 @@ mod tests {
             Vec::new(),
         )
         .await
-        .unwrap();
+        .unwrap_err();
 
-        assert!(matches!(result.decision, CompilerDecision::FinalAnswer));
+        assert!(
+            matches!(error, AppError::ToolProtocol(message) if message.contains("expected=required") && message.contains("actual=<none>"))
+        );
     }
 }

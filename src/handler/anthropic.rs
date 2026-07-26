@@ -3405,7 +3405,7 @@ mod tests {
         assert!(
             matches!(err, AppError::ToolProtocol(message) if message.contains("expected=required") && message.contains("actual=<none>"))
         );
-        assert_eq!(tool_requests.load(Ordering::SeqCst), 1);
+        assert_eq!(tool_requests.load(Ordering::SeqCst), 2);
         assert_eq!(state.stats.stats.active_requests.load(Ordering::Relaxed), 0);
         assert_eq!(state.stats.stats.failed_requests.load(Ordering::Relaxed), 1);
     }
