@@ -3,6 +3,7 @@ import {
   apiFetchConfig,
   apiSaveConfig,
   apiSaveConcurrencyLimit,
+  apiSavePlatform,
   apiTestToolRuntime,
   apiTestOpenAiToolRuntime,
   type FullConfig,
@@ -75,6 +76,10 @@ export function ConfigPage() {
   const [persistedConcurrency, setPersistedConcurrency] = useState<number | null>(null);
   const [savingConcurrency, setSavingConcurrency] = useState(false);
   const [concurrencyMessage, setConcurrencyMessage] = useState<{ type: 'ok' | 'err'; text: string } | null>(null);
+  // 平台切换：与并发限制同样的"独立保存 + 即时生效"模式
+  const [persistedPlatformDefault, setPersistedPlatformDefault] = useState<string | null>(null);
+  const [savingPlatform, setSavingPlatform] = useState(false);
+  const [platformMessage, setPlatformMessage] = useState<{ type: 'ok' | 'err'; text: string } | null>(null);
   const [message, setMessage] = useState<{ type: 'ok' | 'err'; text: string } | null>(null);
   const [oldPassword, setOldPassword] = useState('');
   const [newPassword, setNewPassword] = useState('');
@@ -105,6 +110,8 @@ export function ConfigPage() {
         setConfig(fresh);
         setPersistedConcurrency(fresh.limits.max_concurrent_requests);
         setConcurrencyMessage(null);
+        setPersistedPlatformDefault(fresh.platform?.default ?? null);
+        setPlatformMessage(null);
       })
       .catch(() => setMessage({ type: 'err', text: t('config.loadFailed') }));
   };
@@ -118,6 +125,9 @@ export function ConfigPage() {
   const valid = isValidMaxConcurrentRequests(config.limits.max_concurrent_requests);
   const concurrencyDirty =
     persistedConcurrency !== null && persistedConcurrency !== config.limits.max_concurrent_requests;
+  const platformDirty =
+    persistedPlatformDefault !== null &&
+    defaultPlatform.default !== persistedPlatformDefault;
 
   const update = <T,>(path: string[], value: T) => {
     setConfig((prev) => {
@@ -207,6 +217,27 @@ export function ConfigPage() {
       });
     } finally {
       setSavingConcurrency(false);
+    }
+  };
+
+  const handleSavePlatform = async () => {
+    const next = defaultPlatform;
+    setSavingPlatform(true);
+    setPlatformMessage(null);
+    try {
+      const fresh = await apiSavePlatform(next);
+      setConfig(fresh);
+      setPersistedPlatformDefault(fresh.platform?.default ?? next.default);
+      setPlatformMessage({ type: 'ok', text: t('config.platform.switched') });
+    } catch (e: unknown) {
+      setPlatformMessage({
+        type: 'err',
+        text: t('config.platform.switchFailed', {
+          error: e instanceof Error ? e.message : String(e),
+        }),
+      });
+    } finally {
+      setSavingPlatform(false);
     }
   };
 
@@ -559,6 +590,28 @@ export function ConfigPage() {
               <option value="ouyi8">{t('config.platform.ouyi8')}</option>
               <option value="ouyi7">{t('config.platform.ouyi7')}</option>
             </select>
+            <p className="mt-1 text-xs text-muted-foreground">
+              {t('config.platform.switchHint')}
+            </p>
+            <div className="mt-2 flex items-center gap-2">
+              <Button
+                type="button"
+                size="sm"
+                onClick={handleSavePlatform}
+                disabled={!platformDirty || savingPlatform || saving}
+              >
+                <PlugZap className="h-4 w-4 mr-1" />
+                {savingPlatform ? t('config.platform.switching') : t('config.platform.switchSave')}
+              </Button>
+              {platformDirty && !savingPlatform && (
+                <span className="text-xs text-amber-600">{t('config.platform.dirty')}</span>
+              )}
+            </div>
+            {platformMessage && (
+              <p className={`mt-2 text-xs ${platformMessage.type === 'err' ? 'text-destructive' : 'text-green-700'}`}>
+                {platformMessage.text}
+              </p>
+            )}
           </div>
           <div className="flex items-center gap-2 pt-6">
             <label className="text-sm text-muted-foreground">{t('config.platform.promptOnStart')}</label>
@@ -566,6 +619,9 @@ export function ConfigPage() {
               checked={defaultPlatform.prompt_on_start}
               onCheckedChange={(checked) => update(['platform'], { ...defaultPlatform, prompt_on_start: checked })}
             />
+            <p className="text-xs text-muted-foreground mt-1 md:block hidden">
+              {t('config.platform.promptOnStartHint')}
+            </p>
           </div>
         </div>
       </Section>

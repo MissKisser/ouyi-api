@@ -324,6 +324,21 @@ export async function apiSaveConcurrencyLimit(value: number): Promise<FullConfig
   return fresh;
 }
 
+/**
+ * 切换平台（即时生效，无需重启）。把 platform 配置作为 PUT body 提交，
+ * 后端 prepare_and_commit_config_update 会重建 ouyi_client、切换 state.platform、
+ * 触发模型列表重载。保存后立即拉取最新配置并校验 default 已落盘。
+ */
+export async function apiSavePlatform(platform: PlatformConfig): Promise<FullConfig> {
+  await apiSaveConfig({ platform });
+  const fresh = await apiFetchConfig();
+  const persisted = fresh.platform?.default;
+  if (persisted !== platform.default) {
+    throw new Error('Platform switch was not persisted');
+  }
+  return fresh;
+}
+
 export async function apiTestToolRuntime(config: ToolRuntimeConfig): Promise<ToolRuntimeTestResponse> {
   return apiFetch<ToolRuntimeTestResponse>('/admin/api/tool-runtime/test', {
     method: 'POST',

@@ -505,4 +505,127 @@ prompt_on_start = false
             .unwrap()
             .unwrap();
     }
+
+    /// 网页"切换平台"：把 platform.default 从 Ouyi8 改为 Ouyi7 时，
+    /// 写盘成功后应立即更新 state.platform、state.ouyi_client（变体切换为 V7）、
+    /// state.platform_status。这是无需重启的核心保证。
+    #[tokio::test]
+    async fn platform_switch_updates_runtime_platform_client_and_status() {
+        let state = make_test_state_with_limit(0);
+        // make_test_state 默认 platform = Ouyi8、ouyi_v7 = None
+        assert_eq!(*state.platform.read().await, OuyiPlatform::Ouyi8);
+        let config_file = TempFileGuard::new("platform-switch");
+        write_complete_test_config(&config_file.0, 0);
+        let update = serde_json::from_value(json!({
+            "platform": {"default": "ouyi7", "prompt_on_start": false}
+        }))
+        .unwrap();
+
+        handlers::prepare_and_commit_config_update(&state, &config_file.0, update)
+            .await
+            .unwrap();
+
+        // state.platform 已切换
+        assert_eq!(*state.platform.read().await, OuyiPlatform::Ouyi7);
+        // state.ouyi_client 已重建为 V7 变体
+        assert!(matches!(
+            *state.ouyi_client.read().await,
+            crate::client::OuyiClient::V7(_)
+        ));
+        // platform_status 同步
+        let status = state.platform_status.read().await;
+        assert_eq!(status.platform, OuyiPlatform::Ouyi7);
+        assert_eq!(status.label, "Ouyi 7.0");
+        // 持久化的 config 也带上新 default
+        assert_eq!(
+            state.config.read().await.platform.as_ref().unwrap().default,
+            OuyiPlatform::Ouyi7
+        );
+    }
+
+    /// 同平台改 token：用户没切换平台时（platform.default 与活动平台一致），
+    /// 仍走旧的"同平台 client 重建"分支。
+    #[tokio::test]
+    async fn platform_default_unchanged_keeps_legacy_same_platform_rebuild() {
+        let state = make_test_state_with_limit(0);
+        // 活动 platform 是 Ouyi8
+        let config_file = TempFileGuard::new("platform-same");
+        write_complete_test_config(&config_file.0, 0);
+        let update = serde_json::from_value(json!({
+            "deepseek": {"jwt_token": "refreshed-ouyi8-jwt"}
+        }))
+        .unwrap();
+
+        handlers::prepare_and_commit_config_update(&state, &config_file.0, update)
+            .await
+            .unwrap();
+
+        // 平台没变
+        assert_eq!(*state.platform.read().await, OuyiPlatform::Ouyi8);
+        // client 仍是 V8（同平台重建，不切换变体）
+        assert!(matches!(
+            *state.ouyi_client.read().await,
+            crate::client::OuyiClient::V8(_)
+        ));
+    }
+
+    /// 切换到目标平台与当前活动平台相同时，不应触发重建（幂等）。
+    #[tokio::test]
+    async fn platform_switch_to_same_active_platform_is_noop() {
+        let state = make_test_state_with_limit(0);
+        let config_file = TempFileGuard::new("platform-noop");
+        write_complete_test_config(&config_file.0, 0);
+        let update = serde_json::from_value(json!({
+            "platform": {"default": "ouyi8", "prompt_on_start": false}
+        }))
+        .unwrap();
+
+        handlers::prepare_and_commit_config_update(&state, &config_file.0, update)
+            .await
+            .unwrap();
+
+        assert_eq!(*state.platform.read().await, OuyiPlatform::Ouyi8);
+        // 没有切换意图，client 不应被重建（这里只能间接验证——不 panic、不切换变体）
+        assert!(matches!(
+            *state.ouyi_client.read().await,
+            crate::client::OuyiClient::V8(_)
+        ));
+    }
+
+    /// 回归测试：当 config.toml 没有 [platform] 段（config.platform = None）
+    /// 但服务已用默认平台启动时，GET /admin/api/config 必须返回非 null 的
+    /// platform.default（与当前活动平台一致），否则前端的 persistedPlatformDefault=null
+    /// 会导致"立即切换平台"按钮永远灰色（即使选了不同的平台）。
+    #[tokio::test]
+    async fn admin_config_returns_active_platform_when_config_section_missing() {
+        let state = make_test_state_with_limit(0);
+        // 模拟 yn8 生产现状：config.toml 无 [platform] 段，但 state.platform = Ouyi8
+        state.config.write().await.platform = None;
+        let token = admin_token(&state).await;
+        let (base_url, server) = spawn_admin_server(state).await;
+
+        let response = reqwest::Client::builder()
+            .no_proxy()
+            .build()
+            .unwrap()
+            .get(format!("{base_url}/admin/api/config"))
+            .bearer_auth(token)
+            .send()
+            .await
+            .unwrap();
+        server.abort();
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let body: Value = response.json().await.unwrap();
+        // platform 不能是 null
+        assert!(
+            body["platform"].is_object(),
+            "platform 应该是非 null 对象，实际: {}",
+            body["platform"]
+        );
+        // default 必须等于当前活动平台 Ouyi8（即 "ouyi8"）
+        assert_eq!(body["platform"]["default"], "ouyi8");
+        // prompt_on_start 缺省为 true（与 PlatformConfig 的兜底一致）
+        assert_eq!(body["platform"]["prompt_on_start"], true);
+    }
 }

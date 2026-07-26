@@ -524,7 +524,7 @@ async fn responses_v7_tools(
     };
 
     let pipeline_out = crate::tool_runtime::pipeline::run_openai_tool_pipeline(
-        &state, &chat_req, text, "ouyi7", start_time,
+        &state, &chat_req, text, platform_key, start_time,
     )
     .await?;
 

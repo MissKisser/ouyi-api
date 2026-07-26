@@ -77,7 +77,7 @@
       "server": "Server",
       "ouyi": "Ouyi API",
       "ouyi7": "Ouyi 7.0 API",
-      "platform": "Startup Platform",
+      "platform": "Platform Switch",
       "limits": "Concurrency Limits",
       "deepseek": "DeepSeek",
       "models": "Model Types",
@@ -155,8 +155,15 @@
       "streamChunkChars": "Simulated stream chunk chars"
     },
     "platform": {
-      "default": "Default Platform",
+      "default": "Current Platform",
+      "switchHint": "Pick a target platform and click below to switch instantly without restarting. The model list refreshes automatically.",
+      "switchSave": "Switch platform now",
+      "switching": "Switching…",
+      "dirty": "Switch not applied yet",
+      "switched": "Platform switched and active.",
+      "switchFailed": "Failed to switch platform: {{error}}",
       "promptOnStart": "Prompt on startup",
+      "promptOnStartHint": "Only affects local terminal startup; web switching is independent of this toggle.",
       "ouyi7": "Ouyi 7.0",
       "ouyi8": "Ouyi 8.0"
     },

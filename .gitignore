@@ -13,6 +13,9 @@ config.toml
 # Claude Code 本地配置和缓存
 .claude/
 
+# ZCode agent 本地 plans/缓存
+.zcode/
+
 # oh-my-claudecode 开发工具目录
 .omc/
 

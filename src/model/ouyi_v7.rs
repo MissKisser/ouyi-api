@@ -29,6 +29,11 @@ pub struct GroupInfo {
 pub struct Privilege {
     #[serde(rename = "customAIModels", default)]
     pub custom_ai_models: Vec<String>,
+    /// 标准模型（数字 value 数组，对应 sysEnum 里的 value，作为 roleId 路由）
+    /// 实地 JWT 探测确认：customAIModels 走 roleId=1+params.model，
+    /// aiModels 走 roleId=value（如 gpt-4o value=35 → roleId=35）。
+    #[serde(rename = "aiModels", default)]
+    pub ai_models: Vec<i64>,
 }
 
 /// 系统枚举项（模型列表）

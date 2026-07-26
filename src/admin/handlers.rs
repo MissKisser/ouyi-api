@@ -393,6 +393,11 @@ pub struct FullConfigResponse {
 pub async fn admin_config(State(state): State<Arc<AppState>>) -> impl IntoResponse {
     let store = state.admin_store.read().await;
     let config = state.config.read().await.clone();
+    // 读 current active platform 作兜底：如果 config.toml 没有 [platform] 段
+    // （config.platform = None），用 state.platform 保证返回的 platform.default
+    // 总与"当前实际活动平台"一致，避免前端 persistedPlatformDefault=null 导致
+    // 平台切换按钮永远灰色。
+    let active_platform = *state.platform.read().await;
     let accounts = state.account_store.get_accounts().await;
 
     let account_values: Vec<serde_json::Value> = accounts
@@ -497,12 +502,17 @@ pub async fn admin_config(State(state): State<Arc<AppState>>) -> impl IntoRespon
         api_keys: vec![],
         tool_runtime: tool_runtime_view,
         openai_tool_runtime: openai_tool_runtime_view,
-        platform: config.platform.as_ref().map(|p| PlatformConfigView {
-            default: serde_json::to_string(&p.default)
-                .unwrap_or_default()
-                .trim_matches('"')
-                .to_string(),
-            prompt_on_start: p.prompt_on_start,
+        platform: Some({
+            let p = config.platform.as_ref();
+            let default = p.map(|p| p.default).unwrap_or(active_platform);
+            let prompt_on_start = p.map(|p| p.prompt_on_start).unwrap_or(true);
+            PlatformConfigView {
+                default: serde_json::to_string(&default)
+                    .unwrap_or_default()
+                    .trim_matches('"')
+                    .to_string(),
+                prompt_on_start,
+            }
         }),
         ouyi_v7: config.ouyi_v7.as_ref().map(|v7| {
             let jwt_masked = if v7.jwt_token.len() > 20 {
@@ -1035,6 +1045,9 @@ pub(super) async fn prepare_and_commit_config_update(
     let mut deepseek_changed = false;
     let mut v7_changed = false;
     let mut new_password_hash = None;
+    // 运行时平台切换意图：用户在网页切换"当前平台"时，目标平台。
+    // 仅当解析后的目标平台与当前活动平台不同时才会触发重建。
+    let mut platform_switch_target: Option<crate::platform::OuyiPlatform> = None;
 
     if let Some(limits) = update.limits.as_ref()
         && let Some(value) = limits.max_concurrent_requests
@@ -1165,6 +1178,12 @@ pub(super) async fn prepare_and_commit_config_update(
         if let Some(prompt_on_start) = platform_update.prompt_on_start {
             platform.prompt_on_start = prompt_on_start;
         }
+        // 网页"切换平台"语义：只要 default 与当前活动平台不同，就触发运行时切换。
+        // active_platform 在副作用段读取，这里只记录意图，等写盘成功后才真正切换。
+        let active_now = *state.platform.read().await;
+        if platform.default != active_now {
+            platform_switch_target = Some(platform.default);
+        }
         candidate.platform = Some(platform);
     }
 
@@ -1210,29 +1229,82 @@ pub(super) async fn prepare_and_commit_config_update(
         store.set_password_hash(password_hash.clone());
     }
 
-    let active_platform = *state.platform.read().await;
-    if deepseek_changed && active_platform == crate::platform::OuyiPlatform::Ouyi8 {
-        let new_client = OuyiHttpClient::new(
-            state.http_client.clone(),
-            persisted.ouyi.base_url.clone(),
-            persisted.ouyi.jwt_token.clone(),
-            persisted.ouyi.app_version.clone(),
-        );
-        *state.ouyi_client.write().await = crate::client::OuyiClient::V8(new_client);
-        state.platform_status.write().await.base_url = persisted.ouyi.base_url.clone();
-    }
-    if v7_changed
-        && active_platform == crate::platform::OuyiPlatform::Ouyi7
-        && let Some(v7) = persisted.ouyi_v7.clone()
-    {
-        let new_client = crate::client::ouyi_v7::Ouyi7HttpClient::new(
-            state.http_client.clone(),
-            v7.base_url.clone(),
-            v7.chatapi_prefix.clone(),
-            v7.jwt_token.clone(),
-        );
-        *state.ouyi_client.write().await = crate::client::OuyiClient::V7(new_client);
-        state.platform_status.write().await.base_url = v7.base_url;
+    // 运行时平台切换（网页"切换平台"按钮）：用 persisted config 全量重建目标平台的
+    // client —— 这覆盖了"同平台改 token"的局部重建路径，因为新 client 已经包含
+    // 所有配置改动。仅当用户在 platform.default 字段实际改了选择时才走这条路径。
+    if let Some(target) = platform_switch_target {
+        // 用最新配置构造目标平台的 client
+        let new_client =
+            crate::build_ouyi_client(&state.http_client, &persisted, target);
+        let new_base_url = match &new_client {
+            crate::client::OuyiClient::V7(v7) => v7.base_url().to_string(),
+            crate::client::OuyiClient::V8(_) => persisted.ouyi.base_url.clone(),
+        };
+        // 切换：先写 client，再切换 platform 标记，最后刷 platform_status
+        *state.ouyi_client.write().await = new_client;
+        *state.platform.write().await = target;
+        {
+            let mut status = state.platform_status.write().await;
+            status.platform = target;
+            status.label = target.label().to_string();
+            status.base_url = new_base_url.clone();
+            status.last_selected_at = chrono::Utc::now();
+            // 切换后 token 是否有效要由后续 catalog 加载判定；先标记为未知
+            status.token_valid = false;
+            status.model_count = 0;
+        }
+        tracing::info!(target = target.label(), "已运行时切换平台");
+
+        // 后台触发一次模型列表重载（不阻塞响应）。失败也不影响切换本身，
+        // 后台刷新任务会在下个 tick 兜底。
+        let reload_state = Arc::clone(state);
+        tokio::spawn(async move {
+            let client = reload_state.ouyi_client.read().await;
+            match crate::load_platform_catalog(&client).await {
+                Ok(catalog) => {
+                    let count = catalog.models.len();
+                    // V7：把路由表同步给 client（customAIModels/aiModels 的路由决策）
+                    if let crate::client::OuyiClient::V7(v7) = &*client {
+                        let table = crate::client::ouyi_v7::build_routing_table_from_catalog(&catalog);
+                        v7.update_routing(table);
+                    }
+                    reload_state.model_mapper.load_from_catalog(&catalog);
+                    let mut status = reload_state.platform_status.write().await;
+                    status.model_count = reload_state.model_mapper.model_count();
+                    status.token_valid = count > 0;
+                    tracing::info!(platform = status.platform.label(), count, "切换平台后模型列表已刷新");
+                }
+                Err(e) => {
+                    tracing::warn!(error = %e, "切换平台后模型列表加载失败，等待后台刷新任务兜底");
+                }
+            }
+        });
+    } else {
+        // 没有切换平台，沿用旧路径：仅当当前活动平台的 token/base_url 变了才重建同平台 client
+        let active_platform = *state.platform.read().await;
+        if deepseek_changed && active_platform == crate::platform::OuyiPlatform::Ouyi8 {
+            let new_client = OuyiHttpClient::new(
+                state.http_client.clone(),
+                persisted.ouyi.base_url.clone(),
+                persisted.ouyi.jwt_token.clone(),
+                persisted.ouyi.app_version.clone(),
+            );
+            *state.ouyi_client.write().await = crate::client::OuyiClient::V8(new_client);
+            state.platform_status.write().await.base_url = persisted.ouyi.base_url.clone();
+        }
+        if v7_changed
+            && active_platform == crate::platform::OuyiPlatform::Ouyi7
+            && let Some(v7) = persisted.ouyi_v7.clone()
+        {
+            let new_client = crate::client::ouyi_v7::Ouyi7HttpClient::new(
+                state.http_client.clone(),
+                v7.base_url.clone(),
+                v7.chatapi_prefix.clone(),
+                v7.jwt_token.clone(),
+            );
+            *state.ouyi_client.write().await = crate::client::OuyiClient::V7(new_client);
+            state.platform_status.write().await.base_url = v7.base_url;
+        }
     }
 
     Ok(PreparedConfigUpdate {
