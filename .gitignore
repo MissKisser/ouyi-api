@@ -36,3 +36,7 @@ logs/
 # 临时文件
 *.tmp
 *.temp
+
+# 部署 staging 目录（可能含真实 JWT / 密钥）
+deploy-staging/
+deploy-build/

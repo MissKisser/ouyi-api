@@ -1,0 +1,138 @@
+# syntax=docker/dockerfile:1.7
+#
+# ouyi-api production image — multi-stage build (yn8 2026-07-26)
+# ----------------------------------------------------------------
+# Use this variant when neither a prebuilt binary nor host-side
+# rustc/cargo are available on the deployment host. yn8 currently
+# has docker but no cargo / node / rustup.
+#
+# Build:
+#   DOCKER_BUILDKIT=1 docker build \
+#     --build-arg BASE_REGISTRY=docker.1ms.run/library \
+#     -t ouyi-api:latest -f Dockerfile.multi .
+#
+# Lessons baked in (see docs/deployments/2026-07-22-yun8-docker-migration.md):
+#   1. docker buildx does NOT honour /etc/docker/daemon.json
+#      registry-mirrors when pulling FROM images. Always pass
+#      BASE_REGISTRY explicitly.
+#   2. Containerised apt update against deb.debian.org's Fastly CDN
+#      stalls under BuildKit's network namespace (single GET hangs
+#      for minutes while a host-side curl returns instantly). Point
+#      apt at a mainland mirror.
+#   3. Aliyun's /debian/ serves bookworm + bookworm-updates, but
+#      bookworm-security lives under a separate /debian-security/
+#      root that we don't actually need (the runtime pulls only
+#      libssl3 + ca-certificates + tini + wget from main). Drop the
+#      security suite to keep sources.list lean.
+
+ARG BASE_REGISTRY=docker.1ms.run/library
+
+############################
+# Stage 1 — frontend build
+############################
+FROM ${BASE_REGISTRY}/node:22-bookworm-slim AS web-builder
+WORKDIR /web
+
+# web/ is small; no separate mirror needed — npm registry defaults
+# work through the mirror chain. Copy manifests first so `npm ci`
+# cache survives source edits.
+COPY web/package.json web/package-lock.json* ./
+RUN npm ci --no-audit --no-fund
+
+COPY web/ ./
+RUN npm run build
+
+############################
+# Stage 2 — Rust release binary
+############################
+FROM ${BASE_REGISTRY}/rust:1-slim-bookworm AS builder
+
+# Switch apt to Aliyun before running apt-get so the deb.debian.org
+# Fastly CDN stall (see doc above) doesn't deadlock the build.
+RUN set -eux; \
+    rm -f /etc/apt/sources.list.d/debian.sources; \
+    printf 'Types: deb\nURIs: https://mirrors.aliyun.com/debian\nSuites: bookworm bookworm-updates\nComponents: main\nSigned-By: /usr/share/keyrings/debian-archive-keyring.gpg\n' \
+      > /etc/apt/sources.list.d/aliyun.sources
+
+WORKDIR /src
+
+# cargo registry: crates.io / index.crates.io are unreachable from yn8,
+# redirect through USTC's sparse mirror (HTTP-only — no git fetch).
+# The `sparse+` URL prefix tells cargo to use the sparse index protocol
+# (HTTP GET per package directory), which works through any HTTPS proxy.
+RUN mkdir -p /usr/local/cargo \
+ && printf '%s\n' \
+        '[source.crates-io]' \
+        'replace-with = "ustc"' \
+        '' \
+        '[source.ustc]' \
+        'registry = "sparse+https://mirrors.ustc.edu.cn/crates.io-index/"' \
+    > /usr/local/cargo/config.toml
+ENV CARGO_HOME=/usr/local/cargo \
+    CARGO_REGISTRIES_CRATES_IO_PROTOCOL=sparse
+
+RUN apt-get update \
+ && apt-get install -y --no-install-recommends \
+        pkg-config libssl-dev ca-certificates \
+ && rm -rf /var/lib/apt/lists/*
+
+# Dependency caching layer: copy only Cargo.toml / Cargo.lock first.
+COPY Cargo.toml Cargo.lock ./
+RUN mkdir -p src \
+ && echo 'fn main() { println!("placeholder"); }' > src/main.rs \
+ && cargo build --release \
+ && rm -rf src target/release/deps/ouyi_api* target/release/ouyi-api
+
+# Real source on top of cached deps.
+# `#[derive(RustEmbed)]` reads web/dist at compile time; rust-embed
+# fails the build if the folder is missing. The web-builder stage
+# already produced /web/dist; copy it into the source tree so the
+# embed macro can locate it.
+COPY src ./src
+COPY --from=web-builder /web/dist ./web/dist
+RUN cargo build --release \
+ && strip target/release/ouyi-api
+
+############################
+# Stage 3 — runtime
+############################
+FROM ${BASE_REGISTRY}/debian:bookworm-slim AS runtime
+
+# Same Aliyun mirror — but the bookworm-slim base has no
+# ca-certificates yet, so apt over HTTPS fails with "No system
+# certificates available". Use the HTTP mirror URL instead.
+RUN set -eux; \
+    rm -f /etc/apt/sources.list.d/debian.sources; \
+    printf 'Types: deb\nURIs: http://mirrors.aliyun.com/debian\nSuites: bookworm bookworm-updates\nComponents: main\nSigned-By: /usr/share/keyrings/debian-archive-keyring.gpg\n' \
+      > /etc/apt/sources.list.d/aliyun.sources
+
+RUN apt-get update \
+ && apt-get install -y --no-install-recommends \
+        libssl3 ca-certificates tini wget \
+ && rm -rf /var/lib/apt/lists/* \
+ && groupadd --system --gid 1000 app \
+ && useradd  --system --uid 1000 --gid app --no-create-home --shell /usr/sbin/nologin app
+
+ENV LANG=C.UTF-8 \
+    LC_ALL=C.UTF-8 \
+    SERVER_HOST=0.0.0.0 \
+    SERVER_PORT=4117 \
+    OUYI_CONFIG=/app/config/config.toml \
+    RUST_LOG=info
+
+WORKDIR /app
+
+COPY --from=web-builder /web/dist ./web/dist
+COPY --from=builder   /src/target/release/ouyi-api ./ouyi-api
+
+RUN mkdir -p /app/config && chown -R app:app /app
+VOLUME ["/app/config"]
+EXPOSE 4117
+
+USER app
+
+HEALTHCHECK --interval=30s --timeout=5s --start-period=30s --retries=3 \
+    CMD wget -qO- "http://127.0.0.1:${SERVER_PORT}/v1/models" >/dev/null || exit 1
+
+ENTRYPOINT ["/usr/bin/tini", "--"]
+CMD ["./ouyi-api"]
