@@ -259,7 +259,9 @@ pub async fn compile_tool_decision_with_usage_and_payloads(
         model: req.model.clone(),
         transcript,
         tools: tool_specs,
-        tool_choice: None,
+        tool_choice: crate::tool_runtime::protocol::anthropic_tool_choice_to_spec(
+            req.tool_choice.as_ref(),
+        ),
         payloads,
     };
 
@@ -1024,5 +1026,70 @@ mod tests {
             }
             CompilerDecision::FinalAnswer => panic!("expected retry tool call"),
         }
+    }
+
+    #[tokio::test]
+    async fn test_anthropic_compiler_receives_real_forced_tool_choice() {
+        use axum::{Json, Router, routing::post};
+        use tokio::net::TcpListener;
+
+        async fn handler(Json(body): Json<serde_json::Value>) -> Json<serde_json::Value> {
+            assert_eq!(body["tool_choice"]["type"], "any");
+            Json(serde_json::json!({
+                "content": [],
+                "usage": {"input_tokens": 1, "output_tokens": 0}
+            }))
+        }
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            axum::serve(listener, Router::new().route("/v1/messages", post(handler)))
+                .await
+                .unwrap();
+        });
+        let req = MessagesRequest {
+            model: "claude-test".to_string(),
+            messages: vec![crate::model::anthropic::AnthropicMessage {
+                role: "user".to_string(),
+                content: crate::model::anthropic::AnthropicContent::Text("run".to_string()),
+            }],
+            system: None,
+            max_tokens: 128,
+            stream: Some(false),
+            tools: Some(vec![AnthropicTool {
+                name: "Bash".to_string(),
+                description: "Run shell command".to_string(),
+                input_schema: serde_json::json!({"type": "object"}),
+            }]),
+            temperature: None,
+            top_p: None,
+            top_k: None,
+            stop_sequences: None,
+            thinking: None,
+            tool_choice: Some(crate::model::anthropic::ToolChoice::Any),
+        };
+        let config = ToolRuntimeConfig {
+            enabled: true,
+            mode: crate::config::ToolRuntimeMode::Compiler,
+            provider: ToolRuntimeProvider::Anthropic,
+            base_url: Some(format!("http://{addr}")),
+            api_key: Some("test-key".to_string()),
+            api_key_env: None,
+            model: Some("tool-model".to_string()),
+            timeout_secs: 5,
+        };
+
+        let result = compile_tool_decision_with_usage_and_payloads(
+            reqwest::Client::builder().no_proxy().build().unwrap(),
+            &config,
+            &req,
+            "no marked call",
+            Vec::new(),
+        )
+        .await
+        .unwrap();
+
+        assert!(matches!(result.decision, CompilerDecision::FinalAnswer));
     }
 }

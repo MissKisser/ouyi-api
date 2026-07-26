@@ -655,12 +655,7 @@ async fn handle_non_stream_response(
 }
 
 fn uuid_short() -> String {
-    use std::time::{SystemTime, UNIX_EPOCH};
-    let ts = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_nanos();
-    format!("{:x}", ts % 0xFFFFFF)
+    uuid::Uuid::new_v4().simple().to_string()
 }
 
 /// 检查是否有长时任务需要轮询，如果有则生成轮询响应
@@ -953,7 +948,7 @@ async fn handle_openai_tools_response(
 async fn handle_openai_tools_plain_output(
     state: Arc<AppState>,
     req: ChatCompletionRequest,
-    _model_full: String,
+    model_full: String,
     short_model: String,
     ouyi_output: String,
     prompt_tokens: u64,
@@ -964,14 +959,21 @@ async fn handle_openai_tools_plain_output(
     let task_id = format!("chatcmpl-{}", uuid_short());
     let elapsed = start_time.elapsed().as_millis() as u64;
 
-    let pipeline_out = crate::tool_runtime::pipeline::run_openai_tool_pipeline(
+    let pipeline_out = match crate::tool_runtime::pipeline::run_openai_tool_pipeline(
         &state,
         &req,
         ouyi_output,
         platform_key,
         start_time,
     )
-    .await?;
+    .await
+    {
+        Ok(output) => output,
+        Err(error) => {
+            record_chat_error(&state, start_time, &model_full, &error, platform_key);
+            return Err(error);
+        }
+    };
 
     match pipeline_out {
         crate::tool_runtime::pipeline::PipelineOutput::ToolCalls { calls, meta: _ } => {
@@ -1064,6 +1066,15 @@ mod tests {
         ToolRuntimeConfig, ToolRuntimeMode, ToolRuntimeProvider,
     };
     use crate::model::mapper::ModelMapper;
+
+    #[test]
+    fn test_uuid_short_uses_full_uuid_entropy() {
+        let first = uuid_short();
+        let second = uuid_short();
+        assert_ne!(first, second);
+        assert!(first.len() > 6);
+        assert!(second.len() > 6);
+    }
     use crate::model::openai::{ChatMessage, ToolDef, ToolFunction};
     use axum::Router;
     use axum::body::Body;
@@ -1395,6 +1406,37 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_tool_pipeline_error_records_failed_request() {
+        let mut config = test_config(
+            "http://127.0.0.1:1".to_string(),
+            "http://127.0.0.1:2".to_string(),
+        );
+        config.openai_tool_runtime = None;
+        let state = make_test_state(config);
+        let mut req = openai_request(false);
+        req.tool_choice = Some(json!("required"));
+        state.stats.record_start();
+
+        let err = handle_openai_tools_plain_output(
+            state.clone(),
+            req,
+            "gpt-test".to_string(),
+            "gpt-test".to_string(),
+            "这是最终回答，没有工具调用。".to_string(),
+            0,
+            0,
+            std::time::Instant::now(),
+            "ouyi8",
+        )
+        .await
+        .unwrap_err();
+
+        assert!(matches!(err, AppError::ToolProtocol(_)));
+        assert_eq!(state.stats.stats.active_requests.load(Ordering::Relaxed), 0);
+        assert_eq!(state.stats.stats.failed_requests.load(Ordering::Relaxed), 1);
+    }
+
+    #[tokio::test]
     async fn test_openai_tools_invokes_openai_tool_runtime_when_main_output_needs_compiler() {
         let tool_requests = Arc::new(AtomicUsize::new(0));
         let state = setup_tool_runtime_state(tool_requests.clone()).await;
@@ -1412,6 +1454,11 @@ mod tests {
             value["choices"][0]["message"]["tool_calls"][0]["function"]["name"],
             "Bash"
         );
+        let call_id = value["choices"][0]["message"]["tool_calls"][0]["id"]
+            .as_str()
+            .unwrap();
+        assert!(call_id.starts_with("call_proxy_"));
+        assert_ne!(call_id, "call_from_openai_tool_model");
 
         let logs = state.stats.get_tool_runtime_logs(10);
         assert_eq!(logs.len(), 1);
@@ -1442,7 +1489,8 @@ mod tests {
         let body = response.into_body().collect().await.unwrap().to_bytes();
         let body_text = String::from_utf8(body.to_vec()).unwrap();
         assert!(body_text.contains("\"tool_calls\""));
-        assert!(body_text.contains("call_from_openai_tool_model"));
+        assert!(body_text.contains("call_proxy_"));
+        assert!(!body_text.contains("call_from_openai_tool_model"));
         assert!(body_text.contains("[DONE]"));
     }
 

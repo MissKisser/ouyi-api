@@ -30,6 +30,75 @@ pub enum ToolChoiceSpec {
     Tool(String),
 }
 
+pub fn anthropic_tool_choice_to_spec(
+    choice: Option<&crate::model::anthropic::ToolChoice>,
+) -> Option<ToolChoiceSpec> {
+    match choice {
+        Some(crate::model::anthropic::ToolChoice::Auto) => Some(ToolChoiceSpec::Auto),
+        Some(crate::model::anthropic::ToolChoice::Any) => Some(ToolChoiceSpec::Required),
+        Some(crate::model::anthropic::ToolChoice::Tool { name }) => {
+            Some(ToolChoiceSpec::Tool(name.clone()))
+        }
+        None => None,
+    }
+}
+
+pub fn openai_tool_choice_to_spec(choice: Option<&serde_json::Value>) -> Option<ToolChoiceSpec> {
+    choice.and_then(|tool_choice| {
+        if let Some(value) = tool_choice.as_str() {
+            match value {
+                "auto" => Some(ToolChoiceSpec::Auto),
+                "required" => Some(ToolChoiceSpec::Required),
+                _ => Some(ToolChoiceSpec::Auto),
+            }
+        } else if let Some(object) = tool_choice.as_object() {
+            object
+                .get("function")
+                .and_then(|function| function.get("name"))
+                .or_else(|| object.get("name"))
+                .and_then(|name| name.as_str())
+                .map(|name| ToolChoiceSpec::Tool(name.to_string()))
+                .or(Some(ToolChoiceSpec::Auto))
+        } else {
+            Some(ToolChoiceSpec::Auto)
+        }
+    })
+}
+
+pub fn validate_tool_choice(
+    choice: Option<&ToolChoiceSpec>,
+    actual_names: &[String],
+) -> Result<(), crate::error::AppError> {
+    let expected = match choice {
+        Some(ToolChoiceSpec::Required) if actual_names.is_empty() => Some("required".to_string()),
+        Some(ToolChoiceSpec::Tool(name))
+            if actual_names.is_empty() || actual_names.iter().any(|actual| actual != name) =>
+        {
+            Some(name.clone())
+        }
+        _ => None,
+    };
+
+    if let Some(expected) = expected {
+        let actual = if actual_names.is_empty() {
+            "<none>".to_string()
+        } else {
+            actual_names.join(",")
+        };
+        return Err(crate::error::AppError::ToolProtocol(format!(
+            "工具选择约束不满足: expected={expected}, actual={actual}"
+        )));
+    }
+
+    Ok(())
+}
+
+pub fn normalize_tool_call_ids<'a>(ids: impl IntoIterator<Item = &'a mut String>) {
+    for id in ids {
+        *id = format!("call_proxy_{}", uuid::Uuid::new_v4().simple());
+    }
+}
+
 /// 工具运行时请求上下文，用于抽象不同端点的工具编译
 #[derive(Debug, Clone)]
 pub struct ToolRuntimeRequestContext {
@@ -79,27 +148,7 @@ pub fn openai_request_to_context(
     let transcript = crate::tool_runtime::context::from_openai_chat(req)
         .map_err(crate::error::AppError::BadRequest)?;
 
-    let tool_choice = req.tool_choice.as_ref().and_then(|tc| {
-        if let Some(str_val) = tc.as_str() {
-            match str_val {
-                "auto" => Some(ToolChoiceSpec::Auto),
-                "required" => Some(ToolChoiceSpec::Required),
-                _ => Some(ToolChoiceSpec::Auto),
-            }
-        } else if let Some(obj) = tc.as_object() {
-            if let Some(func) = obj.get("function") {
-                if let Some(name) = func.get("name").and_then(|n| n.as_str()) {
-                    Some(ToolChoiceSpec::Tool(name.to_string()))
-                } else {
-                    Some(ToolChoiceSpec::Auto)
-                }
-            } else {
-                Some(ToolChoiceSpec::Auto)
-            }
-        } else {
-            Some(ToolChoiceSpec::Auto)
-        }
-    });
+    let tool_choice = openai_tool_choice_to_spec(req.tool_choice.as_ref());
 
     Ok(ToolRuntimeRequestContext {
         endpoint: ToolEndpointKind::OpenAi,
@@ -114,6 +163,7 @@ pub fn openai_request_to_context(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::model::anthropic::ToolChoice as AnthropicToolChoice;
     use crate::model::openai::{ChatCompletionRequest, ChatMessage, ToolFunction};
 
     #[test]
@@ -402,5 +452,57 @@ mod tests {
         assert_eq!(ctx.payloads[0].id, "p1");
         ctx.payloads.clear();
         assert!(ctx.payloads.is_empty());
+    }
+
+    #[test]
+    fn test_anthropic_tool_choice_maps_to_runtime_spec() {
+        assert_eq!(
+            anthropic_tool_choice_to_spec(Some(&AnthropicToolChoice::Any)),
+            Some(ToolChoiceSpec::Required)
+        );
+        assert_eq!(
+            anthropic_tool_choice_to_spec(Some(&AnthropicToolChoice::Tool {
+                name: "Read".to_string(),
+            })),
+            Some(ToolChoiceSpec::Tool("Read".to_string()))
+        );
+        assert_eq!(
+            anthropic_tool_choice_to_spec(Some(&AnthropicToolChoice::Auto)),
+            Some(ToolChoiceSpec::Auto)
+        );
+    }
+
+    #[test]
+    fn test_responses_style_function_choice_maps_to_named_tool() {
+        let choice = serde_json::json!({"type": "function", "name": "Read"});
+        assert_eq!(
+            openai_tool_choice_to_spec(Some(&choice)),
+            Some(ToolChoiceSpec::Tool("Read".to_string()))
+        );
+    }
+
+    #[test]
+    fn test_forced_tool_choice_rejects_missing_or_wrong_calls() {
+        let err = validate_tool_choice(Some(&ToolChoiceSpec::Required), &[]).unwrap_err();
+        assert!(
+            matches!(err, crate::error::AppError::ToolProtocol(message) if message.contains("expected=required") && message.contains("actual=<none>"))
+        );
+
+        let err = validate_tool_choice(
+            Some(&ToolChoiceSpec::Tool("Read".to_string())),
+            &["Bash".to_string()],
+        )
+        .unwrap_err();
+        assert!(
+            matches!(err, crate::error::AppError::ToolProtocol(message) if message.contains("expected=Read") && message.contains("actual=Bash"))
+        );
+    }
+
+    #[test]
+    fn test_normalize_provider_call_ids_discards_duplicate_provider_ids() {
+        let mut ids = ["call_0".to_string(), "call_0".to_string()];
+        normalize_tool_call_ids(ids.iter_mut());
+        assert_ne!(ids[0], ids[1]);
+        assert!(ids.iter().all(|id| id.starts_with("call_proxy_")));
     }
 }

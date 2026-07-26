@@ -42,6 +42,7 @@ use tool_runtime::ToolLedger;
 pub struct CachedToolSession {
     pub session_id: i64,
     pub created_at: std::time::Instant,
+    pub claimed: Arc<std::sync::atomic::AtomicBool>,
 }
 
 pub struct AppState {

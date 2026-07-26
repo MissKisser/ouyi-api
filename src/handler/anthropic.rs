@@ -177,11 +177,26 @@ fn take_cached_tool_session(
             found = Some((removed_key, cached));
         }
     }
-    // 清理所有相关 keys（跨模型复用时可能有多个残留）
-    if found.is_some() {
-        for key in &keys {
-            state.tool_sessions.remove(key);
-        }
+    let claimed = found.as_ref().is_some_and(|(_, cached)| {
+        cached
+            .claimed
+            .compare_exchange(
+                false,
+                true,
+                std::sync::atomic::Ordering::AcqRel,
+                std::sync::atomic::Ordering::Acquire,
+            )
+            .is_ok()
+    });
+    if !claimed {
+        return None;
+    }
+    // 同一上游会话可能同时绑定多个并行 tool_use id；领取任一 alias 后全部失效。
+    if let Some((_, cached)) = &found {
+        let session_id = cached.session_id;
+        state
+            .tool_sessions
+            .retain(|_, entry| entry.session_id != session_id);
     }
     found
 }
@@ -193,6 +208,12 @@ fn insert_cached_tool_session(
     tool_use_id: &str,
     session_id: i64,
 ) {
+    let claimed = state
+        .tool_sessions
+        .iter()
+        .find(|entry| entry.session_id == session_id)
+        .map(|entry| entry.claimed.clone())
+        .unwrap_or_else(|| Arc::new(std::sync::atomic::AtomicBool::new(false)));
     // 只存储全局 key，实现跨模型复用
     let key = global_tool_session_cache_key(tool_use_id);
     state.tool_sessions.insert(
@@ -200,6 +221,7 @@ fn insert_cached_tool_session(
         crate::CachedToolSession {
             session_id,
             created_at: std::time::Instant::now(),
+            claimed,
         },
     );
 }
@@ -1142,8 +1164,11 @@ async fn handle_compiler_tool_runtime_message(
                 broker_started.elapsed().as_millis() as u64,
                 &e.to_string(),
             );
-            tracing::warn!(error = %e, "工具决策异常，返回主脑文本");
-            BrokerDecision::FinalAnswer { usage: None }
+            tracing::warn!(error = %e, "工具决策异常，传播协议错误");
+            record_anthropic_error(&state, start_time, &model_full, &e, "ouyi8");
+            state.active_sessions.remove(&session_id);
+            spawn_session_cleanup(client, session_id);
+            return Err(e);
         }
     };
 
@@ -1397,8 +1422,13 @@ async fn handle_anthropic_tools_plain_output(
                 broker_started.elapsed().as_millis() as u64,
                 &e.to_string(),
             );
-            tracing::warn!(error = %e, "工具决策异常，返回主脑文本");
-            BrokerDecision::FinalAnswer { usage: None }
+            tracing::warn!(error = %e, "工具决策异常，传播协议错误");
+            record_anthropic_error(&state, start_time, &model_full, &e, platform_key);
+            if let Some((client, session_id)) = reusable_session.as_ref() {
+                state.active_sessions.remove(session_id);
+                spawn_session_cleanup(client.clone(), *session_id);
+            }
+            return Err(e);
         }
     };
 
@@ -2137,6 +2167,7 @@ async fn handle_anthropic_stream(
                     crate::CachedToolSession {
                         session_id,
                         created_at: std::time::Instant::now(),
+                        claimed: Arc::new(std::sync::atomic::AtomicBool::new(false)),
                     },
                 );
                 tracing::debug!(session_id, tool_use_id = %tool_id, "缓存工具会话等待 tool_result 回传");
@@ -2305,6 +2336,7 @@ async fn handle_anthropic_non_stream(
                 crate::CachedToolSession {
                     session_id,
                     created_at: std::time::Instant::now(),
+                    claimed: Arc::new(std::sync::atomic::AtomicBool::new(false)),
                 },
             );
             tracing::info!(session_id, tool_use_id = %tool_id, "缓存工具会话等待 tool_result 回传");
@@ -2328,12 +2360,7 @@ async fn handle_anthropic_non_stream(
 }
 
 fn uuid_short() -> String {
-    use std::time::{SystemTime, UNIX_EPOCH};
-    let ts = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_nanos();
-    format!("{:x}", ts % 0xFFFFFF)
+    uuid::Uuid::new_v4().simple().to_string()
 }
 
 #[cfg(test)]
@@ -2346,7 +2373,7 @@ mod tests {
     use http_body_util::BodyExt;
     use serde_json::json;
     use std::sync::Arc;
-    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
     use crate::admin::stats::StatsCollector;
     use crate::admin::{AccountStore, auth::AdminStore};
@@ -2359,6 +2386,15 @@ mod tests {
         AnthropicContent, AnthropicMessage, AnthropicTool, ContentBlock,
     };
     use crate::model::mapper::ModelMapper;
+
+    #[test]
+    fn test_uuid_short_uses_full_uuid_entropy() {
+        let first = uuid_short();
+        let second = uuid_short();
+        assert_ne!(first, second);
+        assert!(first.len() > 6);
+        assert!(second.len() > 6);
+    }
 
     fn make_tool_result_msg(tool_use_id: &str, content: &str) -> AnthropicMessage {
         AnthropicMessage {
@@ -3294,6 +3330,13 @@ mod tests {
         assert_eq!(value["stop_reason"], "tool_use");
         assert_eq!(value["content"][0]["type"], "tool_use");
         assert_eq!(value["content"][0]["name"], "Bash");
+        assert!(
+            value["content"][0]["id"]
+                .as_str()
+                .unwrap()
+                .starts_with("call_proxy_")
+        );
+        assert_ne!(value["content"][0]["id"], "tool_call_from_compiler");
     }
 
     #[tokio::test]
@@ -3333,6 +3376,41 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_forced_any_propagates_compiler_final_answer_as_tool_protocol() {
+        let tool_requests = Arc::new(AtomicUsize::new(0));
+        let ouyi_base_url = spawn_mock_router(
+            Router::new()
+                .route("/api/chat/session", post(ouyi_session_handler))
+                .route("/api/chat/completions", post(ouyi_plain_hello_handler)),
+        )
+        .await;
+        let tool_base_url = spawn_mock_router(
+            Router::new()
+                .route("/chat/completions", post(tool_compiler_final_handler))
+                .with_state(tool_requests.clone()),
+        )
+        .await;
+
+        let state = make_test_state(test_config(ouyi_base_url, tool_base_url));
+        let mut req = make_request_with_tools();
+        req.stream = Some(false);
+        req.tools = Some(vec![bash_tool()]);
+        req.tool_choice = Some(crate::model::anthropic::ToolChoice::Any);
+        let routing = resolve_model_routing(&req.model, &state.model_mapper);
+
+        let err = handle_compiler_tool_runtime_message(state.clone(), req, routing)
+            .await
+            .unwrap_err();
+
+        assert!(
+            matches!(err, AppError::ToolProtocol(message) if message.contains("expected=required") && message.contains("actual=<none>"))
+        );
+        assert_eq!(tool_requests.load(Ordering::SeqCst), 1);
+        assert_eq!(state.stats.stats.active_requests.load(Ordering::Relaxed), 0);
+        assert_eq!(state.stats.stats.failed_requests.load(Ordering::Relaxed), 1);
+    }
+
+    #[tokio::test]
     async fn test_plain_tool_intent_invokes_tool_model() {
         let tool_requests = Arc::new(AtomicUsize::new(0));
         let ouyi_base_url = spawn_mock_router(
@@ -3368,6 +3446,13 @@ mod tests {
         assert_eq!(value["stop_reason"], "tool_use");
         assert_eq!(value["content"][0]["type"], "tool_use");
         assert_eq!(value["content"][0]["name"], "Bash");
+        assert!(
+            value["content"][0]["id"]
+                .as_str()
+                .unwrap()
+                .starts_with("call_proxy_")
+        );
+        assert_ne!(value["content"][0]["id"], "tool_call_from_compiler");
     }
 
     #[tokio::test]
@@ -3482,6 +3567,114 @@ mod tests {
 
         assert_eq!(cached.1.session_id, 42);
         assert!(state.tool_sessions.is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_taking_one_tool_alias_clears_all_parallel_session_aliases() {
+        let state = make_test_state(test_config(
+            "http://127.0.0.1:1".to_string(),
+            "http://127.0.0.1:2".to_string(),
+        ));
+        state.tool_sessions.insert(
+            global_tool_session_cache_key("call_proxy_a"),
+            crate::CachedToolSession {
+                session_id: 99,
+                created_at: std::time::Instant::now(),
+                claimed: Arc::new(AtomicBool::new(false)),
+            },
+        );
+        state.tool_sessions.insert(
+            global_tool_session_cache_key("call_proxy_b"),
+            crate::CachedToolSession {
+                session_id: 99,
+                created_at: std::time::Instant::now(),
+                claimed: Arc::new(AtomicBool::new(false)),
+            },
+        );
+
+        let taken = take_cached_tool_session(&state, "claude-full", "claude-short", "call_proxy_a")
+            .expect("one alias should resolve the shared session");
+        assert_eq!(taken.1.session_id, 99);
+        assert!(state.tool_sessions.is_empty());
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn test_parallel_tool_alias_claim_allows_only_one_session_owner() {
+        for round in 0..32 {
+            let state = make_test_state(test_config(
+                "http://127.0.0.1:1".to_string(),
+                "http://127.0.0.1:2".to_string(),
+            ));
+            let session_id = 10_000 + round;
+            let claimed = Arc::new(AtomicBool::new(false));
+            for index in 0..2048 {
+                state.tool_sessions.insert(
+                    global_tool_session_cache_key(&format!("filler-{index}")),
+                    crate::CachedToolSession {
+                        session_id,
+                        created_at: std::time::Instant::now(),
+                        claimed: claimed.clone(),
+                    },
+                );
+            }
+            for tool_id in ["race-a", "race-b"] {
+                state.tool_sessions.insert(
+                    global_tool_session_cache_key(tool_id),
+                    crate::CachedToolSession {
+                        session_id,
+                        created_at: std::time::Instant::now(),
+                        claimed: claimed.clone(),
+                    },
+                );
+            }
+
+            let barrier = Arc::new(tokio::sync::Barrier::new(2));
+            let left_state = state.clone();
+            let left_barrier = barrier.clone();
+            let left = tokio::spawn(async move {
+                left_barrier.wait().await;
+                take_cached_tool_session(&left_state, "full", "short", "race-a")
+            });
+            let right_state = state.clone();
+            let right = tokio::spawn(async move {
+                barrier.wait().await;
+                take_cached_tool_session(&right_state, "full", "short", "race-b")
+            });
+
+            let (left, right) = tokio::join!(left, right);
+            let owners =
+                usize::from(left.unwrap().is_some()) + usize::from(right.unwrap().is_some());
+            assert_eq!(owners, 1, "round {round} claimed the same session twice");
+        }
+    }
+
+    #[tokio::test]
+    async fn test_normalized_duplicate_provider_ids_do_not_overwrite_tool_sessions() {
+        let state = make_test_state(test_config(
+            "http://127.0.0.1:1".to_string(),
+            "http://127.0.0.1:2".to_string(),
+        ));
+        let mut ids = ["toolu_0".to_string(), "toolu_0".to_string()];
+        crate::tool_runtime::protocol::normalize_tool_call_ids(ids.iter_mut());
+
+        insert_cached_tool_session(&state, "full-a", "short-a", &ids[0], 41);
+        insert_cached_tool_session(&state, "full-b", "short-b", &ids[1], 42);
+
+        assert_eq!(state.tool_sessions.len(), 2);
+        assert_eq!(
+            take_cached_tool_session(&state, "full-a", "short-a", &ids[0])
+                .unwrap()
+                .1
+                .session_id,
+            41
+        );
+        assert_eq!(
+            take_cached_tool_session(&state, "full-b", "short-b", &ids[1])
+                .unwrap()
+                .1
+                .session_id,
+            42
+        );
     }
 
     #[tokio::test]
@@ -3869,7 +4062,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_tool_compiler_bad_arguments_does_not_return_400() {
+    async fn test_tool_compiler_bad_arguments_propagates_original_error() {
         let tool_requests = Arc::new(AtomicUsize::new(0));
         let ouyi_base_url = spawn_mock_router(
             Router::new()
@@ -3893,9 +4086,54 @@ mod tests {
         req.tools = Some(vec![write_tool()]);
         let routing = resolve_model_routing(&req.model, &state.model_mapper);
 
-        let response = handle_compiler_tool_runtime_message(state, req, routing)
+        let err = handle_compiler_tool_runtime_message(state.clone(), req, routing)
             .await
-            .unwrap();
-        assert_ne!(response.status(), axum::http::StatusCode::BAD_REQUEST);
+            .unwrap_err();
+        assert!(
+            matches!(err, AppError::BadRequest(message) if message.contains("参数 JSON 解析失败"))
+        );
+        assert_eq!(state.stats.stats.active_requests.load(Ordering::Relaxed), 0);
+        assert_eq!(state.stats.stats.failed_requests.load(Ordering::Relaxed), 1);
+    }
+
+    #[tokio::test]
+    async fn test_plain_output_broker_error_records_failed_request() {
+        let tool_requests = Arc::new(AtomicUsize::new(0));
+        let tool_base_url = spawn_mock_router(
+            Router::new()
+                .route(
+                    "/chat/completions",
+                    post(tool_compiler_bad_arguments_handler),
+                )
+                .with_state(tool_requests.clone()),
+        )
+        .await;
+        let state = make_test_state(test_config("http://127.0.0.1:1".to_string(), tool_base_url));
+        let mut req = make_request_with_tools();
+        req.stream = Some(false);
+        req.tools = Some(vec![write_tool()]);
+        let routing = resolve_model_routing(&req.model, &state.model_mapper);
+        state.stats.record_start();
+
+        let err = handle_anthropic_tools_plain_output(
+            state.clone(),
+            req,
+            routing,
+            "将 payload p1 写入 docs/report.md。".to_string(),
+            0,
+            0,
+            std::time::Instant::now(),
+            "ouyi7",
+            None,
+        )
+        .await
+        .unwrap_err();
+
+        assert!(
+            matches!(err, AppError::BadRequest(message) if message.contains("参数 JSON 解析失败"))
+        );
+        assert_eq!(tool_requests.load(Ordering::SeqCst), 2);
+        assert_eq!(state.stats.stats.active_requests.load(Ordering::Relaxed), 0);
+        assert_eq!(state.stats.stats.failed_requests.load(Ordering::Relaxed), 1);
     }
 }

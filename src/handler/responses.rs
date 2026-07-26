@@ -379,14 +379,21 @@ async fn responses_v8_tools(
     }
 
     // pipeline 决策
-    let pipeline_out = crate::tool_runtime::pipeline::run_openai_tool_pipeline(
+    let pipeline_out = match crate::tool_runtime::pipeline::run_openai_tool_pipeline(
         &state,
         &chat_req,
         upstream_text,
         "ouyi8",
         start_time,
     )
-    .await?;
+    .await
+    {
+        Ok(output) => output,
+        Err(error) => {
+            record_responses_error(&state, start_time, &model_full, &error, "ouyi8");
+            return Err(error);
+        }
+    };
 
     let short_model = chat_req.model.clone();
     let task_id = format!("resp_{}", crate::tool_runtime::uuid_short());
@@ -553,10 +560,21 @@ async fn responses_v7_tools(
         }
     };
 
-    let pipeline_out = crate::tool_runtime::pipeline::run_openai_tool_pipeline(
-        &state, &chat_req, text, platform_key, start_time,
+    let pipeline_out = match crate::tool_runtime::pipeline::run_openai_tool_pipeline(
+        &state,
+        &chat_req,
+        text,
+        platform_key,
+        start_time,
     )
-    .await?;
+    .await
+    {
+        Ok(output) => output,
+        Err(error) => {
+            record_responses_error(&state, start_time, &model_full, &error, platform_key);
+            return Err(error);
+        }
+    };
 
     let short_model = chat_req.model.clone();
     let task_id = format!("resp_{}", crate::tool_runtime::uuid_short());
@@ -1465,12 +1483,7 @@ fn build_responses_response(
 }
 
 fn uuid_short() -> String {
-    use std::time::{SystemTime, UNIX_EPOCH};
-    let ts = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_nanos();
-    format!("{:x}", ts % 0xFFFFFF)
+    uuid::Uuid::new_v4().simple().to_string()
 }
 
 #[cfg(test)]
@@ -1481,6 +1494,15 @@ mod tests {
     use axum::http::{StatusCode, header};
     use axum::routing::post;
     use http_body_util::BodyExt;
+
+    #[test]
+    fn test_uuid_short_uses_full_uuid_entropy() {
+        let first = uuid_short();
+        let second = uuid_short();
+        assert_ne!(first, second);
+        assert!(first.len() > 6);
+        assert!(second.len() > 6);
+    }
 
     #[test]
     fn test_function_call_output_converts_to_named_tool_message() {
@@ -1577,6 +1599,17 @@ mod tests {
             .unwrap()
     }
 
+    async fn ouyi_plain_final_handler() -> axum::response::Response {
+        axum::response::Response::builder()
+            .status(StatusCode::OK)
+            .header(header::CONTENT_TYPE, "text/event-stream")
+            .body(Body::from(concat!(
+                "data: {\"id\":\"1\",\"type\":\"string\",\"data\":\"这是最终回答，没有工具调用。\"}\n\n",
+                "data: {\"id\":\"1\",\"type\":\"done\"}\n\n"
+            )))
+            .unwrap()
+    }
+
     async fn application_error_state() -> Arc<AppState> {
         let ouyi_base_url = spawn_mock_router(
             Router::new()
@@ -1585,6 +1618,16 @@ mod tests {
                     "/api/chat/completions",
                     post(ouyi_application_error_handler),
                 ),
+        )
+        .await;
+        make_test_state(test_config(ouyi_base_url))
+    }
+
+    async fn plain_final_state() -> Arc<AppState> {
+        let ouyi_base_url = spawn_mock_router(
+            Router::new()
+                .route("/api/chat/session", post(ouyi_session_handler))
+                .route("/api/chat/completions", post(ouyi_plain_final_handler)),
         )
         .await;
         make_test_state(test_config(ouyi_base_url))
@@ -1826,6 +1869,21 @@ mod tests {
         assert!(
             matches!(err, AppError::Upstream(message) if message.contains("您的套餐余量不足，请购买后重试"))
         );
+    }
+
+    #[tokio::test]
+    async fn test_responses_tool_pipeline_error_records_failed_request() {
+        let state = plain_final_state().await;
+        let mut req = responses_request(false, true);
+        req.tool_choice = Some(json!("required"));
+
+        let err = responses(State(state.clone()), Json(req))
+            .await
+            .unwrap_err();
+
+        assert!(matches!(err, AppError::ToolProtocol(_)));
+        assert_eq!(state.stats.stats.active_requests.load(Ordering::Relaxed), 0);
+        assert_eq!(state.stats.stats.failed_requests.load(Ordering::Relaxed), 1);
     }
 
     #[tokio::test]

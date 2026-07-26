@@ -24,12 +24,7 @@ pub mod validation;
 mod broker_probe;
 
 pub(crate) fn uuid_short() -> String {
-    use std::time::{SystemTime, UNIX_EPOCH};
-    let ts = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_nanos();
-    format!("{:x}", ts % 0xFFFFFF)
+    uuid::Uuid::new_v4().simple().to_string()
 }
 
 #[derive(Debug, Clone)]
@@ -377,6 +372,34 @@ mod tests {
             Some("Read".to_string())
         );
         assert!(ledger.pending_age_secs("session-a").is_some());
+    }
+
+    #[test]
+    fn test_uuid_short_uses_full_uuid_entropy() {
+        let first = super::uuid_short();
+        let second = super::uuid_short();
+        assert_ne!(first, second);
+        assert!(first.len() > 6);
+        assert!(second.len() > 6);
+    }
+
+    #[test]
+    fn test_normalized_duplicate_provider_ids_keep_ledger_sessions_isolated() {
+        let mut ids = ["call_0".to_string(), "call_0".to_string()];
+        crate::tool_runtime::protocol::normalize_tool_call_ids(ids.iter_mut());
+        let ledger = super::ToolLedger::new();
+
+        ledger
+            .record_tool_use("session-a", &ids[0], "Bash")
+            .unwrap();
+        ledger
+            .record_tool_use("session-b", &ids[1], "Bash")
+            .unwrap();
+
+        assert_ne!(ids[0], ids[1]);
+        assert_eq!(ledger.pending_count(), 2);
+        assert!(ledger.validate_tool_result("session-a", &ids[0]).is_ok());
+        assert!(ledger.validate_tool_result("session-b", &ids[1]).is_ok());
     }
 
     #[test]

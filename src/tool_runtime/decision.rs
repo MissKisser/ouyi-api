@@ -2,7 +2,10 @@ use crate::config::ToolRuntimeConfig;
 use crate::error::AppError;
 use crate::tool_runtime::broker::BrokerToolCall;
 use crate::tool_runtime::openai_compiler::{CompiledToolCall, CompilerDecision};
-use crate::tool_runtime::protocol::{openai_request_to_context, openai_tools_to_specs};
+use crate::tool_runtime::protocol::{
+    normalize_tool_call_ids, openai_request_to_context, openai_tool_choice_to_spec,
+    openai_tools_to_specs, validate_tool_choice,
+};
 
 /// 工具决策来源模式
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -86,6 +89,7 @@ pub async fn decide_openai_tools_from_text(
         .map(|tools| openai_tools_to_specs(tools.as_slice()))
         .unwrap_or_default();
 
+    let tool_choice = openai_tool_choice_to_spec(req.tool_choice.as_ref());
     let payload_extraction = crate::tool_runtime::payload::extract_payloads(main_model_output);
     let decision_text = payload_extraction.sanitized_text.as_str();
     let explicit_intent = crate::tool_runtime::dialect::has_explicit_tool_intent(decision_text);
@@ -107,8 +111,15 @@ pub async fn decide_openai_tools_from_text(
     };
 
     if !broker_calls.is_empty() {
+        let mut calls = broker_calls_to_compiled(broker_calls);
+        let actual_names = calls
+            .iter()
+            .map(|call| call.name.clone())
+            .collect::<Vec<_>>();
+        validate_tool_choice(tool_choice.as_ref(), &actual_names)?;
+        normalize_tool_call_ids(calls.iter_mut().map(|call| &mut call.id));
         return Ok(ToolTextDecision::ToolCalls {
-            calls: broker_calls_to_compiled(broker_calls),
+            calls,
             meta: ToolDecisionMeta {
                 mode: ToolDecisionMode::Broker,
                 provider: runtime_provider(runtime_config),
@@ -123,6 +134,7 @@ pub async fn decide_openai_tools_from_text(
     }
 
     let Some(config) = runtime_config.filter(|cfg| cfg.enabled) else {
+        validate_tool_choice(tool_choice.as_ref(), &[])?;
         if explicit_intent {
             return Err(AppError::ToolProtocol(
                 "检测到明确工具意图，但没有生成合法工具调用".to_string(),
@@ -173,12 +185,25 @@ pub async fn decide_openai_tools_from_text(
                 )
                 .map_err(AppError::ToolProtocol)?;
             }
+            let mut calls = calls;
+            let actual_names = calls
+                .iter()
+                .map(|call| call.name.clone())
+                .collect::<Vec<_>>();
+            validate_tool_choice(context.tool_choice.as_ref(), &actual_names)?;
+            normalize_tool_call_ids(calls.iter_mut().map(|call| &mut call.id));
             Ok(ToolTextDecision::ToolCalls { calls, meta })
         }
-        CompilerDecision::FinalAnswer if explicit_intent => Err(AppError::ToolProtocol(
-            "编译器未能转换明确的工具意图".to_string(),
-        )),
-        CompilerDecision::FinalAnswer => Ok(ToolTextDecision::FinalAnswer { meta }),
+        CompilerDecision::FinalAnswer => {
+            validate_tool_choice(context.tool_choice.as_ref(), &[])?;
+            if explicit_intent {
+                Err(AppError::ToolProtocol(
+                    "编译器未能转换明确的工具意图".to_string(),
+                ))
+            } else {
+                Ok(ToolTextDecision::FinalAnswer { meta })
+            }
+        }
     }
 }
 
@@ -257,5 +282,106 @@ mod tests {
         .unwrap_err();
 
         assert!(matches!(error, AppError::ToolProtocol(_)));
+    }
+
+    #[tokio::test]
+    async fn test_required_choice_rejects_final_answer_without_compiler() {
+        let mut req = openai_req_with_bash_tool();
+        req.tool_choice = Some(serde_json::json!("required"));
+
+        let error = decide_openai_tools_from_text(
+            reqwest::Client::new(),
+            None,
+            &req,
+            "这是最终回答，没有工具调用。",
+        )
+        .await
+        .unwrap_err();
+
+        assert!(
+            matches!(error, AppError::ToolProtocol(message) if message.contains("expected=required") && message.contains("actual=<none>"))
+        );
+    }
+
+    #[tokio::test]
+    async fn test_specific_choice_rejects_other_valid_marked_tool() {
+        let mut req = openai_req_with_bash_tool();
+        req.tools.as_mut().unwrap().push(ToolDef {
+            tool_type: "function".to_string(),
+            function: ToolFunction {
+                name: "Read".to_string(),
+                description: Some("读取文件".to_string()),
+                parameters: Some(serde_json::json!({
+                    "type": "object",
+                    "properties": {"file_path": {"type": "string"}},
+                    "required": ["file_path"]
+                })),
+            },
+        });
+        req.tool_choice = Some(serde_json::json!({
+            "type": "function",
+            "function": {"name": "Read"}
+        }));
+        let output = concat!(
+            "<|tool▁calls▁begin|>",
+            "[{\"name\":\"Bash\",\"arguments\":{\"command\":\"pwd\"}}]",
+            "<|tool▁calls▁end|>"
+        );
+
+        let error = decide_openai_tools_from_text(reqwest::Client::new(), None, &req, output)
+            .await
+            .unwrap_err();
+
+        assert!(
+            matches!(error, AppError::ToolProtocol(message) if message.contains("expected=Read") && message.contains("actual=Bash"))
+        );
+    }
+
+    #[tokio::test]
+    async fn test_required_choice_rejects_compiler_final_answer() {
+        use axum::{Json, Router, routing::post};
+
+        async fn final_answer() -> Json<serde_json::Value> {
+            Json(serde_json::json!({
+                "choices": [{"message": {"content": "no tool call"}}],
+                "usage": {"prompt_tokens": 2, "completion_tokens": 1}
+            }))
+        }
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            axum::serve(
+                listener,
+                Router::new().route("/chat/completions", post(final_answer)),
+            )
+            .await
+            .unwrap();
+        });
+        let config = ToolRuntimeConfig {
+            enabled: true,
+            mode: crate::config::ToolRuntimeMode::Compiler,
+            provider: crate::config::ToolRuntimeProvider::OpenaiCompatible,
+            base_url: Some(format!("http://{addr}")),
+            api_key: Some("test-key".to_string()),
+            api_key_env: None,
+            model: Some("tool-model".to_string()),
+            timeout_secs: 5,
+        };
+        let mut req = openai_req_with_bash_tool();
+        req.tool_choice = Some(serde_json::json!("required"));
+
+        let error = decide_openai_tools_from_text(
+            reqwest::Client::builder().no_proxy().build().unwrap(),
+            Some(&config),
+            &req,
+            "请决定是否调用工具。",
+        )
+        .await
+        .unwrap_err();
+
+        assert!(
+            matches!(error, AppError::ToolProtocol(message) if message.contains("expected=required") && message.contains("actual=<none>"))
+        );
     }
 }

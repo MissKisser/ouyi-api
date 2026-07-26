@@ -2,7 +2,9 @@ use crate::config::ToolRuntimeConfig;
 use crate::error::AppError;
 use crate::model::anthropic::MessagesRequest;
 use crate::tool_runtime::dialect::parse_known_tool_calls;
-use crate::tool_runtime::protocol::ToolSpec;
+use crate::tool_runtime::protocol::{
+    ToolSpec, anthropic_tool_choice_to_spec, normalize_tool_call_ids, validate_tool_choice,
+};
 
 fn broker_id() -> String {
     format!("call_broker_{}", uuid::Uuid::new_v4().simple())
@@ -280,24 +282,38 @@ pub async fn decide_with_broker(
         .as_ref()
         .map(|tools| crate::tool_runtime::protocol::anthropic_tools_to_specs(tools.as_slice()))
         .unwrap_or_default();
+    let tool_choice = anthropic_tool_choice_to_spec(req.tool_choice.as_ref());
 
     let payload_extraction = crate::tool_runtime::payload::extract_payloads(ouyi_output);
     let decision_text = payload_extraction.sanitized_text.as_str();
     let explicit_intent = crate::tool_runtime::dialect::has_explicit_tool_intent(decision_text);
 
-    let marked =
+    let mut marked =
         parse_marked_tool_calls(decision_text, &tool_specs).map_err(AppError::ToolProtocol)?;
     if !marked.is_empty() {
+        let actual_names = marked
+            .iter()
+            .map(|call| call.name.clone())
+            .collect::<Vec<_>>();
+        validate_tool_choice(tool_choice.as_ref(), &actual_names)?;
+        normalize_tool_call_ids(marked.iter_mut().map(|call| &mut call.id));
         return Ok(BrokerDecision::ToolCalls(marked));
     }
 
-    let rule_calls =
+    let mut rule_calls =
         parse_rule_tool_intent(decision_text, &tool_specs).map_err(AppError::ToolProtocol)?;
     if !rule_calls.is_empty() {
+        let actual_names = rule_calls
+            .iter()
+            .map(|call| call.name.clone())
+            .collect::<Vec<_>>();
+        validate_tool_choice(tool_choice.as_ref(), &actual_names)?;
+        normalize_tool_call_ids(rule_calls.iter_mut().map(|call| &mut call.id));
         return Ok(BrokerDecision::ToolCalls(rule_calls));
     }
 
     let Some(config) = tool_runtime_config.filter(|config| config.enabled) else {
+        validate_tool_choice(tool_choice.as_ref(), &[])?;
         if explicit_intent {
             return Err(AppError::ToolProtocol(
                 "检测到明确工具意图，但没有生成合法工具调用".to_string(),
@@ -326,29 +342,36 @@ pub async fn decide_with_broker(
                 )
                 .map_err(AppError::ToolProtocol)?;
             }
-            Ok(BrokerDecision::ToolCalls(
-                calls
-                    .into_iter()
-                    .map(|call| BrokerToolCall {
-                        id: call.id,
-                        name: call.name,
-                        input: call.input,
-                    })
-                    .collect(),
-            ))
-        }
-        crate::tool_runtime::openai_compiler::CompilerDecision::FinalAnswer if explicit_intent => {
-            Err(AppError::ToolProtocol(
-                "编译器未能转换明确的工具意图".to_string(),
-            ))
+            let mut calls = calls
+                .into_iter()
+                .map(|call| BrokerToolCall {
+                    id: call.id,
+                    name: call.name,
+                    input: call.input,
+                })
+                .collect::<Vec<_>>();
+            let actual_names = calls
+                .iter()
+                .map(|call| call.name.clone())
+                .collect::<Vec<_>>();
+            validate_tool_choice(tool_choice.as_ref(), &actual_names)?;
+            normalize_tool_call_ids(calls.iter_mut().map(|call| &mut call.id));
+            Ok(BrokerDecision::ToolCalls(calls))
         }
         crate::tool_runtime::openai_compiler::CompilerDecision::FinalAnswer => {
-            Ok(BrokerDecision::FinalAnswer {
-                usage: Some(BrokerUsage {
-                    prompt_tokens: compiled.usage.prompt_tokens,
-                    completion_tokens: compiled.usage.completion_tokens,
-                }),
-            })
+            validate_tool_choice(tool_choice.as_ref(), &[])?;
+            if explicit_intent {
+                Err(AppError::ToolProtocol(
+                    "编译器未能转换明确的工具意图".to_string(),
+                ))
+            } else {
+                Ok(BrokerDecision::FinalAnswer {
+                    usage: Some(BrokerUsage {
+                        prompt_tokens: compiled.usage.prompt_tokens,
+                        completion_tokens: compiled.usage.completion_tokens,
+                    }),
+                })
+            }
         }
     }
 }
@@ -356,6 +379,47 @@ pub async fn decide_with_broker(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn anthropic_req_with_tools(
+        tool_choice: crate::model::anthropic::ToolChoice,
+    ) -> MessagesRequest {
+        MessagesRequest {
+            model: "claude-test".to_string(),
+            messages: vec![crate::model::anthropic::AnthropicMessage {
+                role: "user".to_string(),
+                content: crate::model::anthropic::AnthropicContent::Text("完成任务".to_string()),
+            }],
+            system: None,
+            max_tokens: 128,
+            stream: Some(false),
+            tools: Some(vec![
+                crate::model::anthropic::AnthropicTool {
+                    name: "Bash".to_string(),
+                    description: "Run shell command".to_string(),
+                    input_schema: serde_json::json!({
+                        "type": "object",
+                        "properties": {"command": {"type": "string"}},
+                        "required": ["command"]
+                    }),
+                },
+                crate::model::anthropic::AnthropicTool {
+                    name: "Read".to_string(),
+                    description: "Read file".to_string(),
+                    input_schema: serde_json::json!({
+                        "type": "object",
+                        "properties": {"file_path": {"type": "string"}},
+                        "required": ["file_path"]
+                    }),
+                },
+            ]),
+            temperature: None,
+            top_p: None,
+            top_k: None,
+            stop_sequences: None,
+            thinking: None,
+            tool_choice: Some(tool_choice),
+        }
+    }
 
     fn bash_spec() -> ToolSpec {
         ToolSpec {
@@ -571,5 +635,43 @@ mod tests {
             classify_long_task_result("some error output", "DONE"),
             LongTaskResult::Pending
         ));
+    }
+
+    #[tokio::test]
+    async fn test_anthropic_any_choice_rejects_final_answer_without_compiler() {
+        let req = anthropic_req_with_tools(crate::model::anthropic::ToolChoice::Any);
+
+        let err = decide_with_broker(
+            reqwest::Client::new(),
+            None,
+            &req,
+            "这是最终回答，没有工具调用。",
+        )
+        .await
+        .unwrap_err();
+
+        assert!(
+            matches!(err, AppError::ToolProtocol(message) if message.contains("expected=required") && message.contains("actual=<none>"))
+        );
+    }
+
+    #[tokio::test]
+    async fn test_anthropic_specific_choice_rejects_other_valid_marked_tool() {
+        let req = anthropic_req_with_tools(crate::model::anthropic::ToolChoice::Tool {
+            name: "Read".to_string(),
+        });
+        let output = concat!(
+            "<|tool▁calls▁begin|>",
+            "[{\"name\":\"Bash\",\"arguments\":{\"command\":\"pwd\"}}]",
+            "<|tool▁calls▁end|>"
+        );
+
+        let err = decide_with_broker(reqwest::Client::new(), None, &req, output)
+            .await
+            .unwrap_err();
+
+        assert!(
+            matches!(err, AppError::ToolProtocol(message) if message.contains("expected=Read") && message.contains("actual=Bash"))
+        );
     }
 }
