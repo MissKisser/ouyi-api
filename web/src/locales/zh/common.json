@@ -3,6 +3,7 @@
     "dashboard": "概览",
     "models": "模型",
     "chat": "聊天测试",
+    "endpoints": "API 地址",
     "config": "配置",
     "logs": "日志",
     "logout": "退出"
@@ -271,5 +272,25 @@
     "confirm": "确认",
     "success": "成功",
     "error": "错误"
+  },
+  "endpoints": {
+    "title": "API 地址",
+    "baseLabel": "基准 URL",
+    "test": "测试连通性",
+    "testAll": "全部测试",
+    "copy": "复制",
+    "testing": "测试中…",
+    "statusPending": "待测试",
+    "statusOk": "可达",
+    "statusFail": "不可达",
+    "networkError": "网络错误",
+    "timeout": "请求超时",
+    "pathLabel": "路径",
+    "chat1": "OpenAI Chat Completions",
+    "chat2": "OpenAI Chat Completions（openai 别名）",
+    "resp1": "OpenAI Responses",
+    "resp2": "OpenAI Responses（openai 别名）",
+    "anth1": "Anthropic Messages",
+    "anth2": "Anthropic Messages（短别名）"
   }
 }

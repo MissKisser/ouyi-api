@@ -3,6 +3,7 @@
     "dashboard": "Dashboard",
     "models": "Models",
     "chat": "Chat Test",
+    "endpoints": "API Endpoints",
     "config": "Config",
     "logs": "Logs",
     "logout": "Logout"
@@ -271,5 +272,25 @@
     "confirm": "Confirm",
     "success": "Success",
     "error": "Error"
+  },
+  "endpoints": {
+    "title": "API Endpoints",
+    "baseLabel": "Base URL",
+    "test": "Test connectivity",
+    "testAll": "Test all",
+    "copy": "Copy",
+    "testing": "Testing…",
+    "statusPending": "Not tested",
+    "statusOk": "Reachable",
+    "statusFail": "Unreachable",
+    "networkError": "Network error",
+    "timeout": "Request timeout",
+    "pathLabel": "Path",
+    "chat1": "OpenAI Chat Completions",
+    "chat2": "OpenAI Chat Completions (openai alias)",
+    "resp1": "OpenAI Responses",
+    "resp2": "OpenAI Responses (openai alias)",
+    "anth1": "Anthropic Messages",
+    "anth2": "Anthropic Messages (short alias)"
   }
 }

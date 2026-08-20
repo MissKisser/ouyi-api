@@ -10,6 +10,7 @@ import {
   LogOut,
   ScrollText,
   MessageSquare,
+  Link2,
 } from 'lucide-react';
 import { useTranslation } from 'react-i18next';
 
@@ -27,6 +28,7 @@ export function Layout() {
     { to: '/', icon: LayoutDashboard, label: t('nav.dashboard') },
     { to: '/models', icon: Boxes, label: t('nav.models') },
     { to: '/chat', icon: MessageSquare, label: t('nav.chat') },
+    { to: '/endpoints', icon: Link2, label: t('nav.endpoints') },
     { to: '/config', icon: Settings, label: t('nav.config') },
     { to: '/logs', icon: ScrollText, label: t('nav.logs') },
   ];

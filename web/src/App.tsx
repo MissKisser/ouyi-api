@@ -9,6 +9,7 @@ import { ModelsPage } from '@/pages/ModelsPage';
 import { ConfigPage } from '@/pages/ConfigPage';
 import { LogsPage } from '@/pages/LogsPage';
 import { ChatTestPage } from '@/pages/ChatTestPage';
+import { ApiEndpointsPage } from '@/pages/ApiEndpointsPage';
 
 function ProtectedRoutes() {
   const { isAuthenticated } = useAuth();
@@ -23,6 +24,7 @@ function ProtectedRoutes() {
         <Route path="config" element={<ConfigPage />} />
         <Route path="logs" element={<LogsPage />} />
         <Route path="chat" element={<ChatTestPage />} />
+        <Route path="endpoints" element={<ApiEndpointsPage />} />
       </Route>
     </Routes>
   );

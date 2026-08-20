@@ -22,6 +22,16 @@ config.toml
 # Playwright MCP 测试产物
 .playwright-mcp/
 
+# sisyphus 开发工具持久化
+.sisyphus/
+
+# 文档（只保留本地，远端只留 README.md）
+AGENTS.md
+CLAUDE.md
+SPEC.md
+docs/
+scripts/smoke/README.md
+
 # IDE 配置
 .idea/
 .vscode/
@@ -43,3 +53,9 @@ logs/
 # 部署 staging 目录（可能含真实 JWT / 密钥）
 deploy-staging/
 deploy-build/
+
+# 本地部署经验记录（不推送远程）
+docs/deployments/2026-08-20-yn8-docker-redeploy.md
+
+# 本地 prebuilt 实验（不在生产使用）
+Dockerfile.prebuilt
