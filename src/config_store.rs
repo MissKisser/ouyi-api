@@ -47,8 +47,14 @@ pub fn atomic_replace(path: &Path, bytes: &[u8]) -> Result<(), AppError> {
     atomic_replace_unlocked(path, bytes)
 }
 
+fn parent_directory(path: &Path) -> &Path {
+    path.parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+        .unwrap_or_else(|| Path::new("."))
+}
+
 fn atomic_replace_unlocked(path: &Path, bytes: &[u8]) -> Result<(), AppError> {
-    let parent = path.parent().unwrap_or_else(|| Path::new("."));
+    let parent = parent_directory(path);
     let file_name = path
         .file_name()
         .and_then(|name| name.to_str())
@@ -95,6 +101,19 @@ fn atomic_replace_unlocked(path: &Path, bytes: &[u8]) -> Result<(), AppError> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// 相对裸文件名（如 `config.toml`）的 `parent()` 返回空路径而非 `None`；
+    /// 空路径 `open()` 在 Linux 上报 ENOENT，会让已成功的写入被目录 fsync
+    /// 整体判为失败。此测试锁定裸文件名必须解析到当前目录。
+    #[test]
+    fn bare_relative_config_path_resolves_parent_to_cwd() {
+        assert_eq!(parent_directory(Path::new("config.toml")), Path::new("."));
+        assert_eq!(
+            parent_directory(Path::new("/etc/ouyi/config.toml")),
+            Path::new("/etc/ouyi")
+        );
+    }
+
 
     fn temp_path(label: &str) -> std::path::PathBuf {
         std::env::temp_dir().join(format!(

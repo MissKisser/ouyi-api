@@ -22,6 +22,7 @@ pub fn app(limiter: ConcurrencyLimiter) -> Router<Arc<AppState>> {
             "/v1/chat/completions",
             post(handler::chat::chat_completions),
         )
+        .route("/openai/v1/chat/completions", post(handler::chat::chat_completions))
         .route("/openai/v1/responses", post(handler::responses::responses))
         .route("/v1/responses", post(handler::responses::responses))
         .route("/anthropic/v1/messages", post(handler::anthropic::messages))

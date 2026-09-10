@@ -178,8 +178,8 @@ export function ApiEndpointsPage() {
         </div>
       </div>
 
-      {/* 卡片列表 */}
-      <div className="space-y-3">
+      {/* 卡片列表 —— 双栏网格 */}
+      <div className="grid grid-cols-1 md:grid-cols-2 gap-3">
         {endpoints.map((ep) => {
           const url = fullUrl(ep.path);
           const status = statuses[ep.key];

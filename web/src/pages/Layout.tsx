@@ -26,8 +26,8 @@ export function Layout() {
 
   const navItems = [
     { to: '/', icon: LayoutDashboard, label: t('nav.dashboard') },
-    { to: '/models', icon: Boxes, label: t('nav.models') },
     { to: '/chat', icon: MessageSquare, label: t('nav.chat') },
+    { to: '/models', icon: Boxes, label: t('nav.models') },
     { to: '/endpoints', icon: Link2, label: t('nav.endpoints') },
     { to: '/config', icon: Settings, label: t('nav.config') },
     { to: '/logs', icon: ScrollText, label: t('nav.logs') },

@@ -6,6 +6,8 @@ pub struct Ouyi7Envelope<T> {
     pub code: i32,
     pub result: Option<T>,
     #[serde(default)]
+    pub message: String,
+    #[serde(default)]
     #[allow(dead_code)]
     pub r#type: Option<String>,
 }

@@ -143,8 +143,9 @@ impl Ouyi7HttpClient {
         let envelope: Ouyi7Envelope<MemberInfoResult> = resp.json().await?;
         if envelope.code != 200 {
             return Err(AppError::Upstream(format!(
-                "memberInfo code: {}",
-                envelope.code
+                "memberInfo code: {} message: {}",
+                envelope.code,
+                envelope.message
             )));
         }
 
@@ -177,8 +178,9 @@ impl Ouyi7HttpClient {
         let envelope: Ouyi7Envelope<Vec<Ouyi7EnumItem>> = resp.json().await?;
         if envelope.code != 200 {
             return Err(AppError::Upstream(format!(
-                "enumDataList code: {}",
-                envelope.code
+                "enumDataList code: {} message: {}",
+                envelope.code,
+                envelope.message
             )));
         }
 
@@ -238,7 +240,7 @@ impl Ouyi7HttpClient {
             return Err(AppError::Upstream(format!(
                 "create_topic code: {} message: {}",
                 envelope.code,
-                String::new()
+                envelope.message
             )));
         }
 
@@ -310,8 +312,9 @@ impl Ouyi7HttpClient {
         let envelope: Ouyi7Envelope<Ouyi7MessagePhase1Result> = resp.json().await?;
         if envelope.code != 200 {
             return Err(AppError::Upstream(format!(
-                "message phase1 code: {}",
-                envelope.code
+                "message phase1 code: {} message: {}",
+                envelope.code,
+                envelope.message
             )));
         }
 
