@@ -1007,8 +1007,11 @@ pub struct LimitsConfigUpdate {
 /// API Key 鉴权更新段。
 #[derive(Clone, Deserialize)]
 pub struct ApiKeysConfigUpdate {
-    /// 新的 key 列表；`None` 表示不修改。空数组表示关闭鉴权并清空 key；
-    /// 数组中的空白项与掩码占位项被忽略（表示保留已有 key）。
+    /// 新的 key 列表，按以下语义处理：
+    /// - `None`：不修改。
+    /// - 空数组：显式关闭鉴权并清空 key。
+    /// - 数组全部为空白或掩码占位项：视为未提供真实 key，保留现有 api_keys 不变。
+    /// - 含至少一个真实 key（≥16 字符）：空白与掩码项丢弃，真实项去重后整体替换。
     pub keys: Option<Vec<String>>,
 }
 
@@ -1439,7 +1442,11 @@ pub(super) async fn prepare_and_commit_config_update(
     {
         let keys = crate::api_auth::normalize_keys(raw_keys)
             .map_err(ConfigUpdateError::BadRequest)?;
-        candidate.api_keys = Some(ApiKeysConfig { keys });
+        // 空数组表示显式关闭鉴权并清空 key；数组非空但 normalize 后为空，说明
+        // 全部为空白或掩码占位项，未提供真实 key，保留既有 api_keys 不变。
+        if !keys.is_empty() || raw_keys.is_empty() {
+            candidate.api_keys = Some(ApiKeysConfig { keys });
+        }
     }
 
     let path = config_path.to_path_buf();

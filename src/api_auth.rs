@@ -117,7 +117,8 @@ pub async fn require_api_key(
     next.run(req).await
 }
 
-/// 规范化 API Key 列表：逐项去空白；空白项与掩码占位项忽略（表示保留已有 key）；
+/// 规范化 API Key 列表：逐项去空白；空白项与掩码占位项被忽略，
+/// 过滤后是否保留既有 key 由调用方按更新语义决定；
 /// 短于 [`MIN_KEY_LEN`] 的项使整次更新失败；结果去重。
 /// 返回 `Err(String)`：描述第一个过短的项。
 pub fn normalize_keys(raw: &[String]) -> Result<Vec<String>, String> {

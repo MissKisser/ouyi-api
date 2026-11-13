@@ -687,6 +687,87 @@ prompt_on_start = false
         );
     }
 
+    /// 回归测试：api_keys 更新传入的数组全部为掩码占位项（如 GET /admin/api/config
+    /// 回显的纯掩码列表）时，视为未提供真实 key，既有 api_keys 保持不变——
+    /// 运行时配置与落盘文件都不应被清空，两次更新均返回 Ok。
+    #[tokio::test]
+    async fn config_put_keeps_existing_api_keys_when_keys_all_masked() {
+        let state = make_test_state_with_limit(0);
+        let config_file = TempFileGuard::new("api-keys-masked");
+        write_complete_test_config(&config_file.0, 0);
+        let first = serde_json::from_value(json!({
+            "api_keys": {"keys": ["sk-test-key-0123456789abcdef"]}
+        }))
+        .unwrap();
+        handlers::prepare_and_commit_config_update(&state, &config_file.0, first)
+            .await
+            .unwrap();
+
+        let masked_only = serde_json::from_value(json!({
+            "api_keys": {"keys": ["sk-…cdef"]}
+        }))
+        .unwrap();
+        handlers::prepare_and_commit_config_update(&state, &config_file.0, masked_only)
+            .await
+            .unwrap();
+
+        assert_eq!(
+            state
+                .config
+                .read()
+                .await
+                .api_keys
+                .as_ref()
+                .map(|section| section.keys.as_slice()),
+            Some(["sk-test-key-0123456789abcdef".to_string()].as_slice())
+        );
+        let persisted: toml::Value = std::fs::read_to_string(&config_file.0)
+            .unwrap()
+            .parse()
+            .unwrap();
+        assert_eq!(
+            persisted["api_keys"]["keys"][0].as_str(),
+            Some("sk-test-key-0123456789abcdef")
+        );
+    }
+
+    /// keys 传空数组表示显式关闭鉴权并清空 key：运行时 keys 置空，
+    /// 配置文件同步为 `[api_keys] keys = []`。
+    #[tokio::test]
+    async fn config_put_empty_keys_clears_runtime_and_file() {
+        let state = make_test_state_with_limit(0);
+        let config_file = TempFileGuard::new("api-keys-empty");
+        write_complete_test_config(&config_file.0, 0);
+        let first = serde_json::from_value(json!({
+            "api_keys": {"keys": ["sk-test-key-0123456789abcdef"]}
+        }))
+        .unwrap();
+        handlers::prepare_and_commit_config_update(&state, &config_file.0, first)
+            .await
+            .unwrap();
+
+        let clear = serde_json::from_value(json!({
+            "api_keys": {"keys": []}
+        }))
+        .unwrap();
+        handlers::prepare_and_commit_config_update(&state, &config_file.0, clear)
+            .await
+            .unwrap();
+
+        assert_eq!(
+            state.config.read().await.api_keys,
+            Some(crate::config::ApiKeysConfig { keys: Vec::new() })
+        );
+        let persisted: toml::Value = std::fs::read_to_string(&config_file.0)
+            .unwrap()
+            .parse()
+            .unwrap();
+        assert_eq!(
+            persisted["api_keys"]["keys"].as_array().map(Vec::len),
+            Some(0)
+        );
+    }
+
     /// 过短 key 的 api_keys 更新必须整次拒绝：返回 BadRequest，
     /// 且不写盘、不改动内存中的 api_keys。
     #[tokio::test]
