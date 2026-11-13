@@ -110,6 +110,16 @@ async fn main() -> Result<(), AppError> {
 
     tracing::info!("已选择平台: {}", selected_platform.label());
 
+    match config.api_keys.as_ref() {
+        Some(section) if !section.keys.is_empty() => {
+            tracing::info!("api_keys=ENABLED ({} key(s))", section.keys.len());
+        }
+        Some(_) => {
+            tracing::warn!("api_keys 段存在但 keys 为空，按未启用处理");
+        }
+        None => tracing::info!("api_keys=DISABLED"),
+    }
+
     if config.ouyi.jwt_token.is_empty() {
         tracing::warn!("JWT token 未配置，请设置 config.toml 中的 ouyi.jwt_token");
     }

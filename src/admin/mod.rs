@@ -651,4 +651,63 @@ prompt_on_start = false
         // prompt_on_start 缺省为 true（与 PlatformConfig 的兜底一致）
         assert_eq!(body["platform"]["prompt_on_start"], true);
     }
+
+    /// api_keys 热更新：写盘成功后，内存配置与持久化文件都应携带新 key 列表。
+    #[tokio::test]
+    async fn config_put_updates_api_keys_runtime_and_file() {
+        let state = make_test_state_with_limit(0);
+        let config_file = TempFileGuard::new("api-keys");
+        write_complete_test_config(&config_file.0, 0);
+        let update = serde_json::from_value(json!({
+            "api_keys": {"keys": ["sk-test-key-0123456789abcdef"]}
+        }))
+        .unwrap();
+
+        handlers::prepare_and_commit_config_update(&state, &config_file.0, update)
+            .await
+            .unwrap();
+
+        assert_eq!(
+            state
+                .config
+                .read()
+                .await
+                .api_keys
+                .as_ref()
+                .map(|section| section.keys.len()),
+            Some(1)
+        );
+        let persisted: toml::Value = std::fs::read_to_string(&config_file.0)
+            .unwrap()
+            .parse()
+            .unwrap();
+        assert_eq!(
+            persisted["api_keys"]["keys"][0].as_str(),
+            Some("sk-test-key-0123456789abcdef")
+        );
+    }
+
+    /// 过短 key 的 api_keys 更新必须整次拒绝：返回 BadRequest，
+    /// 且不写盘、不改动内存中的 api_keys。
+    #[tokio::test]
+    async fn config_put_rejects_short_api_key_without_side_effects() {
+        let state = make_test_state_with_limit(0);
+        let config_file = TempFileGuard::new("api-keys-short");
+        write_complete_test_config(&config_file.0, 0);
+        let before = std::fs::read(&config_file.0).unwrap();
+        let update = serde_json::from_value(json!({
+            "api_keys": {"keys": ["sk-short"]}
+        }))
+        .unwrap();
+
+        let result =
+            handlers::prepare_and_commit_config_update(&state, &config_file.0, update).await;
+
+        assert!(matches!(
+            result,
+            Err(handlers::ConfigUpdateError::BadRequest(_))
+        ));
+        assert_eq!(std::fs::read(&config_file.0).unwrap(), before);
+        assert!(state.config.read().await.api_keys.is_none());
+    }
 }

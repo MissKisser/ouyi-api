@@ -20,8 +20,8 @@ use crate::AppState;
 use crate::admin::accounts::AccountEntry;
 use crate::client::http::OuyiHttpClient;
 use crate::config::{
-    AdminConfig, AppConfig, Ouyi7Config, PlatformConfig, ToolRuntimeConfig, ToolRuntimeMode,
-    ToolRuntimeProvider, write_admin_config, write_app_config,
+    AdminConfig, ApiKeysConfig, AppConfig, Ouyi7Config, PlatformConfig, ToolRuntimeConfig,
+    ToolRuntimeMode, ToolRuntimeProvider, write_admin_config, write_app_config,
 };
 #[cfg(test)]
 use crate::config::{
@@ -493,7 +493,7 @@ pub struct FullConfigResponse {
     admin: AdminConfigResponse,
     /// 账号列表摘要（token 已脱敏、密码不回传）。
     accounts: Vec<serde_json::Value>,
-    /// API key 列表（当前未启用，恒为空表）。
+    /// API key 掩码列表（保留首尾少量字符；未配置时为空表）。
     api_keys: Vec<serde_json::Value>,
     /// anthropic 工具运行时配置。
     tool_runtime: ToolRuntimeConfigView,
@@ -575,6 +575,18 @@ pub async fn admin_config(State(state): State<Arc<AppState>>) -> impl IntoRespon
         }
     };
 
+    let api_keys: Vec<serde_json::Value> = config
+        .api_keys
+        .as_ref()
+        .map(|section| {
+            section
+                .keys
+                .iter()
+                .map(|key| serde_json::json!({ "masked": crate::api_auth::mask_key(key) }))
+                .collect()
+        })
+        .unwrap_or_default();
+
     Json(FullConfigResponse {
         server: ServerConfigView {
             host: config.server.host.clone(),
@@ -615,7 +627,7 @@ pub async fn admin_config(State(state): State<Arc<AppState>>) -> impl IntoRespon
             jwt_issued_at: 0,
         },
         accounts: account_values,
-        api_keys: vec![],
+        api_keys,
         tool_runtime: tool_runtime_view,
         openai_tool_runtime: openai_tool_runtime_view,
         platform: Some({
@@ -981,6 +993,8 @@ pub struct ConfigUpdate {
     pub platform: Option<PlatformConfigUpdate>,
     /// ouyi 7.0 上游配置更新。
     pub ouyi_v7: Option<Ouyi7ConfigUpdate>,
+    /// API Key 鉴权更新。
+    pub api_keys: Option<ApiKeysConfigUpdate>,
 }
 
 /// 并发限制更新段。
@@ -988,6 +1002,14 @@ pub struct ConfigUpdate {
 pub struct LimitsConfigUpdate {
     /// 新的最大并发请求数；`None` 表示不修改。
     pub max_concurrent_requests: Option<usize>,
+}
+
+/// API Key 鉴权更新段。
+#[derive(Clone, Deserialize)]
+pub struct ApiKeysConfigUpdate {
+    /// 新的 key 列表；`None` 表示不修改。空数组表示关闭鉴权并清空 key；
+    /// 数组中的空白项与掩码占位项被忽略（表示保留已有 key）。
+    pub keys: Option<Vec<String>>,
 }
 
 /// 工具运行时配置更新段（两种提供方共用结构）。
@@ -1410,6 +1432,14 @@ pub(super) async fn prepare_and_commit_config_update(
             candidate.openai_tool_runtime.as_ref(),
             openai_tool_runtime_update,
         );
+    }
+
+    if let Some(api_keys_update) = update.api_keys.as_ref()
+        && let Some(raw_keys) = api_keys_update.keys.as_ref()
+    {
+        let keys = crate::api_auth::normalize_keys(raw_keys)
+            .map_err(ConfigUpdateError::BadRequest)?;
+        candidate.api_keys = Some(ApiKeysConfig { keys });
     }
 
     let path = config_path.to_path_buf();
