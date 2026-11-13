@@ -169,6 +169,7 @@ mod tests {
                 max_history_messages: 20,
                 simulated_stream_chunk_chars: 80,
             }),
+            api_keys: None,
         };
 
         let ouyi_client = match platform {

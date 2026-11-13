@@ -8,6 +8,7 @@
 
 mod adapter;
 mod admin;
+pub mod api_auth;
 mod client;
 mod concurrency;
 mod config;

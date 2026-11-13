@@ -2,7 +2,7 @@
 //!
 //! 定义 `config.toml` 各配置段对应的反序列化结构（`[server]` / `[ouyi]` / `[limits]` /
 //! `[admin]` / `[tool_call]` / `[tool_runtime]` / `[openai_tool_runtime]` / `[platform]` /
-//! `[ouyi_v7]`），并提供两类能力：
+//! `[ouyi_v7]` / `[api_keys]`），并提供两类能力：
 //! - 读取：[`AppConfig::load`] 系列函数从磁盘加载配置；
 //! - 写回：[`write_app_config`] 等函数经 `config_store` 以"读原文档 → 修改 → 校验候选文本
 //!   → 原子替换"的方式持久化，保留文件中未被触及的段落与注释。
@@ -38,6 +38,18 @@ pub struct AppConfig {
     pub platform: Option<PlatformConfig>,
     /// Ouyi 7.0 平台对接配置（`[ouyi_v7]` 段），选择 7.0 平台时使用，多数字段有内置默认值。
     pub ouyi_v7: Option<Ouyi7Config>,
+    /// 推理入口 API Key 鉴权配置（`[api_keys]` 段），可选；缺省表示未启用。
+    #[serde(default)]
+    pub api_keys: Option<ApiKeysConfig>,
+}
+
+/// 推理入口 API Key 鉴权配置（`[api_keys]` 段）。
+#[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
+pub struct ApiKeysConfig {
+    /// 允许访问推理与模型列表端点的 API Key 列表；
+    /// 非空列表启用鉴权，空列表视为未启用。
+    #[serde(default)]
+    pub keys: Vec<String>,
 }
 
 /// 工具调用协议解析的自定义标记配置。
@@ -276,7 +288,7 @@ impl AppConfig {
 /// 经 `config_store::update_document` 执行"读取原文件 → 重写各配置段 → 反序列化校验候选文本
 /// → 原子替换"，避免校验或落盘中途失败导致只写入了一半字段；管理后台的全量配置更新应走此函数。
 /// 文件中未被该函数触及的段落与注释保持不变，`admin` / `platform` / `ouyi_v7` /
-/// `tool_runtime` / `openai_tool_runtime` 段在对应配置为 `None` 时从文件中移除。
+/// `tool_runtime` / `openai_tool_runtime` / `api_keys` 段在对应配置为 `None` 时从文件中移除。
 /// - `path`: 配置文件路径；`config`: 要持久化的完整配置。
 /// - 返回：替换成功后重新解析出的 `AppConfig`。
 /// - 返回 `Err(AppError::Config)`：目标段不是普通 table、`max_concurrent_requests` 超出
@@ -306,6 +318,19 @@ pub fn write_app_config(path: &Path, config: &AppConfig) -> Result<AppConfig, Ap
                 AppError::Config("max_concurrent_requests 超出可持久化范围".to_string())
             })?,
         );
+
+        match &config.api_keys {
+            Some(section) => {
+                let mut keys = toml_edit::Array::new();
+                for key in &section.keys {
+                    keys.push(key.as_str());
+                }
+                doc["api_keys"]["keys"] = toml_edit::value(keys);
+            }
+            None => {
+                doc.remove("api_keys");
+            }
+        }
 
         write_optional_admin(doc, config.admin.as_ref())?;
         write_optional_platform(doc, config.platform.as_ref())?;

@@ -282,6 +282,7 @@ prompt_on_start = false
                 prompt_on_start: false,
             }),
             ouyi_v7: None,
+            api_keys: None,
         };
 
         Arc::new(AppState {
