@@ -247,7 +247,7 @@ async fn main() -> Result<(), AppError> {
     let admin_router = admin::admin_routes(state.clone());
     let static_router = admin::static_file_router();
 
-    let app = router::app(state.concurrency_limiter.clone())
+    let app = router::app(state.clone())
         .merge(admin_router)
         .merge(static_router)
         .layer(CorsLayer::permissive())
