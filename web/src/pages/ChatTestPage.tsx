@@ -51,6 +51,27 @@ const DEFAULT_PARAMS: ChatParams = {
 };
 
 /**
+ * 从错误响应体中提取可读的错误信息。
+ *
+ * * `raw` - 响应体原文，通常为 JSON 错误结构。
+ * 返回值：解析出的错误消息；无法解析为 JSON 时返回原文，空响应返回兜底文案。
+ */
+function extractErrorMessage(raw: string): string {
+  const text = raw.trim();
+  if (!text) return 'Unknown error';
+  try {
+    const parsed = JSON.parse(text);
+    const detail = parsed?.error;
+    if (typeof detail === 'string') return detail;
+    if (detail?.message) return detail.message;
+    if (parsed?.message) return parsed.message;
+    return text;
+  } catch {
+    return text;
+  }
+}
+
+/**
  * 对话测试页：选择模型后向 /v1/chat/completions 发起流式（SSE）对话，
  * 实时渲染增量回复。模型列表优先取分类接口（按供应商分组 + chip 筛选 + 搜索），
  * 失败时依次回退到 OpenAI 风格与管理端列表接口；支持采样参数面板、
@@ -244,7 +265,8 @@ export function ChatTestPage() {
       });
 
       if (!response.ok) {
-        throw new Error(`HTTP ${response.status}`);
+        const raw = await response.text().catch(() => '');
+        throw new Error(`HTTP ${response.status}: ${extractErrorMessage(raw)}`);
       }
 
       const reader = response.body?.getReader();
@@ -253,6 +275,8 @@ export function ChatTestPage() {
       const decoder = new TextDecoder();
       let buffer = '';
       let fullContent = '';
+      let sseEvent = '';
+      let sseError = '';
 
       while (true) {
         const { done, value } = await reader.read();
@@ -264,11 +288,23 @@ export function ChatTestPage() {
 
         for (const line of lines) {
           const trimmed = line.trim();
-          if (!trimmed || trimmed === 'data: [DONE]') continue;
+          if (!trimmed) continue;
+          if (trimmed.startsWith('event:')) {
+            sseEvent = trimmed.slice(6).trim();
+            continue;
+          }
+          if (trimmed === 'data: [DONE]') continue;
           if (!trimmed.startsWith('data: ')) continue;
 
           try {
             const json = JSON.parse(trimmed.slice(6));
+            const payloadError = json.error;
+            if (sseEvent === 'error' || payloadError) {
+              sseError = payloadError?.message ?? json.message ?? sseError;
+              sseEvent = '';
+              continue;
+            }
+            sseEvent = '';
             const delta = json.choices?.[0]?.delta;
             if (delta?.content) {
               fullContent += delta.content;
@@ -285,6 +321,10 @@ export function ChatTestPage() {
 
       if (fullContent) {
         setMessages(prev => [...prev, { role: 'assistant', content: fullContent, timestamp: Date.now() }]);
+      }
+
+      if (sseError) {
+        throw new Error(sseError);
       }
     } catch (e: unknown) {
       if (e instanceof DOMException && e.name === 'AbortError') return;
