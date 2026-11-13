@@ -111,11 +111,11 @@
     },
     "apiKeys": {
       "title": "API Key Authentication",
-      "desc": "Once at least one key is configured, inference and model-list endpoints require an Authorization: Bearer <key> or x-api-key header. Removing all keys disables authentication.",
+      "desc": "Once at least one key is configured, inference and model-list endpoints require an Authorization: Bearer <key> or x-api-key header. Removing all keys disables authentication. Submitting a non-empty list replaces all existing keys; include both old and new keys when rotating.",
       "current": "{{count}} key(s) configured (auth {{state}})",
       "enabled": "enabled",
       "disabled": "disabled",
-      "placeholder": "One new key per line; submitting empty keeps existing keys unchanged",
+      "placeholder": "Full replacement: one key per line; submitting overwrites all existing keys (include old keys you want to keep); empty submission keeps them unchanged",
       "save": "Save auth settings",
       "saving": "Saving…",
       "saved": "Auth settings saved",

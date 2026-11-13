@@ -164,25 +164,36 @@ JSON
   ok "STEP 5 完成"
 }
 
+# ----------- STEP 鉴权：未启用时无凭据应放行 -----------
+step_auth_open() {
+  section "STEP 鉴权: 未配置 [api_keys] 时无凭据访问 ${BASE_URL}/v1/models，期望 200"
+  local code
+  code=$(curl -sS -o /dev/null -w '%{http_code}' "$BASE_URL/v1/models")
+  echo "状态码: ${code}"
+  if [ "$code" = "200" ]; then
+    ok "鉴权未启用，无凭据放行"
+  else
+    fail "期望 200，实际 ${code}（若已配置 [api_keys]，启用场景请经管理端热更新后人工复验）"
+  fi
+}
+
 # ----------- 主入口 -----------
 case "${1:-all}" in
   models)       step_models ;;
   pick)         step_pick_model ;;
   chat)         step_chat_min ;;
   translate)    step_translate_no_tools && step_translate_empty_tools ;;
+  auth)         step_auth_open ;;
   all)
     step_models
     step_pick_model
     step_chat_min
     step_translate_no_tools
     step_translate_empty_tools
+    step_auth_open
     section "全部完成"
     echo "结果在: $OUT_DIR"
     echo "对比 04 vs 05 的响应字节数，看反代是否对空 tools 字段做了处理。"
     ;;
-  *) echo "用法: bash run.sh {models|pick|chat|translate|all}"; exit 2 ;;
+  *) echo "用法: bash run.sh {models|pick|chat|translate|auth|all}"; exit 2 ;;
 esac
-
-# ── STEP 鉴权：未启用时应放行（启用场景由管理端热更新后人工复验）──
-echo "=== AUTH-1: 未配置 [api_keys] 时无凭据访问 /v1/models，期望 200 ==="
-curl -sS -o /dev/null -w '%{http_code}\n' "$BASE_URL/v1/models"
