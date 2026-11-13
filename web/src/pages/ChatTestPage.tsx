@@ -257,11 +257,12 @@ export function ChatTestPage() {
         body.thinking = { type: 'enabled', budget_tokens: params.thinkingBudget };
       }
 
+      const token = getToken();
       const response = await fetch('/v1/chat/completions', {
         method: 'POST',
         headers: {
           'Content-Type': 'application/json',
-          ...(getToken() ? { Authorization: `Bearer ${getToken()}` } : {}),
+          ...(token ? { Authorization: `Bearer ${token}` } : {}),
         },
         body: JSON.stringify(body),
         signal: abortController.signal,

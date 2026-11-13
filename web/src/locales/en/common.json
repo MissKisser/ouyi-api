@@ -119,6 +119,10 @@
       "save": "Save auth settings",
       "saving": "Saving…",
       "saved": "Auth settings saved",
+      "noChange": "No new key entered; existing configuration unchanged",
+      "clear": "Clear all keys and disable authentication",
+      "clearConfirm": "Clear all API keys and disable endpoint authentication?",
+      "cleared": "All keys cleared; authentication disabled",
       "tooShort": "A key is shorter than 16 characters"
     },
     "admin": {

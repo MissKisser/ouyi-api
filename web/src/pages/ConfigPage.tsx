@@ -230,12 +230,16 @@ export function ConfigPage() {
     }
   };
 
-  /** 保存接口鉴权设置：文本框为空表示保持现有 key；有内容则整体替换。 */
+  /** 保存接口鉴权设置：文本框为空不发起请求并提示保持不变；有内容则整体替换。 */
   const handleSaveApiKeys = async () => {
     const lines = apiKeyInput
       .split('\n')
       .map((line) => line.trim())
       .filter((line) => line.length > 0);
+    if (lines.length === 0) {
+      setMessage({ type: 'ok', text: t('config.apiKeys.noChange') });
+      return;
+    }
     if (lines.some((line) => line.length < 16)) {
       setMessage({ type: 'err', text: t('config.apiKeys.tooShort') });
       return;
@@ -243,12 +247,31 @@ export function ConfigPage() {
     setSavingApiKeys(true);
     setMessage(null);
     try {
-      const body = lines.length > 0 ? { api_keys: { keys: lines } } : { api_keys: {} };
-      await apiSaveConfig(body);
+      await apiSaveConfig({ api_keys: { keys: lines } });
       setMessage({ type: 'ok', text: t('config.apiKeys.saved') });
       setApiKeyInput('');
       const fresh = await apiFetchConfig();
       setConfig(fresh);
+    } catch (e: unknown) {
+      setMessage({
+        type: 'err',
+        text: t('config.saveFailed', { error: e instanceof Error ? e.message : String(e) }),
+      });
+    } finally {
+      setSavingApiKeys(false);
+    }
+  };
+
+  /** 清空全部 API key 并关闭接口鉴权：经确认后提交空 key 列表并回读刷新配置。 */
+  const handleClearApiKeys = async () => {
+    if (!window.confirm(t('config.apiKeys.clearConfirm'))) return;
+    setSavingApiKeys(true);
+    setMessage(null);
+    try {
+      await apiSaveConfig({ api_keys: { keys: [] } });
+      const fresh = await apiFetchConfig();
+      setConfig(fresh);
+      setMessage({ type: 'ok', text: t('config.apiKeys.cleared') });
     } catch (e: unknown) {
       setMessage({
         type: 'err',
@@ -587,9 +610,18 @@ export function ConfigPage() {
             rows={3}
             className="font-mono text-xs"
           />
-          <Button onClick={handleSaveApiKeys} disabled={savingApiKeys}>
-            {savingApiKeys ? t('config.apiKeys.saving') : t('config.apiKeys.save')}
-          </Button>
+          <div className="flex gap-2">
+            <Button onClick={handleSaveApiKeys} disabled={savingApiKeys}>
+              {savingApiKeys ? t('config.apiKeys.saving') : t('config.apiKeys.save')}
+            </Button>
+            <Button
+              variant="destructive"
+              onClick={handleClearApiKeys}
+              disabled={(config.api_keys?.length ?? 0) === 0 || savingApiKeys}
+            >
+              {t('config.apiKeys.clear')}
+            </Button>
+          </div>
         </CardContent>
       </Card>
 
