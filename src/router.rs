@@ -39,7 +39,10 @@ pub fn app(state: Arc<AppState>) -> Router<Arc<AppState>> {
             "/v1/chat/completions",
             post(handler::chat::chat_completions),
         )
-        .route("/openai/v1/chat/completions", post(handler::chat::chat_completions))
+        .route(
+            "/openai/v1/chat/completions",
+            post(handler::chat::chat_completions),
+        )
         .route("/openai/v1/responses", post(handler::responses::responses))
         .route("/v1/responses", post(handler::responses::responses))
         .route("/anthropic/v1/messages", post(handler::anthropic::messages))
@@ -742,14 +745,15 @@ mod tests {
 
     #[tokio::test]
     async fn inference_open_when_api_keys_not_configured() {
-        let state = make_state(OuyiPlatform::Ouyi8, "http://127.0.0.1:1".to_string(), String::new());
+        let state = make_state(
+            OuyiPlatform::Ouyi8,
+            "http://127.0.0.1:1".to_string(),
+            String::new(),
+        );
         let base_url = spawn_protocol_app(state).await;
         let client = reqwest::Client::builder().no_proxy().build().unwrap();
 
-        for headers in [
-            None,
-            Some(("authorization", "Bearer sk-anything-goes")),
-        ] {
+        for headers in [None, Some(("authorization", "Bearer sk-anything-goes"))] {
             let mut req = client.get(format!("{base_url}/v1/models"));
             if let Some((name, value)) = headers {
                 req = req.header(name, value);
@@ -761,7 +765,11 @@ mod tests {
 
     #[tokio::test]
     async fn inference_rejects_missing_or_wrong_key_when_enabled() {
-        let state = make_state(OuyiPlatform::Ouyi8, "http://127.0.0.1:1".to_string(), String::new());
+        let state = make_state(
+            OuyiPlatform::Ouyi8,
+            "http://127.0.0.1:1".to_string(),
+            String::new(),
+        );
         enable_api_keys(&state, &["sk-correct-key-0123456789"]).await;
         let base_url = spawn_protocol_app(state.clone()).await;
         let client = reqwest::Client::builder().no_proxy().build().unwrap();
@@ -797,7 +805,11 @@ mod tests {
 
     #[tokio::test]
     async fn inference_accepts_valid_key_and_admin_jwt_when_enabled() {
-        let state = make_state(OuyiPlatform::Ouyi8, "http://127.0.0.1:1".to_string(), String::new());
+        let state = make_state(
+            OuyiPlatform::Ouyi8,
+            "http://127.0.0.1:1".to_string(),
+            String::new(),
+        );
         enable_api_keys(&state, &["sk-correct-key-0123456789"]).await;
         let admin_token = state
             .admin_store
@@ -825,7 +837,11 @@ mod tests {
 
     #[tokio::test]
     async fn admin_login_unaffected_by_api_key_auth() {
-        let state = make_state(OuyiPlatform::Ouyi8, "http://127.0.0.1:1".to_string(), String::new());
+        let state = make_state(
+            OuyiPlatform::Ouyi8,
+            "http://127.0.0.1:1".to_string(),
+            String::new(),
+        );
         enable_api_keys(&state, &["sk-correct-key-0123456789"]).await;
         let base_url = spawn_protocol_app(state).await;
 

@@ -1440,8 +1440,8 @@ pub(super) async fn prepare_and_commit_config_update(
     if let Some(api_keys_update) = update.api_keys.as_ref()
         && let Some(raw_keys) = api_keys_update.keys.as_ref()
     {
-        let keys = crate::api_auth::normalize_keys(raw_keys)
-            .map_err(ConfigUpdateError::BadRequest)?;
+        let keys =
+            crate::api_auth::normalize_keys(raw_keys).map_err(ConfigUpdateError::BadRequest)?;
         // 空数组表示显式关闭鉴权并清空 key；数组非空但 normalize 后为空，说明
         // 全部为空白或掩码占位项，未提供真实 key，保留既有 api_keys 不变。
         if !keys.is_empty() || raw_keys.is_empty() {
@@ -1476,8 +1476,7 @@ pub(super) async fn prepare_and_commit_config_update(
     // 所有配置改动。仅当用户在 platform.default 字段实际改了选择时才走这条路径。
     if let Some(target) = platform_switch_target {
         // 用最新配置构造目标平台的 client
-        let new_client =
-            crate::build_ouyi_client(&state.http_client, &persisted, target);
+        let new_client = crate::build_ouyi_client(&state.http_client, &persisted, target);
         let new_base_url = match &new_client {
             crate::client::OuyiClient::V7(v7) => v7.base_url().to_string(),
             crate::client::OuyiClient::V8(_) => persisted.ouyi.base_url.clone(),
@@ -1507,14 +1506,19 @@ pub(super) async fn prepare_and_commit_config_update(
                     let count = catalog.models.len();
                     // V7：把路由表同步给 client（customAIModels/aiModels 的路由决策）
                     if let crate::client::OuyiClient::V7(v7) = &*client {
-                        let table = crate::client::ouyi_v7::build_routing_table_from_catalog(&catalog);
+                        let table =
+                            crate::client::ouyi_v7::build_routing_table_from_catalog(&catalog);
                         v7.update_routing(table);
                     }
                     reload_state.model_mapper.load_from_catalog(&catalog);
                     let mut status = reload_state.platform_status.write().await;
                     status.model_count = reload_state.model_mapper.model_count();
                     status.token_valid = count > 0;
-                    tracing::info!(platform = status.platform.label(), count, "切换平台后模型列表已刷新");
+                    tracing::info!(
+                        platform = status.platform.label(),
+                        count,
+                        "切换平台后模型列表已刷新"
+                    );
                 }
                 Err(e) => {
                     tracing::warn!(error = %e, "切换平台后模型列表加载失败，等待后台刷新任务兜底");

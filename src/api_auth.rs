@@ -205,8 +205,14 @@ mod tests {
 
     #[test]
     fn constant_time_eq_matches_only_identical_values() {
-        assert!(constant_time_eq("sk-a-0123456789abcdef", "sk-a-0123456789abcdef"));
-        assert!(!constant_time_eq("sk-a-0123456789abcdef", "sk-b-0123456789abcdef"));
+        assert!(constant_time_eq(
+            "sk-a-0123456789abcdef",
+            "sk-a-0123456789abcdef"
+        ));
+        assert!(!constant_time_eq(
+            "sk-a-0123456789abcdef",
+            "sk-b-0123456789abcdef"
+        ));
         assert!(!constant_time_eq("short", "sk-a-0123456789abcdef"));
     }
 

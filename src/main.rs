@@ -236,7 +236,8 @@ async fn main() -> Result<(), AppError> {
                 Ok(catalog) => {
                     // V7：catalog 加载后同步模型路由表给 client（customAIModels/aiModels 的路由决策）
                     if let crate::client::OuyiClient::V7(v7) = &*client {
-                        let table = crate::client::ouyi_v7::build_routing_table_from_catalog(&catalog);
+                        let table =
+                            crate::client::ouyi_v7::build_routing_table_from_catalog(&catalog);
                         v7.update_routing(table);
                     }
                     refresh_state.model_mapper.load_from_catalog(&catalog);
