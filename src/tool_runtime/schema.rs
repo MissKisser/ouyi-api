@@ -12,6 +12,7 @@ use crate::tool_runtime::protocol::ToolSpec;
 /// - `Edit`：`old_string` / `new_string` 替换为对应的 `*_ref`；
 /// - `MultiEdit`：`edits[].items` 内的两个文本字段替换为 `*_ref`；
 /// - 其它工具原样克隆返回。
+///
 /// `required` 列表中的同名项同步替换；schema 结构不符合预期时保持原样。
 ///
 /// # 参数

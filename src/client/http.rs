@@ -70,6 +70,7 @@ impl OuyiHttpClient {
     ///
     /// 副作用：向上游发起 POST 请求，并在上游侧创建会话。
     /// * `model` - 会话使用的模型名
+    ///
     /// 返回 `Err(AppError::Upstream)`：请求失败、状态非 2xx、响应解析
     /// 失败、业务码非 0 或返回空数据。
     pub async fn create_session(&self, model: &str) -> Result<SessionData, AppError> {
@@ -108,6 +109,7 @@ impl OuyiHttpClient {
     ///
     /// 副作用：向上游发起 DELETE 请求，销毁上游侧会话。
     /// * `session_id` - 上游会话 ID
+    ///
     /// 返回 `Err(AppError::Upstream)`：请求失败或状态非 2xx。
     pub async fn delete_session(&self, session_id: i64) -> Result<(), AppError> {
         let url = format!("{}/api/chat/session/{}", self.base_url, session_id);
@@ -126,6 +128,7 @@ impl OuyiHttpClient {
     /// * `session_id` - 上游会话 ID
     /// * `text` - 发送的文本内容
     /// * `thinking` - 是否开启深度思考模式
+    ///
     /// 返回 `Err(AppError::Upstream)`：请求失败或状态非 2xx；
     /// 响应流的读取与解析由调用方负责。
     pub async fn chat_stream(

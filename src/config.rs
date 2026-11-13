@@ -257,6 +257,7 @@ impl AppConfig {
 
     /// 从指定路径加载并解析配置。
     /// - `path`: TOML 配置文件路径。
+    ///
     /// 返回 `Err`：文件不可读，或解析出的字段不符合结构定义。
     pub fn load_from_path(path: &Path) -> Result<Self, Box<dyn std::error::Error>> {
         let content = std::fs::read_to_string(path)?;

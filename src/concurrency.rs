@@ -65,6 +65,7 @@ impl ConcurrencyLimiter {
 
     /// 调整并发上限。
     /// - `max`: 新上限；`0` 表示不限流。
+    ///
     /// 只影响后续的申请判定：已持有的名额不会因调低上限而被强制回收。
     pub fn set_limit(&self, max: usize) {
         lock_state(&self.state).max = max;
@@ -80,6 +81,7 @@ impl ConcurrencyLimiter {
 /// 请求进入处理器前先申请名额；申请失败时立即返回 429，并按路径前缀区分错误信封：
 /// - `/anthropic` 前缀：Anthropic 风格的 `rate_limit_error` 信封；
 /// - 其它路径：OpenAI 风格的 `rate_limit_error`（`code = concurrency_limit_exceeded`）信封。
+///
 /// 拒绝响应均携带 `Retry-After: 1`。
 /// 取得名额后，名额凭证被移入响应体：响应体存活期间持续占坑，
 /// 保证流式响应传输期间名额不被提前释放。

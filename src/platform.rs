@@ -91,6 +91,7 @@ pub fn parse_platform_choice(input: &str) -> Option<OuyiPlatform> {
 
 /// 交互式选择平台：向终端打印选项并循环读取输入，直到得到合法选择。
 /// - `is_terminal`: 进程是否连接交互终端；为 `false` 时直接返回 `Err`，不发起询问。
+///
 /// 副作用：写标准输出、读标准输入（阻塞等待用户输入）。
 /// 返回 `Err(String)`：非交互终端、输入流关闭或读取失败。
 pub fn select_platform(is_terminal: bool) -> Result<OuyiPlatform, String> {

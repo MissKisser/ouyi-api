@@ -23,6 +23,7 @@ use crate::handler;
 ///   `/v1/responses`、`/anthropic/v1/messages`、`/anthropic/messages`，全部经过
 ///   [`limit_inference_requests`] 限流与 [`reject_tool_runtime_recursion`] 递归防护。
 /// - `limiter`: 全局并发限流器（与 `AppState` 中的实例共享同一份计数）。
+///
 /// 返回以 `Arc<AppState>` 为状态的 `Router`，由 `main` 再合并管理后台与静态资源路由。
 pub fn app(limiter: ConcurrencyLimiter) -> Router<Arc<AppState>> {
     let models = Router::new()

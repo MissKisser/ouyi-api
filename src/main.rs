@@ -303,6 +303,7 @@ async fn shutdown_signal() {
 /// 根据平台构造对应的平台客户端。
 /// - 7.0：读取 `[ouyi_v7]` 段（缺字段时使用内置默认值），空 Token 视为未配置；
 /// - 8.0：读取 `[ouyi]` 段。
+///
 /// 返回封装好基础地址与凭证的 [`OuyiClient`]，不发起网络请求。
 pub(crate) fn build_ouyi_client(
     http_client: &reqwest::Client,
@@ -375,6 +376,7 @@ fn build_ouyi_client_with_token(
 /// 从平台客户端拉取模型目录。
 /// - 7.0：串行请求成员信息与模型枚举接口后合成目录，模型列表为空时报错；
 /// - 8.0：请求模板接口并解析为目录。
+///
 /// 副作用：向上游发起网络请求。
 /// 返回 `Err(AppError::Upstream)`：任一上游请求失败或模型列表为空。
 pub(crate) async fn load_platform_catalog(client: &OuyiClient) -> Result<ModelCatalog, AppError> {

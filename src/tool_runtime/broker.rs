@@ -130,6 +130,7 @@ fn extract_explicit_command(raw: &str) -> Option<String> {
 /// 当前支持两类规则（均要求对应工具在 `tools` 中存在）：
 /// - "执行命令：" / "Bash 执行命令：" 后跟代码块或单行命令 → 调用 Bash；
 /// - "读取文件 " / "读取文件：" / "Read 文件 " 后跟单行路径 → 调用 Read。
+///
 /// 多行自然语言不会命中 Bash 规则。
 ///
 /// # 参数
