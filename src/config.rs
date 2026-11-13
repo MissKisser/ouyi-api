@@ -321,11 +321,12 @@ pub fn write_app_config(path: &Path, config: &AppConfig) -> Result<AppConfig, Ap
 
         match &config.api_keys {
             Some(section) => {
+                let table = ensure_table(doc, "api_keys")?;
                 let mut keys = toml_edit::Array::new();
                 for key in &section.keys {
                     keys.push(key.as_str());
                 }
-                doc["api_keys"]["keys"] = toml_edit::value(keys);
+                table["keys"] = toml_edit::value(keys);
             }
             None => {
                 doc.remove("api_keys");
@@ -905,6 +906,193 @@ preserved = true
         assert!(content.contains("# keep this comment"));
 
         let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn test_write_app_config_persists_api_keys_with_standard_table_header() {
+        struct TempFileGuard(std::path::PathBuf);
+
+        impl Drop for TempFileGuard {
+            fn drop(&mut self) {
+                let _ = std::fs::remove_file(&self.0);
+            }
+        }
+
+        let temp_file = TempFileGuard(
+            std::env::temp_dir().join(format!("ouyi-api-keys-write-{}.toml", uuid::Uuid::new_v4())),
+        );
+        std::fs::write(
+            &temp_file.0,
+            r#"# keep api_keys roundtrip comment
+[server]
+host = "127.0.0.1"
+port = 3000
+
+[ouyi]
+base_url = "https://example.invalid"
+jwt_token = "test"
+app_version = "3.0.3"
+model_refresh_interval_secs = 3600
+
+[limits]
+request_timeout_secs = 30
+no_data_timeout_secs = 30
+max_response_bytes = 1048576
+max_messages_bytes = 1048576
+max_concurrent_requests = 1
+
+[custom]
+preserved = true
+"#,
+        )
+        .unwrap();
+
+        let mut config = AppConfig::load_from_path(&temp_file.0).unwrap();
+        config.api_keys = Some(ApiKeysConfig {
+            keys: vec![
+                "sk-inference-test-key-0001".to_string(),
+                "sk-inference-test-key-0002".to_string(),
+            ],
+        });
+
+        let persisted = write_app_config(&temp_file.0, &config).unwrap();
+
+        let content = std::fs::read_to_string(&temp_file.0).unwrap();
+        let parsed: toml::Value = content.parse().unwrap();
+
+        assert_eq!(persisted.api_keys, config.api_keys);
+        assert!(content.contains("[api_keys]"));
+        assert!(!content.contains("api_keys = {"));
+        let keys = parsed["api_keys"]["keys"].as_array().unwrap();
+        assert_eq!(keys.len(), 2);
+        assert_eq!(keys[0].as_str(), Some("sk-inference-test-key-0001"));
+        assert_eq!(keys[1].as_str(), Some("sk-inference-test-key-0002"));
+        assert_eq!(parsed["custom"]["preserved"].as_bool(), Some(true));
+        assert_eq!(parsed["server"]["port"].as_integer(), Some(3000));
+        assert!(content.contains("# keep api_keys roundtrip comment"));
+    }
+
+    #[test]
+    fn test_write_app_config_removes_api_keys_section_when_none() {
+        struct TempFileGuard(std::path::PathBuf);
+
+        impl Drop for TempFileGuard {
+            fn drop(&mut self) {
+                let _ = std::fs::remove_file(&self.0);
+            }
+        }
+
+        let temp_file = TempFileGuard(std::env::temp_dir().join(format!(
+            "ouyi-api-keys-remove-{}.toml",
+            uuid::Uuid::new_v4()
+        )));
+        std::fs::write(
+            &temp_file.0,
+            r#"
+[server]
+host = "127.0.0.1"
+port = 3000
+
+[ouyi]
+base_url = "https://example.invalid"
+jwt_token = "test"
+app_version = "3.0.3"
+model_refresh_interval_secs = 3600
+
+[limits]
+request_timeout_secs = 30
+no_data_timeout_secs = 30
+max_response_bytes = 1048576
+max_messages_bytes = 1048576
+max_concurrent_requests = 1
+
+[api_keys]
+keys = ["sk-inference-test-key-0001"]
+
+[custom]
+preserved = true
+"#,
+        )
+        .unwrap();
+
+        let mut config = AppConfig::load_from_path(&temp_file.0).unwrap();
+        config.api_keys = None;
+
+        write_app_config(&temp_file.0, &config).unwrap();
+
+        let content = std::fs::read_to_string(&temp_file.0).unwrap();
+        let parsed: toml::Value = content.parse().unwrap();
+
+        assert!(parsed.get("api_keys").is_none());
+        assert!(!content.contains("api_keys"));
+        assert_eq!(parsed["custom"]["preserved"].as_bool(), Some(true));
+        assert_eq!(parsed["server"]["port"].as_integer(), Some(3000));
+    }
+
+    #[test]
+    fn test_write_app_config_rejects_scalar_api_keys_without_panicking() {
+        struct TempFileGuard(std::path::PathBuf);
+
+        impl Drop for TempFileGuard {
+            fn drop(&mut self) {
+                let _ = std::fs::remove_file(&self.0);
+            }
+        }
+
+        let temp_file = TempFileGuard(std::env::temp_dir().join(format!(
+            "ouyi-api-keys-scalar-{}.toml",
+            uuid::Uuid::new_v4()
+        )));
+        let original = r#"api_keys = "scalar"
+
+[server]
+host = "127.0.0.1"
+port = 3000
+
+[ouyi]
+base_url = "https://example.invalid"
+jwt_token = "test"
+app_version = "3.0.3"
+model_refresh_interval_secs = 3600
+
+[limits]
+request_timeout_secs = 30
+no_data_timeout_secs = 30
+max_response_bytes = 1048576
+max_messages_bytes = 1048576
+max_concurrent_requests = 1
+"#;
+        std::fs::write(&temp_file.0, original).unwrap();
+
+        let mut config = toml::from_str::<AppConfig>(
+            r#"
+[server]
+host = "127.0.0.1"
+port = 3000
+
+[ouyi]
+base_url = "https://example.invalid"
+jwt_token = "test"
+app_version = "3.0.3"
+model_refresh_interval_secs = 3600
+
+[limits]
+request_timeout_secs = 30
+no_data_timeout_secs = 30
+max_response_bytes = 1048576
+max_messages_bytes = 1048576
+max_concurrent_requests = 1
+"#,
+        )
+        .unwrap();
+        config.api_keys = Some(ApiKeysConfig {
+            keys: vec!["sk-inference-test-key-0001".to_string()],
+        });
+
+        let result = write_app_config(&temp_file.0, &config);
+
+        assert!(matches!(result, Err(AppError::Config(_))));
+        assert_eq!(std::fs::read_to_string(&temp_file.0).unwrap(), original);
     }
 
     #[test]

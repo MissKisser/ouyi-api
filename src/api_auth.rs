@@ -26,7 +26,7 @@ pub fn normalize_keys(raw: &[String]) -> Result<Vec<String>, String> {
     Ok(keys)
 }
 
-/// 判断值是否为掩码占位（与账号 token 掩码约定一致：包含 `…` 且以非空白字符起止）。
+/// 判断值是否为掩码占位值：包含 `…` 或 `****` 的项视为表示保留已有 key 的占位，跳过更新。
 fn is_masked(value: &str) -> bool {
     value.contains('…') || value.contains("****")
 }
