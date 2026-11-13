@@ -182,3 +182,7 @@ case "${1:-all}" in
     ;;
   *) echo "用法: bash run.sh {models|pick|chat|translate|all}"; exit 2 ;;
 esac
+
+# ── STEP 鉴权：未启用时应放行（启用场景由管理端热更新后人工复验）──
+echo "=== AUTH-1: 未配置 [api_keys] 时无凭据访问 /v1/models，期望 200 ==="
+curl -sS -o /dev/null -w '%{http_code}\n' "$BASE_URL/v1/models"
