@@ -110,10 +110,16 @@
       "add": "添加账号"
     },
     "apiKeys": {
-      "description": "描述",
-      "placeholder": "描述",
-      "add": "添加 API Key",
-      "copyTitle": "复制"
+      "title": "接口鉴权（API Key）",
+      "desc": "配置至少一个 key 后，推理与模型列表接口要求携带 Authorization: Bearer <key> 或 x-api-key 请求头；清空全部 key 即关闭鉴权。",
+      "current": "当前已配置 {{count}} 个 key（鉴权{{state}}）",
+      "enabled": "已启用",
+      "disabled": "未启用",
+      "placeholder": "输入新的 key，每行一个；留空提交表示保持现有 key 不变",
+      "save": "保存鉴权设置",
+      "saving": "保存中…",
+      "saved": "鉴权设置已保存",
+      "tooShort": "存在长度不足 16 个字符的 key"
     },
     "admin": {
       "passwordSet": "密码已设置",

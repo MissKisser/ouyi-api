@@ -110,10 +110,16 @@
       "add": "Add Account"
     },
     "apiKeys": {
-      "description": "Description",
-      "placeholder": "Description",
-      "add": "Add API Key",
-      "copyTitle": "Copy"
+      "title": "API Key Authentication",
+      "desc": "Once at least one key is configured, inference and model-list endpoints require an Authorization: Bearer <key> or x-api-key header. Removing all keys disables authentication.",
+      "current": "{{count}} key(s) configured (auth {{state}})",
+      "enabled": "enabled",
+      "disabled": "disabled",
+      "placeholder": "One new key per line; submitting empty keeps existing keys unchanged",
+      "save": "Save auth settings",
+      "saving": "Saving…",
+      "saved": "Auth settings saved",
+      "tooShort": "A key is shorter than 16 characters"
     },
     "admin": {
       "passwordSet": "Password set",

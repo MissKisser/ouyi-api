@@ -1,7 +1,7 @@
 import { useState, useRef, useEffect, useCallback, useMemo } from 'react';
 import { useTranslation } from 'react-i18next';
 import { Send, Settings2, Trash2, Copy, RefreshCw, Search, Check, ChevronDown } from 'lucide-react';
-import { apiFetchModels, apiFetchCategorizedModels, apiFetchModelsOpenAI, type ModelInfo, type CategorizedModelGroup } from '@/lib/api';
+import { apiFetchModels, apiFetchCategorizedModels, apiFetchModelsOpenAI, getToken, type ModelInfo, type CategorizedModelGroup } from '@/lib/api';
 import { Button } from '@/components/ui/button';
 import { Textarea } from '@/components/ui/textarea';
 import { Label } from '@/components/ui/label';
@@ -259,7 +259,10 @@ export function ChatTestPage() {
 
       const response = await fetch('/v1/chat/completions', {
         method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
+        headers: {
+          'Content-Type': 'application/json',
+          ...(getToken() ? { Authorization: `Bearer ${getToken()}` } : {}),
+        },
         body: JSON.stringify(body),
         signal: abortController.signal,
       });
