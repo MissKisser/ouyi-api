@@ -1,3 +1,8 @@
+//! OpenAI ChatCompletion 请求到 ouyi 文本协议的请求适配。
+//!
+//! 将多轮消息（system / user / assistant / tool）拍平为带角色前缀的单段文本，
+//! 工具调用与工具结果以标记块形式内嵌，并在请求携带工具定义时
+//! 注入工具调用格式说明与强制工具提示。
 use crate::model::openai::ChatCompletionRequest;
 
 const TOOL_CALL_FORMAT: &str = concat!(
@@ -28,9 +33,14 @@ const TOOL_CALL_REMINDER: &str = concat!(
     "\n\n【工具调用提醒】如果你无法仅凭已有知识完成当前任务，请思考需要调用哪个工具，然后直接输出工具调用标记。不要犹豫，直接行动。",
 );
 
+/// 转换后的 ouyi 请求载荷。
 pub struct OuyiRequest {
+    /// 拼接后的系统提示（含工具使用说明）；请求中无系统内容时为 `None`。
     pub system_prompt: Option<String>,
+    /// 拍平后的对话正文，按 `[User]:` / `[Assistant]:` 等前缀区分角色，
+    /// 工具调用以标记块内嵌、工具结果以 `<tool_result>` 包裹。
     pub text: String,
+    /// 是否启用思考模式；调用方判定为需要思考或模型名包含 `-thinking` 时为真。
     pub thinking: bool,
 }
 
@@ -99,6 +109,19 @@ fn build_tool_instruction_text(req: &ChatCompletionRequest) -> String {
     )
 }
 
+/// 将 OpenAI ChatCompletion 请求转换为 ouyi 文本协议请求。
+///
+/// - `openai_req`：OpenAI 格式请求，含多轮消息、工具定义与 `tool_choice`；
+/// - `model_full`：完整模型名，包含 `-thinking` 时启用思考模式；
+/// - `should_thinking`：调用方显式指定的思考开关，与模型名判定取或。
+///
+/// 转换规则：system 消息合并进 `system_prompt`（携带工具时工具说明在前）；
+/// assistant 消息携带的 tool_calls 还原为工具调用标记块；tool 结果按
+/// `tool_call_id` 反查工具名后以 `<tool_result>` 包裹；`tool_choice` 指定
+/// 强制工具时在正文末尾注入强制提示与未闭合的 `<think>` 引导块。
+///
+/// 返回拼装好的 [`OuyiRequest`]；`messages` 为空或 tool 结果找不到对应
+/// 工具名时返回 `Err`（错误信息为中文描述文本）。
 pub fn convert_request(
     openai_req: &ChatCompletionRequest,
     model_full: &str,

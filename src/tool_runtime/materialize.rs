@@ -1,3 +1,8 @@
+//! 工具入参中的 payload 引用落地（materialize）。
+//! 把工具调用入参里的 `*_ref` 引用字段替换为对应 payload 的正文，并对
+//! 长文本字段做直写限制——超过阈值的正文必须走 payload 引用传递，
+//! 防止工具模型直接内联超长内容。
+
 use crate::tool_runtime::payload::ToolPayload;
 
 const LONG_TEXT_LIMIT: usize = 1024;
@@ -11,6 +16,24 @@ const REF_FIELDS: &[(&str, &str)] = &[
 
 const LONG_TEXT_FIELDS: &[&str] = &["content", "old_string", "new_string", "command"];
 
+/// 递归落地 JSON 值中的 payload 引用。
+///
+/// 处理规则（对对象与数组递归生效）：
+/// - `content_ref` / `old_string_ref` / `new_string_ref` / `command_ref`
+///   字段被移除，并把对应目标字段（`content` / `old_string` / `new_string` /
+///   `command`）设置为引用的 payload 正文；
+/// - 目标字段若直接出现且长度超过 1024 字节，视为违规（必须走引用）。
+///
+/// # 参数
+/// - `value`：工具调用入参 JSON，修改原地生效。
+/// - `payloads`：本次请求可用的 payload 列表。
+///
+/// # 返回
+/// 全部引用落地成功返回 `Ok(())`。
+///
+/// # 错误
+/// 引用与目标字段同时存在、引用值不是字符串、引用 ID 不在 payloads 中、
+/// 或长文本字段未走引用时，返回描述性错误字符串。
 pub fn materialize_payload_refs(
     value: &mut serde_json::Value,
     payloads: &[ToolPayload],

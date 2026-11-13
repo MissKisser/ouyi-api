@@ -49,6 +49,8 @@ pub fn build_responses_response_from_pipeline(
     }
 }
 
+/// 把编译后的工具调用列表映射为 `function_call` 类型的输出项数组，
+/// 每个调用一项，`arguments` 为序列化后的 JSON 字符串。
 fn build_function_call_items(calls: &[CompiledToolCall]) -> Vec<ResponseOutputItem> {
     calls
         .iter()
@@ -65,6 +67,8 @@ fn build_function_call_items(calls: &[CompiledToolCall]) -> Vec<ResponseOutputIt
         .collect()
 }
 
+/// 把最终回答文本包装为单个 `message` 类型输出项，
+/// 内容为 `output_text` 内容块，不携带注解。
 fn build_message_item(text: &str) -> Vec<ResponseOutputItem> {
     vec![ResponseOutputItem {
         item_type: "message".to_string(),

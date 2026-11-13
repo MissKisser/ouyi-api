@@ -11,22 +11,35 @@ import { Input } from '@/components/ui/input';
 import { Collapsible, CollapsibleContent } from '@/components/ui/collapsible';
 import { compareProviders, localizeProviderName } from '@/lib/model-labels';
 
+/** 聊天界面中的单条消息。 */
 interface Message {
+  /** 消息角色：用户 / 助手 / 系统。 */
   role: 'user' | 'assistant' | 'system';
+  /** 消息文本内容。 */
   content: string;
+  /** 消息创建时间，毫秒时间戳（Date.now()）。 */
   timestamp: number;
 }
 
+/** 对话采样参数集合（对应 OpenAI 风格请求体字段）。 */
 interface ChatParams {
+  /** 温度系数，0–2，越高越随机。 */
   temperature: number;
+  /** 单次回复的最大输出 token 数。 */
   maxTokens: number;
+  /** 核采样累积概率阈值，0–1。 */
   topP: number;
+  /** 存在惩罚系数，-2 到 2。 */
   presencePenalty: number;
+  /** 频率惩罚系数，-2 到 2。 */
   frequencyPenalty: number;
+  /** 是否开启思考模式（携带 thinking 扩展字段）。 */
   thinking: boolean;
+  /** 思考模式的 token 预算，单位 token。 */
   thinkingBudget: number;
 }
 
+/** 参数面板的默认值，重置按钮恢复到该组数值。 */
 const DEFAULT_PARAMS: ChatParams = {
   temperature: 1.0,
   maxTokens: 8192,
@@ -37,6 +50,13 @@ const DEFAULT_PARAMS: ChatParams = {
   thinkingBudget: 4096,
 };
 
+/**
+ * 对话测试页：选择模型后向 /v1/chat/completions 发起流式（SSE）对话，
+ * 实时渲染增量回复。模型列表优先取分类接口（按供应商分组 + chip 筛选 + 搜索），
+ * 失败时依次回退到 OpenAI 风格与管理端列表接口；支持采样参数面板、
+ * 中止生成、清空会话与复制消息。副作用：加载与发送均发起网络请求，
+ * 复制写入剪贴板；发送期间以 requestAnimationFrame 节流流式内容更新。
+ */
 export function ChatTestPage() {
   const { t, i18n } = useTranslation();
   const [models, setModels] = useState<ModelInfo[]>([]);

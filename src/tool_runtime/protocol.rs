@@ -1,35 +1,64 @@
+//! 协议无关的工具规格层。
+//! 把 OpenAI 与 Anthropic 两种协议的工具定义、tool_choice 统一为内部规格
+//! （`ToolSpec` / `ToolChoiceSpec`），并在此层完成工具启用判定、tool_choice
+//! 约束校验与调用 ID 归一化，供 broker / 决策层与编译器共用。
+
 use crate::model::anthropic::AnthropicTool;
 use crate::model::openai::ToolDef;
 
+/// 判断 OpenAI Chat 请求是否启用了工具调用。
+///
+/// 条件：携带非空工具列表，且 `tool_choice` 不是字符串 `"none"`。
+///
+/// # 参数
+/// - `req`：OpenAI Chat 请求。
+///
+/// # 返回
+/// 工具调用启用时为 `true`。
 pub fn openai_tools_enabled(req: &crate::model::openai::ChatCompletionRequest) -> bool {
     req.tools.as_ref().is_some_and(|tools| !tools.is_empty())
         && req.tool_choice.as_ref().and_then(|choice| choice.as_str()) != Some("none")
 }
 
-/// 协议无关工具规格，用于 OpenAI 和 Anthropic 工具的统一表示
+/// 协议无关工具规格，用于 OpenAI 和 Anthropic 工具的统一表示。
 #[derive(Debug, Clone, PartialEq)]
 pub struct ToolSpec {
+    /// 工具名称。
     pub name: String,
+    /// 工具功能描述；OpenAI 侧缺省时为空串。
     pub description: String,
+    /// 工具入参的 JSON Schema；OpenAI 侧缺省时为空对象 schema。
     pub input_schema: serde_json::Value,
 }
 
-/// 工具端点类型
+/// 工具端点类型。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ToolEndpointKind {
+    /// OpenAI 协议端点。
     OpenAi,
+    /// Anthropic 协议端点（当前流程未消费，保留供统一抽象）。
     #[allow(dead_code)]
     Anthropic,
 }
 
-/// 工具选择规格
+/// 工具选择规格（协议无关的 tool_choice 表示）。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ToolChoiceSpec {
+    /// 由模型自行决定是否调用工具。
     Auto,
+    /// 强制必须产生工具调用。
     Required,
+    /// 强制调用指定名称的工具。
     Tool(String),
 }
 
+/// 把 Anthropic 的 ToolChoice 转换为协议无关规格。
+///
+/// # 参数
+/// - `choice`：Anthropic 请求中的 tool_choice；`None` 表示未设置。
+///
+/// # 返回
+/// 对应规格；未设置时为 `None`（auto 映射为 `Auto`，any 映射为 `Required`）。
 pub fn anthropic_tool_choice_to_spec(
     choice: Option<&crate::model::anthropic::ToolChoice>,
 ) -> Option<ToolChoiceSpec> {
@@ -43,6 +72,17 @@ pub fn anthropic_tool_choice_to_spec(
     }
 }
 
+/// 把 OpenAI 侧的 tool_choice JSON 转换为协议无关规格。
+///
+/// 字符串形式：`"auto"` / `"required"` / 其它值一律按 `Auto`；
+/// 对象形式：取 `function.name` 或顶层 `name` 映射为 `Tool`，取不到名称
+/// 时按 `Auto` 处理；其它类型按 `Auto` 处理。`None` 输入返回 `None`。
+///
+/// # 参数
+/// - `choice`：请求中的 tool_choice 原始 JSON。
+///
+/// # 返回
+/// 对应规格；输入为 `None` 时为 `None`。
 pub fn openai_tool_choice_to_spec(choice: Option<&serde_json::Value>) -> Option<ToolChoiceSpec> {
     choice.and_then(|tool_choice| {
         if let Some(value) = tool_choice.as_str() {
@@ -65,6 +105,21 @@ pub fn openai_tool_choice_to_spec(choice: Option<&serde_json::Value>) -> Option<
     })
 }
 
+/// 校验实际产生的工具调用是否满足 tool_choice 约束。
+///
+/// `Required` 要求至少有一个调用；`Tool(name)` 要求全部调用均为该工具。
+/// `Auto` 或未设置时不做约束。
+///
+/// # 参数
+/// - `choice`：请求的 tool_choice 规格。
+/// - `actual_names`：实际产生的工具调用名称列表（为空表示无调用）。
+///
+/// # 返回
+/// 约束满足返回 `Ok(())`。
+///
+/// # 错误
+/// 约束不满足时返回 `AppError::ToolProtocol`，消息含
+/// `expected=<约束>` 与 `actual=<实际调用>`。
 pub fn validate_tool_choice(
     choice: Option<&ToolChoiceSpec>,
     actual_names: &[String],
@@ -93,25 +148,47 @@ pub fn validate_tool_choice(
     Ok(())
 }
 
+/// 将工具调用 ID 就地重写为 `call_proxy_<uuid>` 形式。
+///
+/// 上游可能输出重复或不唯一的调用 ID，统一重写可保证 ID 全局唯一，
+/// 避免账本与会话记录互相串扰。
+///
+/// # 参数
+/// - `ids`：待重写的调用 ID 可变引用迭代。
 pub fn normalize_tool_call_ids<'a>(ids: impl IntoIterator<Item = &'a mut String>) {
     for id in ids {
         *id = format!("call_proxy_{}", uuid::Uuid::new_v4().simple());
     }
 }
 
-/// 工具运行时请求上下文，用于抽象不同端点的工具编译
+/// 工具运行时请求上下文，用于抽象不同端点的工具编译。
 #[derive(Debug, Clone)]
 pub struct ToolRuntimeRequestContext {
+    /// 请求来源端点类型。
     pub endpoint: ToolEndpointKind,
+    /// 请求的模型标识（当前流程未消费，保留供统一抽象）。
     #[allow(dead_code)]
     pub model: String,
+    /// 规范化后的会话时间线。
     pub transcript: Vec<crate::tool_runtime::context::TranscriptItem>,
+    /// 可用工具规格列表。
     pub tools: Vec<ToolSpec>,
+    /// 工具选择规格。
     pub tool_choice: Option<ToolChoiceSpec>,
+    /// 主模型输出中抽离的长文本负载。
     pub payloads: Vec<crate::tool_runtime::payload::ToolPayload>,
 }
 
-/// 将 OpenAI 工具定义转换为协议无关规格
+/// 将 OpenAI 工具定义转换为协议无关规格。
+///
+/// 仅保留 `type == "function"` 的定义；description / parameters 缺省时
+/// 分别取空串与空对象 schema。
+///
+/// # 参数
+/// - `tools`：OpenAI 工具定义列表。
+///
+/// # 返回
+/// 转换后的工具规格列表，顺序与输入一致。
 pub fn openai_tools_to_specs(tools: &[ToolDef]) -> Vec<ToolSpec> {
     tools
         .iter()
@@ -128,7 +205,13 @@ pub fn openai_tools_to_specs(tools: &[ToolDef]) -> Vec<ToolSpec> {
         .collect()
 }
 
-/// 将 Anthropic 工具定义转换为协议无关规格
+/// 将 Anthropic 工具定义转换为协议无关规格。
+///
+/// # 参数
+/// - `tools`：Anthropic 工具定义列表。
+///
+/// # 返回
+/// 转换后的工具规格列表，字段一一对应，顺序与输入一致。
 pub fn anthropic_tools_to_specs(tools: &[AnthropicTool]) -> Vec<ToolSpec> {
     tools
         .iter()
@@ -140,7 +223,21 @@ pub fn anthropic_tools_to_specs(tools: &[AnthropicTool]) -> Vec<ToolSpec> {
         .collect()
 }
 
-/// 将 OpenAI ChatCompletionRequest 转换为工具运行时上下文
+/// 将 OpenAI Chat 请求转换为工具运行时上下文。
+///
+/// 消息历史经 context 模块规范化为时间线，tool_choice 转为规格表示，
+/// 负载列表初始为空（由调用方在提取 payload 后填充）。
+///
+/// # 参数
+/// - `req`：OpenAI Chat 请求。
+/// - `tools`：已转换的工具规格列表。
+///
+/// # 返回
+/// 端点标记为 OpenAi 的工具运行时上下文。
+///
+/// # 错误
+/// 消息历史不规范（工具结果缺 ID、调用参数 JSON 非法等）时返回
+/// `AppError::BadRequest`。
 pub fn openai_request_to_context(
     req: &crate::model::openai::ChatCompletionRequest,
     tools: Vec<ToolSpec>,

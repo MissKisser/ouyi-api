@@ -1,3 +1,11 @@
+//! 配置文件持久化模块。
+//!
+//! 提供对 `config.toml` 的"读取 → 修改 → 校验 → 原子替换"写入通道：
+//! - 进程内互斥锁（`CONFIG_FILE_LOCK`）串行化所有写入，避免并发写互相覆盖；
+//! - 修改后的候选文本先经 `AppConfig` 反序列化校验，失败则放弃写入，原文件保持不变；
+//! - 替换通过"同目录唯一临时文件 + rename"实现：Unix 下继承原文件权限并 fsync 目录，
+//!   Windows 下目标存在时先移除再 rename；任一步失败都会清理临时文件。
+
 use std::fs::{self, OpenOptions};
 use std::io::Write;
 use std::path::Path;
@@ -11,6 +19,19 @@ use crate::error::AppError;
 
 static CONFIG_FILE_LOCK: Mutex<()> = Mutex::new(());
 
+/// 以回调方式修改配置文件并原子持久化。
+///
+/// 执行顺序（全程持有进程内配置写锁）：
+/// 1. 读取 `path` 的原始文本并解析为 `toml_edit::DocumentMut`，保留注释与未知段落；
+/// 2. 调用 `mutate` 原地修改文档；`mutate` 返回错误时立即中止，原文件保持不变；
+/// 3. 将候选文本反序列化为 [`AppConfig`] 校验合法性，失败则中止且原文件不变；
+/// 4. 通过同目录临时文件 + rename 原子替换目标文件（Unix 继承原文件权限并 fsync 目录）。
+///
+/// - `path`: 配置文件路径。
+/// - `mutate`: 对 TOML 文档的原地修改闭包，返回 `Err` 时放弃整次写入。
+/// - 返回：替换成功后重新解析出的 `AppConfig`。
+/// - 返回 `Err(AppError::Config)`：文件读取、解析、候选校验或替换失败；
+///   `Err(AppError::Internal)`：进程内配置写锁已损坏。
 pub fn update_document<F>(path: &Path, mutate: F) -> Result<AppConfig, AppError>
 where
     F: FnOnce(&mut toml_edit::DocumentMut) -> Result<(), AppError>,
@@ -31,6 +52,9 @@ where
     Ok(config)
 }
 
+/// （仅测试）将整份 TOML 文档原子写入 `path`，不做候选校验。
+/// 与 [`update_document`] 共用同一把进程内写锁与原子替换流程。
+/// 返回 `Err(AppError::Internal)`：写锁损坏；`Err(AppError::Config)`：临时文件或替换失败。
 #[cfg(test)]
 pub fn write_document(path: &Path, document: &toml_edit::DocumentMut) -> Result<(), AppError> {
     let _guard = CONFIG_FILE_LOCK
@@ -39,6 +63,8 @@ pub fn write_document(path: &Path, document: &toml_edit::DocumentMut) -> Result<
     atomic_replace_unlocked(path, document.to_string().as_bytes())
 }
 
+/// （仅测试）将原始字节原子写入 `path`，绕过文档解析与候选校验。
+/// 错误情形与 [`write_document`] 相同。
 #[cfg(test)]
 pub fn atomic_replace(path: &Path, bytes: &[u8]) -> Result<(), AppError> {
     let _guard = CONFIG_FILE_LOCK
@@ -47,12 +73,17 @@ pub fn atomic_replace(path: &Path, bytes: &[u8]) -> Result<(), AppError> {
     atomic_replace_unlocked(path, bytes)
 }
 
+/// 解析目标文件的父目录；裸文件名（无目录部分）返回当前目录 `.`。
 fn parent_directory(path: &Path) -> &Path {
     path.parent()
         .filter(|parent| !parent.as_os_str().is_empty())
         .unwrap_or_else(|| Path::new("."))
 }
 
+/// 原子替换文件内容（调用方需已持有配置写锁）。
+/// 在同目录创建唯一命名的临时文件写入 `bytes`（Unix 下继承原文件权限），`sync_all` 落盘后
+/// rename 到目标路径（Windows 下目标存在时先移除）；Unix 下再 fsync 父目录保证落盘顺序。
+/// 任一步失败都会尽力删除临时文件并返回 `Err(AppError::Config)`。
 fn atomic_replace_unlocked(path: &Path, bytes: &[u8]) -> Result<(), AppError> {
     let parent = parent_directory(path);
     let file_name = path

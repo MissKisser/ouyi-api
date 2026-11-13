@@ -1,3 +1,9 @@
+//! Anthropic Messages API 端点：`POST /anthropic/v1/messages`、`POST /anthropic/messages`
+//! 以及 Anthropic 风格模型列表 `GET /anthropic/v1/models`。
+//! 职责：模型路由解析、工具运行时路由决策（原 Ouyi 链路 / 编译器链路）、
+//! 上游会话创建与工具会话复用缓存、SSE 流式与非流式响应合成、
+//! 长时任务轮询、以及统计与上游会话清理。
+
 use std::sync::Arc;
 
 use axum::Json;
@@ -23,11 +29,14 @@ use crate::tool_runtime;
 
 const TOOL_RESULT_CONTENT_MAX_BYTES: usize = 64 * 1024;
 
-/// 工具运行时路由决策
+/// 工具运行时路由决策：描述一次 Messages 请求应由哪条链路处理。
 #[derive(Debug, Clone)]
 pub enum RuntimeRoute {
+    /// 无工具调用诉求，直接走原 Ouyi 上游链路。
     OriginalOuyi,
+    /// 请求携带工具且工具模型支持，交由编译器 / broker 链路判定工具调用或最终回答。
     Compiler,
+    /// 请求携带工具但配置的工具模型接口类型不支持，携带的错误信息会转成配置错误返回。
     ConfigError(String),
 }
 
@@ -54,7 +63,12 @@ fn resolve_model_routing(
     }
 }
 
-/// 根据请求与配置返回工具运行时路由决策
+/// 根据请求与配置返回工具运行时路由决策。
+/// `req` 为 Anthropic Messages 请求体，`tool_runtime_config` 为当前的工具运行时配置（可为缺省）。
+/// 判定规则：请求未启用工具调用时走原 Ouyi 链路；启用工具但未配置工具运行时、
+/// 或配置的 provider 为 Anthropic / OpenAI 兼容接口时走 Compiler 链路；
+/// 配置了其它不支持的 provider 时返回 `ConfigError`。
+/// 纯决策函数，无副作用、不发起网络请求。
 pub fn runtime_route(
     req: &MessagesRequest,
     tool_runtime_config: Option<&crate::config::ToolRuntimeConfig>,
@@ -96,6 +110,10 @@ struct AnthropicModelList {
     data: Vec<AnthropicModelEntry>,
 }
 
+/// 列出当前可用的模型（Anthropic `GET /anthropic/v1/models` 协议）。
+/// 从 `model_mapper` 取全部短模型名，逐项生成 `id` 与 `display_name`（均为短名）、
+/// `type` 固定为 `"model"`。返回体形如 `{ "data": [...] }`。
+/// 该端点只读本地映射表，不发起上游请求、无失败分支。
 pub async fn list_models(State(state): State<Arc<AppState>>) -> impl IntoResponse {
     let short_names = state.model_mapper.get_all_short_names();
     let models: Vec<AnthropicModelEntry> = short_names
@@ -548,6 +566,27 @@ fn prune_stale_tool_sessions(state: &AppState, config: &AppConfig) {
     }
 }
 
+/// Anthropic Messages 推理入口（`POST /anthropic/v1/messages` 与 `POST /anthropic/messages`）。
+///
+/// 入参 `req` 为 Anthropic Messages 请求体：`model` 为对外短模型名，
+/// `messages` 为对话消息序列（可为纯文本或内容块，含 `tool_result` 回传），
+/// `stream` 决定 SSE 流式或 JSON 非流式，`tools` / `tool_choice` 启用工具调用，
+/// `thinking` 控制思考模式。
+///
+/// 处理步骤：解析模型路由并记录日志；若请求携带 `tool_result` 且命中已注册的长时任务，
+/// 直接返回轮询响应（或按轮询结果报错）；随后按当前平台分派——
+/// Ouyi7 平台走独立客户端链路，Ouyi8 平台按 `runtime_route` 决策走原 Ouyi 链路
+/// 或编译器工具运行时链路（配置不支持时返回配置错误）。
+///
+/// 副作用：登记与更新请求统计（开始 / 成功 / 失败）与工具运行时统计、
+/// 创建并清理上游会话、维护活跃会话表、工具会话缓存与长时任务台账。
+///
+/// 可能出现的错误：
+/// - `BadRequest`：请求转换为上游格式失败、JWT token 缺失、长时任务状态不存在或轮询计划构造失败；
+/// - `Config`：工具运行时 provider 不受支持，或当前平台缺少对应配置；
+/// - `Upstream`：上游会话创建失败、聊天请求失败、上游应用层报错或长时任务轮询超限；
+/// - `SseStream`：上游字节流读取或 UTF-8 解码失败；
+/// - `ToolProtocol`：工具决策（broker）协议错误。
 pub async fn messages(
     State(state): State<Arc<AppState>>,
     Json(req): Json<MessagesRequest>,

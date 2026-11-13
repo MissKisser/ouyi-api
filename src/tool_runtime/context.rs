@@ -1,29 +1,58 @@
+//! 会话上下文的统一中间表示。
+//! 把 OpenAI Chat 或 Anthropic Messages 的历史消息规范化为统一的
+//! `TranscriptItem` 时间线（用户文本 / 助手文本 / 工具调用 / 工具结果），
+//! 并可渲染为编译器可读的纯文本上下文；工具结果与调用的名称关联在此完成。
+
 use std::collections::HashMap;
 
 use crate::model::anthropic::{AnthropicContent, ContentBlock, MessagesRequest};
 use crate::model::openai::ChatCompletionRequest;
 
+/// 统一会话时间线中的单项。
 #[derive(Debug, Clone, PartialEq)]
 pub enum TranscriptItem {
+    /// 用户输入的文本。
     UserText {
+        /// 文本内容（空文本不产生该项）。
         content: String,
     },
+    /// 助手输出的文本。
     AssistantText {
+        /// 文本内容（空文本不产生该项）。
         content: String,
     },
+    /// 一次工具调用。
     ToolCall {
+        /// 调用唯一标识。
         id: String,
+        /// 工具名称。
         name: String,
+        /// 工具入参（已解析为 JSON 对象）。
         input: serde_json::Value,
     },
+    /// 一次工具执行结果。
     ToolResult {
+        /// 对应调用的唯一标识。
         id: String,
+        /// 工具名称（由调用记录回查得到）。
         name: String,
+        /// 工具输出文本。
         output: String,
+        /// 工具是否报告错误。
         is_error: bool,
     },
 }
 
+/// 建立 OpenAI 调用 ID 到工具名的索引。
+///
+/// 扫描请求消息中助手消息携带的全部 tool_calls，构建 `call_id → function.name`
+/// 映射，供后续回查工具结果对应的工具名。
+///
+/// # 参数
+/// - `req`：OpenAI Chat 请求。
+///
+/// # 返回
+/// 调用 ID 到工具名的哈希表。
 pub fn openai_tool_name_index(req: &ChatCompletionRequest) -> HashMap<String, String> {
     req.messages
         .iter()
@@ -33,6 +62,22 @@ pub fn openai_tool_name_index(req: &ChatCompletionRequest) -> HashMap<String, St
         .collect()
 }
 
+/// 将 OpenAI Chat 请求的消息历史转换为统一时间线。
+///
+/// user / assistant 的文本进入文本项，assistant 的 tool_calls 进入工具调用项
+/// （入参 JSON 文本会被解析），tool 角色消息进入工具结果项，工具名通过
+/// [`openai_tool_name_index`] 回查（或取消息自身 `name`）；system 及其它
+/// 角色被忽略，空文本不产生条目。
+///
+/// # 参数
+/// - `req`：OpenAI Chat 请求。
+///
+/// # 返回
+/// 按消息顺序排列的时间线。
+///
+/// # 错误
+/// 工具调用的 arguments 不是合法 JSON、工具结果缺少 `tool_call_id`、
+/// 或回查不到对应工具名时，返回描述性错误字符串。
 pub fn from_openai_chat(req: &ChatCompletionRequest) -> Result<Vec<TranscriptItem>, String> {
     let mut transcript = Vec::new();
     let tool_names = openai_tool_name_index(req);
@@ -81,6 +126,20 @@ pub fn from_openai_chat(req: &ChatCompletionRequest) -> Result<Vec<TranscriptIte
     Ok(transcript)
 }
 
+/// 将 Anthropic Messages 请求的消息历史转换为统一时间线。
+///
+/// 文本内容进入文本项，ToolUse 块进入工具调用项（并登记 id→name 映射），
+/// ToolResult 块进入工具结果项（保留 is_error 标记）；Thinking 块被忽略。
+///
+/// # 参数
+/// - `req`：Anthropic Messages 请求。
+///
+/// # 返回
+/// 按消息顺序排列的时间线。
+///
+/// # 错误
+/// 工具结果的 `tool_use_id` 在请求消息序列中找不到对应 tool_use 时，
+/// 返回描述性错误字符串。
 pub fn from_anthropic_messages(req: &MessagesRequest) -> Result<Vec<TranscriptItem>, String> {
     let mut transcript = Vec::new();
     let mut tool_names = HashMap::<String, String>::new();
@@ -144,6 +203,16 @@ fn push_text(transcript: &mut Vec<TranscriptItem>, user: bool, content: Option<&
     }
 }
 
+/// 将统一时间线渲染为编译器可读的纯文本。
+///
+/// 每项渲染为带标签的文本段（`[user]` / `[assistant]` / `[tool_call ...]` /
+/// `[tool_result ...]`），工具结果输出截断到前 4000 个字符，段间以空行分隔。
+///
+/// # 参数
+/// - `transcript`：统一时间线。
+///
+/// # 返回
+/// 拼接后的纯文本上下文。
 pub fn render_for_compiler(transcript: &[TranscriptItem]) -> String {
     transcript
         .iter()

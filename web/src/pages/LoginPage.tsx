@@ -8,6 +8,12 @@ import { Card, CardContent, CardDescription, CardHeader, CardTitle } from '@/com
 import { KeyRound, Shield } from 'lucide-react';
 import { useTranslation } from 'react-i18next';
 
+/**
+ * 登录页：挂载时以探测密码请求 POST /admin/api/login 判断后端是否已设置管理密码
+ * （403 视为需要初始化设置，401 视为进入登录模式），据此渲染"设置密码（含确认框，
+ * 最少 6 位）"或"输入密码登录"两种表单。提交成功后跳转首页；
+ * 失败时在表单内展示错误信息。副作用：发起登录/设置请求。
+ */
 export function LoginPage() {
   const { t } = useTranslation();
   const { login, setup } = useAuth();

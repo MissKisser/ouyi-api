@@ -40,6 +40,7 @@ const buttonVariants = cva(
   }
 )
 
+/** 按钮基础组件，支持 variant（default/outline/secondary/ghost/destructive/link）与多种 size 变体。 */
 function Button({
   className,
   variant = "default",

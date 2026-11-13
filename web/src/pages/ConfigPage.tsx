@@ -40,7 +40,7 @@ import {
   parseMaxConcurrentRequestsInput,
 } from '@/lib/concurrency';
 
-/** Collapsible section wrapper */
+/** 可折叠配置分区卡片：点击标题展开/收起，title 为分区名，icon 为标题图标，defaultOpen 控制初始展开。 */
 function Section({
   title,
   icon: Icon,
@@ -69,6 +69,13 @@ function Section({
   );
 }
 
+/**
+ * 配置管理页：加载并编辑完整服务配置，分区展示账号池、上游 ouyi 平台参数、
+ * 并发限制、ouyi7 平台参数、平台切换、两条工具链路、服务监听与管理密码。
+ * 并发限制与平台切换支持"独立保存 + 即时生效 + 回读校验"；工具链路支持连通性测试；
+ * 整页保存通过 PUT 配置接口提交全部节（含管理密码修改），成功后回读刷新；
+ * 取消时经 confirm 确认后重新加载配置。副作用：持续的网络请求与剪贴板写入。
+ */
 export function ConfigPage() {
   const { t } = useTranslation();
   const [config, setConfig] = useState<FullConfig | null>(null);

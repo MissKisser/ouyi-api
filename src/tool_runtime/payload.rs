@@ -1,19 +1,42 @@
+//! 主模型输出中的长文本负载（payload）提取。
+//! 把 `<ouyi_payload id="...">正文</ouyi_payload>` 包裹的长文本抽离出来，
+//! 原位置替换为 `<ouyi_payload_ref>` 引用标记，使长正文不必进入决策文本，
+//! 由 materialize 模块在执行工具前落地引用。
+
+/// 一个被抽离的长文本负载。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ToolPayload {
+    /// 负载唯一 ID：取标签的 `id` 属性，缺失时自动生成 `p<序号>`，重复时追加序号。
     pub id: String,
+    /// 负载正文（已去掉标签换行包裹）。
     pub body: String,
+    /// 正文的字节长度。
     pub byte_len: usize,
 }
 
+/// 负载提取的结果。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PayloadExtraction {
+    /// 替换为引用标记后的净化文本。
     pub sanitized_text: String,
+    /// 抽离出的全部负载，按出现顺序排列。
     pub payloads: Vec<ToolPayload>,
 }
 
 const OPEN_TAG: &str = "<ouyi_payload";
 const CLOSE_TAG: &str = "</ouyi_payload>";
 
+/// 提取输入文本中的全部 payload 并替换为引用标记。
+///
+/// 每个完整闭合的 `<ouyi_payload>` 块被抽为负载，原位置替换为
+/// `<ouyi_payload_ref id="..." bytes="..." />`；开标签未闭合（找不到 `>`）
+/// 或缺少闭合标签的块按普通文本原样保留。
+///
+/// # 参数
+/// - `input`：主模型的原始输出文本。
+///
+/// # 返回
+/// 净化文本与抽离出的负载列表。
 pub fn extract_payloads(input: &str) -> PayloadExtraction {
     let mut sanitized = String::with_capacity(input.len());
     let mut payloads = Vec::new();

@@ -3,6 +3,7 @@
 import * as React from "react"
 import { cn } from "@/lib/utils"
 
+/** 开关切换组件，checked / onCheckedChange 受控，点击切换布尔状态。 */
 const Switch = React.forwardRef<
   HTMLInputElement,
   Omit<React.ComponentProps<"input">, "type"> & {

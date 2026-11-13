@@ -14,16 +14,23 @@ use crate::tool_runtime::openai_compiler::CompiledToolCall;
 /// - `platform_key` / `short_model`：客户端 → Ouyi 模型的映射
 #[derive(Debug, Clone)]
 pub struct PipelineMeta {
+    /// 工具决策使用的供应商标识（预留遥测 / 调试字段）。
     #[allow(dead_code)] // reserved for telemetry/debug
     pub provider: String,
+    /// 工具决策使用的模型标识（预留遥测 / 调试字段）。
     #[allow(dead_code)] // reserved for telemetry/debug
     pub model: String,
+    /// 工具决策使用的服务地址；未配置时为 `None`（预留遥测 / 调试字段）。
     #[allow(dead_code)] // reserved for telemetry/debug
     pub base_url: Option<String>,
+    /// 决策过程消耗的输入 token 数。
     pub prompt_tokens: u64,
+    /// 决策过程消耗的输出 token 数。
     pub completion_tokens: u64,
+    /// 客户端请求命中的平台标识（预留遥测 / 调试字段）。
     #[allow(dead_code)] // reserved for telemetry/debug
     pub platform_key: String,
+    /// 客户端请求的模型短名（预留遥测 / 调试字段）。
     #[allow(dead_code)] // reserved for telemetry/debug
     pub short_model: String,
 }
@@ -51,18 +58,49 @@ impl PipelineMeta {
     }
 }
 
+/// 工具流水线的输出结果。
 #[derive(Debug, Clone)]
 pub enum PipelineOutput {
+    /// 判定为需要执行工具。
     ToolCalls {
+        /// 校验通过的工具调用列表。
         calls: Vec<CompiledToolCall>,
+        /// 流水线元数据。
         meta: PipelineMeta,
     },
+    /// 判定为最终回答，文本原样透传。
     FinalAnswer {
+        /// 上游输出的完整文本。
         text: String,
+        /// 流水线元数据。
         meta: PipelineMeta,
     },
 }
 
+/// 运行 OpenAI 协议的工具流水线：决策 → 账本登记 → 统计记录。
+///
+/// 阶段说明：
+/// 1. 决策：调用 decision 模块解析上游输出，得到工具调用或最终回答；
+/// 2. 账本：工具调用路径上为每次调用登记 ledger，命中长时任务时追加
+///    任务登记（登记失败仅记 warn 日志，不中断流水线）；
+/// 3. 统计：按决策模式写入 tool_runtime 成功统计；最终回答路径另记录
+///    请求级成功统计（含 token 用量）。
+///
+/// # 参数
+/// - `state`：应用共享状态（配置、账本、统计等）。
+/// - `request`：OpenAI Chat 请求（提供工具定义与模型名）。
+/// - `upstream_output`：上游主模型的完整输出文本。
+/// - `platform_key`：客户端请求命中的平台标识。
+/// - `start_time`：请求开始时间，用于最终回答路径的耗时统计。
+///
+/// # 返回
+/// 流水线输出：工具调用列表或最终回答，均携带元数据。
+///
+/// # 错误
+/// 决策失败（协议校验不通过等）或账本写入失败时返回 `AppError`。
+///
+/// # 副作用
+/// 写入工具账本与统计计数器；决策走编译器路径时发起外部 HTTP 调用。
 pub async fn run_openai_tool_pipeline(
     state: &AppState,
     request: &ChatCompletionRequest,
@@ -164,7 +202,7 @@ pub async fn run_openai_tool_pipeline(
                 short_model = %short_model,
                 "openai tool pipeline: final answer"
             );
-            // 复刻 chat 路径原行为：Compiler 模式下额外记一次 tool_runtime stats
+            // Compiler 模式下额外记录一次 tool_runtime stats（与 chat 路径统计口径一致）
             if dmeta.mode == ToolDecisionMode::Compiler {
                 use crate::admin::stats::{
                     ToolRuntimeDecision, ToolRuntimeMode as StatsToolRuntimeMode,

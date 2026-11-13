@@ -23,6 +23,7 @@ import {
 } from 'lucide-react';
 import { useTranslation } from 'react-i18next';
 
+/** 把运行时长（秒）格式化为"天 时 分"的人类可读文本，使用当前语言的单位词。 */
 function formatUptime(secs: number, t: (key: string) => string): string {
   const d = Math.floor(secs / 86400);
   const h = Math.floor((secs % 86400) / 3600);
@@ -32,11 +33,13 @@ function formatUptime(secs: number, t: (key: string) => string): string {
   return `${m}${t('dashboard.stats.minutes')}`;
 }
 
+/** 把毫秒耗时格式化为 ms / s 文本（超过 1 秒时保留一位小数）。 */
 function formatLatency(ms: number): string {
   if (ms < 1000) return `${ms}ms`;
   return `${(ms / 1000).toFixed(1)}s`;
 }
 
+/** 把 token 数量缩写为 K / M / B 形式的紧凑文本，便于大数展示。 */
 function formatTokens(n: number): string {
   if (n >= 1_000_000_000) return `${(n / 1_000_000_000).toFixed(2)}B`;
   if (n >= 1_000_000) return `${(n / 1_000_000).toFixed(2)}M`;
@@ -44,6 +47,7 @@ function formatTokens(n: number): string {
   return `${n}`;
 }
 
+/** 把 ISO 时间字符串格式化为本地时间文本；空值或无法解析时原样返回占位。 */
 function formatDateTime(value?: string): string {
   if (!value) return '-';
   const date = new Date(value);
@@ -51,6 +55,12 @@ function formatDateTime(value?: string): string {
   return date.toLocaleString();
 }
 
+/**
+ * 仪表盘页：通过 SWR 每 5 秒轮询 /admin/api/status 与 /admin/api/stats，
+ * 展示请求总量、成功率、平均耗时、运行时长、平台状态、token 消耗、
+ * 分模型用量表格与账号池各状态计数及账号明细徽标。
+ * 副作用：持续发起轮询请求；任一数据源出错时整页显示加载失败文案。
+ */
 export function DashboardPage() {
   const { t } = useTranslation();
   const { data: status, error: statusError } = useSWR<AdminStatusResponse>(

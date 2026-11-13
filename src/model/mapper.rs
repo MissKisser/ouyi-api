@@ -1,3 +1,8 @@
+//! 模型名映射器：维护"客户端短名 ↔ 欧易完整模型名"的双向映射表。
+//! 支持从欧易 8.0 模板响应或模型目录加载映射，加载失败时回退到内置的
+//! 静态模型列表；并提供按前缀模糊匹配解析模型名、按供应商分组列举等
+//! 查询能力，供路由与模型列表接口使用。
+
 use dashmap::DashMap;
 use serde::Serialize;
 
@@ -5,33 +10,48 @@ use super::catalog::ModelCatalog;
 use super::ouyi::{TmplCapabilities, TmplModel, TmplResponse};
 use super::ouyi::{TmplData, TmplModelAttr, TmplProvider};
 
-/// 官网模型分类项（按 providerName 分组）
+/// 官网模型分类项（按 providerName 分组）。
 #[derive(Debug, Clone, Serialize)]
 pub struct ModelCategoryItem {
+    /// 模型展示名。
     pub label: String,
+    /// 模型完整标识（欧易侧的 value）。
     pub value: String,
+    /// 供应商标识 key。
     pub provider_key: String,
+    /// 模型能力位。
     pub capabilities: TmplCapabilities,
 }
 
-/// 按 providerName 分组的模型列表
+/// 按供应商分组后的模型列表分组。
 #[derive(Debug, Clone, Serialize)]
 pub struct ModelCategory {
+    /// 供应商展示名称。
     pub provider_name: String,
+    /// 供应商标识 key。
     pub provider_key: String,
+    /// 该分组下的模型数量。
     pub count: usize,
+    /// 该分组下的模型条目列表。
     pub models: Vec<ModelCategoryItem>,
 }
 
+/// 映射表中单个模型的完整记录。
 #[derive(Debug, Clone)]
 pub struct ModelEntry {
+    /// 欧易侧完整模型名，如 `claude_chat::claude-sonnet-4-5-vip`。
     pub full_value: String,
+    /// 对外暴露的短名，如 `claude-sonnet-4-5-vip`。
     pub short_name: String,
+    /// 供应商标识 key。
     pub provider_key: String,
+    /// 模型能力位（当前解析流程未消费，保留供后续使用）。
     #[allow(dead_code)]
     pub capabilities: TmplCapabilities,
 }
 
+/// 模型名映射器，线程安全（内部为并发哈希表）。
+/// 维护短名到完整名、完整名到短名的双向映射，以及完整模型元数据表。
 #[derive(Clone)]
 pub struct ModelMapper {
     short_to_full: DashMap<String, ModelEntry>,
@@ -56,6 +76,7 @@ static FALLBACK_MODELS: &[(&str, &str, &str)] = &[
 ];
 
 impl ModelMapper {
+    /// 创建一个空的映射器（不含任何模型，需再调用 load_* 装载）。
     pub fn new() -> Self {
         Self {
             short_to_full: DashMap::new(),
@@ -64,6 +85,17 @@ impl ModelMapper {
         }
     }
 
+    /// 从欧易 8.0 模板响应装载映射表。
+    ///
+    /// 为每个模型生成短名及其别名（去掉 `-vip` / `-thinking` 后缀的形式），
+    /// 解决短名碰撞后整体替换现有映射，并输出加载统计日志。
+    /// 响应缺 `data` 或 `models` 为空时改用静态 fallback 列表。
+    ///
+    /// # 参数
+    /// - `resp`：欧易 8.0 模板接口响应。
+    ///
+    /// # 副作用
+    /// 清空并重建内部映射表；输出 warn/info 级日志。
     pub fn load_from_tmpl(&self, resp: &TmplResponse) {
         let data = match &resp.data {
             Some(d) => d,
@@ -147,6 +179,16 @@ impl ModelMapper {
         );
     }
 
+    /// 从模型目录装载映射表。
+    ///
+    /// 将目录条目转换为 Tmpl 模型结构后复用 `load_from_tmpl` 的装载流程；
+    /// 目录为空时改用静态 fallback 列表。
+    ///
+    /// # 参数
+    /// - `catalog`：由 catalog 模块构建的模型目录。
+    ///
+    /// # 副作用
+    /// 清空并重建内部映射表；目录为空时输出 warn 级日志。
     pub fn load_from_catalog(&self, catalog: &ModelCatalog) {
         if catalog.models.is_empty() {
             tracing::warn!("模型目录为空，使用静态fallback");
@@ -190,6 +232,13 @@ impl ModelMapper {
         self.load_from_tmpl(&resp);
     }
 
+    /// 装载内置的静态 fallback 模型列表。
+    ///
+    /// 在远端模型列表不可用（响应缺数据、目录为空）时兜底使用，
+    /// 固定能力位为：流式与系统角色开启，其余关闭。
+    ///
+    /// # 副作用
+    /// 清空并重建内部映射表；输出 warn 级日志。
     pub fn load_fallback(&self) {
         tracing::warn!("使用静态fallback模型列表");
 
@@ -233,6 +282,17 @@ impl ModelMapper {
         }
     }
 
+    /// 将客户端输入的模型名解析为欧易侧完整模型名。
+    ///
+    /// 解析顺序：精确短名匹配 → 完整名原样返回 → 短名前缀匹配。
+    /// 前缀匹配命中多个时优先带 `-vip` 的条目，其次按短名倒序取最大者；
+    /// 全部未命中时原样返回输入并记录 warn 日志。
+    ///
+    /// # 参数
+    /// - `input`：客户端传入的模型名（短名、完整名或前缀）。
+    ///
+    /// # 返回
+    /// 欧易侧完整模型名；无法解析时返回原始输入。
     pub fn to_ouyi(&self, input: &str) -> String {
         if let Some(entry) = self.short_to_full.get(input) {
             return entry.full_value.clone();
@@ -269,6 +329,7 @@ impl ModelMapper {
         input.to_string()
     }
 
+    /// 返回全部已注册的模型短名，按字典序排序。
     pub fn get_all_short_names(&self) -> Vec<String> {
         let mut names: Vec<String> = self
             .full_to_short
@@ -279,22 +340,45 @@ impl ModelMapper {
         names
     }
 
+    /// 查询完整模型名对应的供应商展示名称。
+    ///
+    /// # 参数
+    /// - `full_value`：欧易侧完整模型名。
+    ///
+    /// # 返回
+    /// 供应商展示名称；模型不在映射表中时为 `None`。
     pub fn get_provider_name(&self, full_value: &str) -> Option<String> {
         self.all_models
             .get(full_value)
             .map(|m| m.attr.provider_name.clone())
     }
 
+    /// 返回当前映射表中的模型总数（按完整模型名去重）。
     pub fn model_count(&self) -> usize {
         self.all_models.len()
     }
 
+    /// 判断指定模型的输出是否应按思考（thinking）内容处理。
+    ///
+    /// 对输入做解析后检查完整模型名或原始输入中是否包含 `-thinking` 标记。
+    ///
+    /// # 参数
+    /// - `model_input`：客户端传入的模型名。
+    ///
+    /// # 返回
+    /// `true` 表示该模型名带思考标记。
     pub fn should_thinking(&self, model_input: &str) -> bool {
         let resolved = self.to_ouyi(model_input);
         resolved.contains("-thinking") || model_input.contains("-thinking")
     }
 
-    /// 按官网 providerName 分组返回所有模型
+    /// 按官网 providerName 分组返回所有模型。
+    ///
+    /// 以（provider_name, provider_key）为分组键聚合全部模型，
+    /// 结果按分组键字典序排列，便于前端按供应商分栏展示。
+    ///
+    /// # 返回
+    /// 供应商分组列表，每组含模型条目与计数。
     pub fn get_categorized_models(&self) -> Vec<ModelCategory> {
         use std::collections::BTreeMap;
 

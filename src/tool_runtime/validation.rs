@@ -1,5 +1,24 @@
+//! 工具调用入参的 schema 校验。
+//! 按 JSON Schema 的常用子集（type / enum / required / properties /
+//! additionalProperties / items）递归校验工具调用入参，拦截未知工具名、
+//! 缺失必填字段、类型不匹配、枚举越界与多余字段。
+
 use crate::tool_runtime::protocol::ToolSpec;
 
+/// 校验一次工具调用的名称与入参。
+///
+/// # 参数
+/// - `tools`：可用工具定义列表。
+/// - `name`：工具调用名称。
+/// - `input`：工具调用入参 JSON。
+///
+/// # 返回
+/// 校验通过返回 `Ok(())`。
+///
+/// # 错误
+/// 工具名不存在、工具定义重名，或入参不符合 schema（含缺失必填字段、
+/// 类型不匹配、枚举越界、数组项违规、多余字段）时，返回带路径的
+/// 描述性错误字符串。
 pub fn validate_tool_call(
     tools: &[ToolSpec],
     name: &str,

@@ -13,6 +13,7 @@ fn sse_event(event_name: &str, data: serde_json::Value) -> Event {
     Event::default().event(event_name).data(data.to_string())
 }
 
+/// 取当前 Unix 时间戳（秒），时钟异常时回退为 0。
 fn now_unix_secs() -> u64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)

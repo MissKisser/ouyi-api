@@ -1,10 +1,18 @@
+//! SSE 流式解析辅助：事件行解析、跨网络分块的 UTF-8 增量解码、行缓冲，
+//! 以及上游应用层错误的识别与敏感信息脱敏。
+
 use crate::model::ouyi::OuyiSseEvent;
 
+/// 上游 SSE 事件的类型归类。
 #[derive(Debug, Clone, PartialEq)]
 pub enum OuyiEventType {
+    /// 文本分片事件（`type == "string"`）。
     StringChunk,
+    /// 结构化对象事件（`type == "object"`）。
     Object,
+    /// 流结束事件（`type == "done"`）。
     Done,
+    /// 无法归类的其他事件类型，携带上游原始类型串。
     Unknown(String),
 }
 
@@ -19,6 +27,9 @@ impl From<&str> for OuyiEventType {
     }
 }
 
+/// 解析一行 `data:` 前缀的 SSE 事件为 [`OuyiSseEvent`]。
+///
+/// 非 `data:` 行、空数据或 JSON 解析失败时返回 `None`。
 pub fn parse_sse_line(line: &str) -> Option<OuyiSseEvent> {
     let data = line.strip_prefix("data:")?.trim();
     if data.is_empty() {
@@ -27,24 +38,35 @@ pub fn parse_sse_line(line: &str) -> Option<OuyiSseEvent> {
     serde_json::from_str::<OuyiSseEvent>(data).ok()
 }
 
+/// UTF-8 增量解码的错误类型。
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 pub enum Utf8StreamError {
+    /// 字节流包含非法 UTF-8 序列，`offset` 为首个非法字节前的有效长度。
     #[error("UTF-8 流包含非法字节（偏移 {offset}）")]
     InvalidSequence { offset: usize },
+    /// 流在多字节字符中间结束，尾部字节已丢弃。
     #[error("UTF-8 流在多字节字符中间结束")]
     IncompleteSequence,
 }
 
+/// 跨网络分块的 UTF-8 增量解码器：暂存不完整的多字节序列，
+/// 待后续分块补齐后再回调输出。
 #[derive(Debug, Default)]
 pub struct Utf8ChunkDecoder {
     pending: Vec<u8>,
 }
 
 impl Utf8ChunkDecoder {
+    /// 创建空解码器。
     pub fn new() -> Self {
         Self::default()
     }
 
+    /// 送入一个字节分块，把其中完整的 UTF-8 文本通过 `on_text` 回调输出。
+    ///
+    /// 不完整的多字节序列尾部会暂存到下一次调用。即使返回 `Err`，
+    /// 出错点之前的合法文本也已先回调输出。
+    /// 返回 `Err(Utf8StreamError::InvalidSequence)` 表示分块内存在非法字节。
     pub fn push_chunk<F>(&mut self, chunk: &[u8], mut on_text: F) -> Result<(), Utf8StreamError>
     where
         F: FnMut(&str),
@@ -76,6 +98,8 @@ impl Utf8ChunkDecoder {
         }
     }
 
+    /// 流结束时调用：暂存区已清空返回 `Ok`；仍残留不完整序列则丢弃尾部
+    /// 字节并返回 `Err(Utf8StreamError::IncompleteSequence)`。
     pub fn finish(&mut self) -> Result<(), Utf8StreamError> {
         if self.pending.is_empty() {
             Ok(())
@@ -158,17 +182,20 @@ fn contains_jwt(message: &str) -> bool {
         .any(|candidate| candidate.starts_with("eyJ") && candidate.matches('.').count() == 2)
 }
 
+/// SSE 行缓冲：把任意切分的文本分块还原为完整行（去 `\r`、跳过空行）。
 pub struct SseLineBuffer {
     buffer: String,
 }
 
 impl SseLineBuffer {
+    /// 创建空缓冲。
     pub fn new() -> Self {
         Self {
             buffer: String::new(),
         }
     }
 
+    /// 追加文本分块，返回其中已完成的行。
     pub fn push_chunk(&mut self, chunk: &str) -> Vec<String> {
         self.buffer.push_str(chunk);
         let mut complete_lines = Vec::new();
@@ -184,6 +211,8 @@ impl SseLineBuffer {
         complete_lines
     }
 
+    /// 流结束时调用：返回缓冲中未以换行结尾的残余内容（trim 后）并清空
+    /// 缓冲；无残余时返回 `None`。
     pub fn drain_remaining(&mut self) -> Option<String> {
         let remaining = self.buffer.trim().to_string();
         if remaining.is_empty() {

@@ -6,19 +6,30 @@ import { Button } from '@/components/ui/button';
 import { Badge } from '@/components/ui/badge';
 import { Separator } from '@/components/ui/separator';
 
+/** 单个端点的连通性测试状态（联合类型，按 kind 区分）。 */
 type EndpointStatus =
   | { kind: 'idle' }
   | { kind: 'loading' }
   | { kind: 'ok'; status: number; latencyMs: number }
   | { kind: 'fail'; reason: 'network' | 'timeout' | 'http'; status?: number; latencyMs?: number };
 
+/** 端点定义：界面 key（用于 i18n 与状态索引）与请求路径。 */
 interface EndpointDef {
+  /** 端点标识，同时是 i18n 文案 key 与状态字典的键。 */
   key: string;
+  /** 端点请求路径（以 / 开头）。 */
   path: string;
 }
 
+/** 单次连通性测试的超时时间，单位毫秒。 */
 const TEST_TIMEOUT_MS = 5000;
 
+/**
+ * API 端点列表页：展示服务暴露的 6 个对话/响应端点的完整 URL，
+ * 支持单端点与全部端点的连通性探测（任意 < 500 的响应视为可达），
+ * 并可一键复制端点地址。探测使用 GET + CORS 模式，超时 5 秒；
+ * 组件卸载时中止所有未完成的请求，并监听 popstate 同步当前 origin。
+ */
 export function ApiEndpointsPage() {
   const { t } = useTranslation();
   const [origin, setOrigin] = useState<string>(() =>

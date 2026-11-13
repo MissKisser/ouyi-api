@@ -15,10 +15,9 @@ import { useTranslation } from 'react-i18next';
 import { compareProviders, localizeProviderName } from '@/lib/model-labels';
 
 /**
- * Filter categorized model groups by an active provider chip and a free-text
- * query. The query is case-insensitive and matches against the group's
- * provider name/key as well as each model's label/value, so that natural
- * searches like "openai" or "gpt-4o-mini" both surface the right group.
+ * 按激活的供应商 chip 与自由文本搜索过滤分类模型分组。
+ * 查询不区分大小写，同时匹配分组的供应商名称/key 与每个模型的 label/value，
+ * 因此搜索 "openai" 或 "gpt-4o-mini" 都能定位到正确的分组；模型数为 0 的分组被剔除。
  */
 function filterCategorizedGroups(
   groups: CategorizedModelGroup[],
@@ -45,6 +44,12 @@ function filterCategorizedGroups(
     .filter(g => g.models.length > 0);
 }
 
+/**
+ * 模型列表页：优先按供应商分组展示模型（SWR 请求分类接口），支持搜索、
+ * 供应商 chip 筛选与分组折叠；分类接口不可用时回退为扁平卡片网格。
+ * 每个模型支持一键复制模型 ID（复制后短暂显示已复制状态）。
+ * 副作用：发起模型列表请求、写入剪贴板。
+ */
 export function ModelsPage() {
   const { t, i18n } = useTranslation();
   const [copiedId, setCopiedId] = useState<string | null>(null);
@@ -77,10 +82,8 @@ export function ModelsPage() {
     [categorizedResponse?.categories],
   );
 
-  // Only fall back to the flat /admin/api/models endpoint when the categorized
-  // endpoint is unavailable (no response yet or hard error). A categorized
-  // response with zero entries should still render the categorized UI — we used
-  // to flip to the flat view in that case, which silently hid the search box.
+  // 仅在分类接口不可用时（尚无响应或请求出错）回退到扁平的 /admin/api/models；
+  // 分类响应为空分组时仍保持分类视图（保留搜索框与筛选 chips）。
   const hasCategories = categorizedGroups.length > 0;
   const shouldFetchFlat = !hasCategories && !error;
   const { data: models } = useSWR<ModelListResponse>(

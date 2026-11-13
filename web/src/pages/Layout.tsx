@@ -14,6 +14,11 @@ import {
 } from 'lucide-react';
 import { useTranslation } from 'react-i18next';
 
+/**
+ * 管理端整体布局：左侧固定侧边栏（Logo、导航菜单、语言切换与登出），
+ * 右侧为可滚动主内容区（渲染嵌套路由 <Outlet />）。
+ * 登出时清空认证状态并跳转 /login；导航项高亮当前路由。
+ */
 export function Layout() {
   const { t } = useTranslation();
   const { logout } = useAuth();

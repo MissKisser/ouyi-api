@@ -1,3 +1,10 @@
+//! OpenAI Chat Completions 端点：`POST /v1/chat/completions` 与 `POST /openai/v1/chat/completions`。
+//! 职责链路：请求校验与统计登记 → 长时任务轮询拦截 → 按当前平台（Ouyi7 / Ouyi8）分派
+//! → 请求转换、上游会话创建与 SSE 流读取 → 按 `stream` 标志与是否携带 tools
+//! 产出 Chat Completions JSON 或 SSE 流响应。
+//! 带 tools 的请求会经工具运行时（编译器 / 代理）判定最终回答或工具调用，
+//! 并在判定后落成功 / 失败统计、清理上游会话与活跃请求计数。
+
 use std::sync::Arc;
 
 use axum::Json;
@@ -25,6 +32,26 @@ use crate::tool_runtime::broker::{self, LongTaskResult, classify_long_task_resul
 use crate::tool_runtime::openai_compiler::CompiledToolCall;
 use crate::tool_runtime::protocol::openai_tools_to_specs;
 
+/// OpenAI Chat Completions 推理入口（`POST /v1/chat/completions` 与
+/// `POST /openai/v1/chat/completions`）。
+///
+/// 入参 `req` 为 OpenAI Chat Completions 请求体：`messages` 为对话消息序列，
+/// `model` 为对外短模型名（经映射表转成上游全名），`stream` 决定 SSE 流式或 JSON 非流式，
+/// `tools` / `tool_choice` 启用函数工具调用。
+///
+/// 处理步骤：先检查消息总大小是否超过 `limits.max_messages_bytes`，随后登记活跃请求统计；
+/// 若请求携带 tools 且命中已注册的长时任务，直接返回轮询响应而不发起上游请求；
+/// 最后按当前平台（Ouyi7 / Ouyi8）分派到对应实现。
+///
+/// 副作用：登记与更新请求统计（开始 / 成功 / 失败）、创建并清理上游会话、
+/// 维护活跃会话表与长时任务台账。
+///
+/// 可能出现的错误：
+/// - `PayloadTooLarge`：消息总大小超过限制；
+/// - `BadRequest`：未配置 JWT token 且无可用账号 token、长时任务状态不存在或轮询计划构造失败；
+/// - `Config`：当前平台缺少对应配置（如 Ouyi7 未配置）；
+/// - `Upstream`：上游会话创建失败、上游聊天请求失败、上游应用层报错或长时任务轮询超限；
+/// - `Internal`：请求体转换为上游格式失败。
 pub async fn chat_completions(
     State(state): State<Arc<AppState>>,
     Json(req): Json<ChatCompletionRequest>,

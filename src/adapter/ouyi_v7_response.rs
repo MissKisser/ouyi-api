@@ -1,3 +1,9 @@
+//! 纯文本到各协议响应体 / 模拟流式 SSE 的构造器。
+//!
+//! 在只能拿到完整纯文本的降级场景下，按 OpenAI ChatCompletion、
+//! Anthropic Messages、OpenAI Responses 三种协议分别构造非流式响应，
+//! 或按 `chunk_chars` 字符切片生成一次性写出的模拟流式 SSE 响应；
+//! 各构造器的 usage 均为零值，事件时序与真实流式协议保持一致。
 use crate::error::AppError;
 use crate::model::anthropic::{MessagesResponse, ResponseContentBlock, ResponseUsage};
 use crate::model::openai::{
@@ -16,7 +22,12 @@ fn now_unix_secs() -> u64 {
         .as_secs()
 }
 
-/// 构造非流式 OpenAI 文本响应
+/// 构造非流式 OpenAI 文本响应。
+///
+/// - `model` / `task_id`：响应中的模型名与响应 ID；
+/// - `text`：完整回复文本。
+///
+/// 返回 `finish_reason` 为 `stop`、usage 为零值的响应体。
 pub fn build_openai_text_response_from_plain(
     model: &str,
     task_id: &str,
@@ -44,7 +55,16 @@ pub fn build_openai_text_response_from_plain(
     }
 }
 
-/// 构造模拟流式 OpenAI SSE 响应
+/// 将纯文本切分为多个 chunk，构造模拟流式 OpenAI SSE 响应。
+///
+/// - `model` / `task_id`：写入每个 chunk 的模型名与响应 ID；
+/// - `text`：完整回复文本，按字符（非字节）切片；
+/// - `chunk_chars`：每个内容 chunk 的字符数。
+///
+/// 事件序列为 role chunk、若干 content chunk、finish chunk（`stop`）与
+/// `[DONE]` 行。返回一次性携带完整 `text/event-stream` 响应体的 axum
+/// `Response`（不做逐 chunk 真实推送）；响应体构建失败时返回 `Err`
+/// （`AppError::Internal`）。
 pub fn build_openai_text_stream_from_plain(
     model: &str,
     task_id: &str,
@@ -139,7 +159,13 @@ pub fn build_openai_text_stream_from_plain(
         .map_err(|e| AppError::Internal(e.to_string()))?)
 }
 
-/// 构造非流式 Anthropic 消息响应
+/// 构造非流式 Anthropic 消息响应。
+///
+/// - `model` / `message_id`：响应中的模型名与消息 ID；
+/// - `text`：完整回复文本。
+///
+/// 返回单个 text content block、`stop_reason` 为 `end_turn`、
+/// usage 为零值的响应体。
 pub fn build_anthropic_message_from_plain(
     model: &str,
     message_id: &str,
@@ -161,7 +187,16 @@ pub fn build_anthropic_message_from_plain(
     }
 }
 
-/// 构造模拟流式 Anthropic SSE 响应
+/// 将纯文本切分为多个 delta，构造模拟流式 Anthropic SSE 响应。
+///
+/// - `model` / `message_id`：写入事件的模型名与消息 ID；
+/// - `text`：完整回复文本，按字符（非字节）切片；
+/// - `chunk_chars`：每个 `text_delta` 的字符数。
+///
+/// 事件序列为 message_start、content_block_start、若干 content_block_delta、
+/// content_block_stop、message_delta（`end_turn`）与 message_stop。
+/// 返回一次性携带完整 `text/event-stream` 响应体的 axum `Response`
+/// （不做逐事件真实推送）；响应体构建失败时返回 `Err`（`AppError::Internal`）。
 pub fn build_anthropic_stream_from_plain(
     model: &str,
     message_id: &str,
@@ -265,7 +300,13 @@ pub fn build_anthropic_stream_from_plain(
         .map_err(|e| AppError::Internal(e.to_string()))?)
 }
 
-/// 构造非流式 Responses API 响应
+/// 构造非流式 OpenAI Responses API 响应。
+///
+/// - `model` / `response_id`：响应中的模型名与响应 ID；
+/// - `text`：完整回复文本。
+///
+/// 返回单个 message 输出项（状态 `completed`、内容类型 `output_text`）、
+/// usage 为零值的响应体。
 pub fn build_responses_response_from_plain(
     model: &str,
     response_id: &str,
@@ -298,7 +339,17 @@ pub fn build_responses_response_from_plain(
     }
 }
 
-/// 构造模拟流式 Responses SSE 响应
+/// 将纯文本切分为多个 delta，构造模拟流式 OpenAI Responses SSE 响应。
+///
+/// - `model` / `response_id`：写入事件的模型名与响应 ID；
+/// - `text`：完整回复文本，按字符（非字节）切片；
+/// - `chunk_chars`：每个 `response.output_text.delta` 的字符数。
+///
+/// 事件序列为 response.created、response.output_item.added、若干
+/// response.output_text.delta、response.output_text.done、
+/// response.output_item.done 与 response.completed。
+/// 返回一次性携带完整 `text/event-stream` 响应体的 axum `Response`
+/// （不做逐事件真实推送）；响应体构建失败时返回 `Err`（`AppError::Internal`）。
 pub fn build_responses_stream_from_plain(
     model: &str,
     response_id: &str,

@@ -1,8 +1,16 @@
+//! ouyi SSE 事件到 OpenAI ChatCompletion 响应的适配。
+//!
+//! 提供两种形态：[`StreamConverter`] 把事件逐条转换为流式 chunk；
+//! [`SseCollector`] 聚合完整事件流后一次性构造非流式响应。
+//! 两者共用 [`ToolCallParser`] 做工具调用标记解析。
 use crate::adapter::tool_call::{ToolCallParser, tool_delta_to_full_call};
 use crate::client::sse::OuyiEventType;
 use crate::model::openai::*;
 use crate::model::ouyi::OuyiSseEvent;
 
+/// ouyi SSE 事件到 OpenAI 流式 chunk 的增量转换器。
+///
+/// 内部维护工具调用解析状态与 token 用量，供聊天流式处理器逐事件调用。
 pub struct StreamConverter {
     model: String,
     task_id: String,
@@ -14,6 +22,10 @@ pub struct StreamConverter {
 }
 
 impl StreamConverter {
+    /// 创建流式转换器。
+    ///
+    /// - `model`：写入每个 chunk 的模型名；
+    /// - `task_id`：写入每个 chunk 的响应 ID。
     pub fn new(model: String, task_id: String) -> Self {
         Self {
             model,
@@ -29,6 +41,15 @@ impl StreamConverter {
         }
     }
 
+    /// 转换单个 ouyi SSE 事件为零到多个 OpenAI chunk。
+    ///
+    /// - string 事件：文本经工具调用解析后输出 content / tool_calls 增量，
+    ///   首个产出的 chunk 会携带 `role: assistant`；
+    /// - object 事件：尝试从中读取 token 用量，不产出 chunk；
+    /// - done 事件：输出收尾 chunk，`finish_reason` 在解析器仍处于工具调用
+    ///   块内时为 `tool_calls`，否则为 `stop`。
+    ///
+    /// 返回 `None` 表示该事件无需产出任何 chunk。
     pub fn convert_event(&mut self, event: &OuyiSseEvent) -> Option<Vec<ChatCompletionChunk>> {
         let event_type = OuyiEventType::from(event.event_type.as_str());
 
@@ -88,6 +109,7 @@ impl StreamConverter {
         }
     }
 
+    /// 返回当前捕获的 token 用量 `(prompt_tokens, completion_tokens)`；尚未捕获时为 `(0, 0)`。
     pub fn tokens(&self) -> (u64, u64) {
         (self.prompt_tokens, self.completion_tokens)
     }
@@ -155,6 +177,7 @@ impl StreamConverter {
     }
 }
 
+/// ouyi SSE 事件聚合器，收集完整输出后构造 OpenAI 非流式响应。
 pub struct SseCollector {
     content_parts: Vec<String>,
     usage: Option<crate::model::ouyi::OuyiUsage>,
@@ -165,6 +188,10 @@ pub struct SseCollector {
 }
 
 impl SseCollector {
+    /// 创建收集器。
+    ///
+    /// - `model`：写入响应体的模型名；
+    /// - `task_id`：作为响应 ID。
     pub fn new(model: String, task_id: String) -> Self {
         Self {
             content_parts: Vec::new(),
@@ -179,6 +206,10 @@ impl SseCollector {
         }
     }
 
+    /// 累积一个 ouyi SSE 事件。
+    ///
+    /// string 事件追加文本片段；object 事件尝试读取并覆盖 token 用量；
+    /// 其余事件类型忽略。
     pub fn push_event(&mut self, event: &OuyiSseEvent) {
         let event_type = OuyiEventType::from(event.event_type.as_str());
         match event_type {
@@ -202,6 +233,7 @@ impl SseCollector {
         }
     }
 
+    /// 返回捕获的 token 用量 `(prompt_tokens, completion_tokens)`；未捕获时为 `(0, 0)`。
     pub fn tokens(&self) -> (u64, u64) {
         match &self.usage {
             Some(u) => (u.prompt_tokens, u.completion_tokens),
@@ -209,10 +241,16 @@ impl SseCollector {
         }
     }
 
+    /// 返回已收集文本片段拼接后的完整文本（未做工具调用解析）。
     pub fn text_content(&self) -> String {
         self.content_parts.join("")
     }
 
+    /// 构造 OpenAI 非流式响应。
+    ///
+    /// 对全部文本做一次工具调用解析：解析出工具调用时 `content` 为 `None`、
+    /// `finish_reason` 为 `tool_calls`，否则返回纯文本、`finish_reason` 为 `stop`；
+    /// token 用量未捕获时填 0。消费收集器自身。
     pub fn build_response(mut self) -> ChatCompletionResponse {
         let full_text: String = self.content_parts.join("");
         let parsed = self.tool_parser.process_chunk(&full_text);

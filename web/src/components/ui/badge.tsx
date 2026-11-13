@@ -27,6 +27,7 @@ const badgeVariants = cva(
   }
 )
 
+/** 徽标（胶囊标签），支持 default / secondary / destructive / outline / ghost / link 变体。 */
 function Badge({
   className,
   variant = "default",

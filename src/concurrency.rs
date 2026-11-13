@@ -1,3 +1,9 @@
+//! 全局并发限流模块。
+//!
+//! 为推理类请求提供进程级并发上限：推理路由的中间件在进入处理器前申请名额（permit），
+//! 名额随响应体存活——流式响应未消费完时名额不会提前释放，响应体被丢弃时归还名额。
+//! 超限请求立即得到 429 响应，并按路径前缀区分 OpenAI 与 Anthropic 两种错误信封。
+
 use std::sync::{Arc, Mutex, MutexGuard};
 
 use axum::Json;
@@ -9,27 +15,42 @@ use axum::response::{IntoResponse, Response};
 use http_body_util::BodyExt;
 use serde_json::json;
 
+/// 限流器的内部计数状态。
 struct LimiterState {
+    /// 并发上限；`0` 表示不限流。
     max: usize,
+    /// 当前持有名额的活跃请求数。
     active: usize,
 }
 
+/// 全局并发限流器，维护"当前活跃请求数 / 上限"计数。
+/// 克隆出的实例与原实例共享同一份计数状态（内部为 `Arc<Mutex<_>>`）。
 #[derive(Clone)]
 pub struct ConcurrencyLimiter {
+    /// 共享的计数状态，互斥锁保护并发安全。
     state: Arc<Mutex<LimiterState>>,
 }
 
+/// 一次并发名额的持有凭证。
+/// 存活期间占用一个活跃名额；被丢弃（或随响应体一起被丢弃）时自动归还名额。
+/// 不可克隆，保证一个凭证只对应一个名额。
 pub struct ConcurrencyPermit {
+    /// 共享计数状态的引用；`None` 表示名额已归还，防止重复释放。
     state: Option<Arc<Mutex<LimiterState>>>,
 }
 
 impl ConcurrencyLimiter {
+    /// 创建上限为 `max` 的限流器。
+    /// - `max`: 最大并发名额数；传 `0` 表示不限流（任何申请都能取得名额）。
     pub fn new(max: usize) -> Self {
         Self {
             state: Arc::new(Mutex::new(LimiterState { max, active: 0 })),
         }
     }
 
+    /// 尝试取得一个并发名额。
+    /// 活跃数未达上限（或上限为 `0` 表示不限流）时活跃数加一并返回 [`ConcurrencyPermit`]；
+    /// 已达上限时返回 `None`，不产生任何副作用。
     pub fn try_acquire(&self) -> Option<ConcurrencyPermit> {
         let mut state = lock_state(&self.state);
         if state.max != 0 && state.active >= state.max {
@@ -42,15 +63,26 @@ impl ConcurrencyLimiter {
         })
     }
 
+    /// 调整并发上限。
+    /// - `max`: 新上限；`0` 表示不限流。
+    /// 只影响后续的申请判定：已持有的名额不会因调低上限而被强制回收。
     pub fn set_limit(&self, max: usize) {
         lock_state(&self.state).max = max;
     }
 
+    /// 返回当前配置的并发上限；`0` 表示不限流。
     pub fn limit(&self) -> usize {
         lock_state(&self.state).max
     }
 }
 
+/// 推理路由的限流中间件。
+/// 请求进入处理器前先申请名额；申请失败时立即返回 429，并按路径前缀区分错误信封：
+/// - `/anthropic` 前缀：Anthropic 风格的 `rate_limit_error` 信封；
+/// - 其它路径：OpenAI 风格的 `rate_limit_error`（`code = concurrency_limit_exceeded`）信封。
+/// 拒绝响应均携带 `Retry-After: 1`。
+/// 取得名额后，名额凭证被移入响应体：响应体存活期间持续占坑，
+/// 保证流式响应传输期间名额不被提前释放。
 pub async fn limit_inference_requests(
     State(limiter): State<ConcurrencyLimiter>,
     request: Request,
@@ -92,6 +124,8 @@ pub async fn limit_inference_requests(
 }
 
 impl Drop for ConcurrencyPermit {
+    /// 丢弃凭证时归还名额：活跃数减一（下溢时保持不变）。
+    /// 已归还过的凭证再次丢弃不会重复扣减。
     fn drop(&mut self) {
         let Some(state) = self.state.take() else {
             return;
@@ -103,6 +137,7 @@ impl Drop for ConcurrencyPermit {
     }
 }
 
+/// 加锁获取计数状态；锁中毒时取回内部数据继续运行，避免限流器永久卡死。
 fn lock_state(state: &Mutex<LimiterState>) -> MutexGuard<'_, LimiterState> {
     state
         .lock()

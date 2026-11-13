@@ -1,14 +1,25 @@
+//! 平台选择与状态模块。
+//!
+//! 定义 Ouyi 平台枚举（7.0 / 8.0）及其显示名、环境变量取值、配置段名的映射，
+//! 提供启动时的平台选择决策链（环境变量 `OUYI_PLATFORM` 优先 → 配置缺省平台 + 交互询问
+//! → 配置缺省平台），以及供管理后台展示的平台运行状态结构。
+
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 
+/// Ouyi 平台枚举，标识反代服务对接的平台代际。
+/// JSON 序列化形式为小写字符串 `"ouyi7"` / `"ouyi8"`。
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize)]
 #[serde(rename_all = "lowercase")]
 pub enum OuyiPlatform {
+    /// Ouyi 7.0 平台，对应配置段 `ouyi_v7`。
     Ouyi7,
+    /// Ouyi 8.0 平台，对应配置段 `ouyi`。
     Ouyi8,
 }
 
 impl OuyiPlatform {
+    /// 返回平台显示名：`"Ouyi 7.0"` 或 `"Ouyi 8.0"`。
     pub fn label(&self) -> &'static str {
         match self {
             OuyiPlatform::Ouyi7 => "Ouyi 7.0",
@@ -16,6 +27,8 @@ impl OuyiPlatform {
         }
     }
 
+    /// 解析环境变量取值为平台，大小写不敏感。
+    /// 接受 `"7"` / `"v7"` / `"ouyi7"` 与 `"8"` / `"v8"` / `"ouyi8"`，其余返回 `None`。
     pub fn from_env_value(s: &str) -> Option<Self> {
         let s_lower = s.to_lowercase();
         match s_lower.as_str() {
@@ -25,6 +38,7 @@ impl OuyiPlatform {
         }
     }
 
+    /// 返回该平台在配置文件中对应的配置段名：7.0 → `ouyi_v7`，8.0 → `ouyi`。
     pub fn config_key(&self) -> &'static str {
         match self {
             OuyiPlatform::Ouyi7 => "ouyi_v7",
@@ -33,17 +47,25 @@ impl OuyiPlatform {
     }
 }
 
+/// 平台运行状态，供管理后台状态接口展示。
 #[derive(Debug, Clone, Serialize)]
 pub struct PlatformStatus {
+    /// 当前平台。
     pub platform: OuyiPlatform,
+    /// 平台显示名。
     pub label: String,
+    /// 平台 API 基础地址。
     pub base_url: String,
+    /// 当前已加载的模型数量。
     pub model_count: usize,
+    /// 平台 Token 是否已验证有效。
     pub token_valid: bool,
+    /// 最近一次创建/刷新该状态的时间（UTC）。
     pub last_selected_at: DateTime<Utc>,
 }
 
 impl PlatformStatus {
+    /// 创建初始平台状态：模型数为 0、Token 未验证、时间戳取当前 UTC 时刻。
     pub fn new(platform: OuyiPlatform, base_url: String) -> Self {
         Self {
             label: platform.label().to_string(),
@@ -56,6 +78,9 @@ impl PlatformStatus {
     }
 }
 
+/// 解析交互式平台选择输入，自动去除首尾空白、大小写不敏感。
+/// `"1"` / `"7"` / `"v7"` / `"ouyi7"` → 7.0，`"2"` / `"8"` / `"v8"` / `"ouyi8"` → 8.0，
+/// 其余输入返回 `None`。
 pub fn parse_platform_choice(input: &str) -> Option<OuyiPlatform> {
     match input.trim().to_lowercase().as_str() {
         "1" | "7" | "v7" | "ouyi7" => Some(OuyiPlatform::Ouyi7),
@@ -64,6 +89,10 @@ pub fn parse_platform_choice(input: &str) -> Option<OuyiPlatform> {
     }
 }
 
+/// 交互式选择平台：向终端打印选项并循环读取输入，直到得到合法选择。
+/// - `is_terminal`: 进程是否连接交互终端；为 `false` 时直接返回 `Err`，不发起询问。
+/// 副作用：写标准输出、读标准输入（阻塞等待用户输入）。
+/// 返回 `Err(String)`：非交互终端、输入流关闭或读取失败。
 pub fn select_platform(is_terminal: bool) -> Result<OuyiPlatform, String> {
     if !is_terminal {
         return Err(
@@ -98,6 +127,11 @@ pub fn select_platform(is_terminal: bool) -> Result<OuyiPlatform, String> {
     }
 }
 
+/// 依据配置与环境变量决定启动平台。
+/// 决策链：环境变量 `OUYI_PLATFORM`（存在即生效，非法值报错）→ 交互终端且配置允许询问时
+/// 交互选择 → 配置缺省平台（未配置 `[platform]` 段时为 8.0）。
+/// 副作用：走交互分支时会写标准输出、读标准输入。
+/// 返回 `Err(String)`：环境变量取值非法，或需要交互选择但没有终端。
 pub fn select_platform_from_config(
     config: Option<&crate::config::PlatformConfig>,
     is_terminal: bool,
@@ -106,6 +140,8 @@ pub fn select_platform_from_config(
     select_platform_from_config_and_env(config, env_platform.as_deref(), is_terminal)
 }
 
+/// [`select_platform_from_config`] 的纯函数版本：环境变量取值由调用方注入，便于测试。
+/// 决策链与错误情形与其一致。
 pub fn select_platform_from_config_and_env(
     config: Option<&crate::config::PlatformConfig>,
     env_platform: Option<&str>,
