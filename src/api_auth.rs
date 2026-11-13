@@ -17,15 +17,23 @@ use std::sync::Arc;
 
 use crate::AppState;
 
-/// 从请求头提取调用凭据：优先 `Authorization: Bearer <key>`，其次 `x-api-key: <key>`。
-/// 两处均缺失或值为空白时返回 `None`。
+/// 提取 Authorization 头中的 Bearer 凭据：auth-scheme 按 RFC 7235 不区分大小写，
+/// 头形如 `Bearer <key>` 时返回去前缀并去空白后的 key，其余形式返回 `None`。
+fn bearer_credential(value: &str) -> Option<&str> {
+    value
+        .get(..7)
+        .filter(|scheme| scheme.eq_ignore_ascii_case("Bearer "))
+        .map(|_| value[7..].trim())
+}
+
+/// 从请求头提取调用凭据：优先 `Authorization: Bearer <key>`（scheme 不区分大小写），
+/// 其次 `x-api-key: <key>`。两处均缺失或值为空白时返回 `None`。
 pub(crate) fn extract_credential(req: &Request) -> Option<String> {
     let headers = req.headers();
     if let Some(key) = headers
         .get(axum::http::header::AUTHORIZATION)
         .and_then(|value| value.to_str().ok())
-        .and_then(|value| value.strip_prefix("Bearer "))
-        .map(str::trim)
+        .and_then(bearer_credential)
         .filter(|key| !key.is_empty())
     {
         return Some(key.to_string());
@@ -244,6 +252,19 @@ mod tests {
         assert_eq!(
             extract_credential(&req2),
             Some("sk-xheader-0123456789".to_string())
+        );
+
+        let mut req3 = axum::extract::Request::builder()
+            .uri("/v1/models")
+            .body(axum::body::Body::empty())
+            .unwrap();
+        req3.headers_mut().insert(
+            "authorization",
+            axum::http::HeaderValue::from_static("bearer sk-lowerhdr-0123456789"),
+        );
+        assert_eq!(
+            extract_credential(&req3),
+            Some("sk-lowerhdr-0123456789".to_string())
         );
     }
 }
