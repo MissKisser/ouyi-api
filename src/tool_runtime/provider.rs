@@ -124,8 +124,8 @@ mod tests {
     fn rejects_configured_public_origin() {
         assert!(
             reject_public_origin(
-                "https://ouyi.viaxv.cn/anthropic",
-                Some("https://ouyi.viaxv.cn"),
+                "https://self.example.test/anthropic",
+                Some("https://self.example.test"),
             )
             .is_err()
         );
