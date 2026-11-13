@@ -1,3 +1,9 @@
+//! 模型输出中工具调用标记的解析与修复。
+//!
+//! 从流式或完整文本中识别 `<|tool▁calls▁begin|>...<|tool▁calls▁end|>` 与
+//! `<tool_use>...</tool_use>` 两类包裹标记（含全角标点等变体的模糊匹配），
+//! 将内部 JSON 或 `<invoke>` 标签内容提取为 OpenAI 工具调用增量，
+//! 并提供多层 JSON 自修复管道 [`repair_json`]。
 use crate::model::openai::{ToolCall, ToolCallDelta, ToolCallFunction, ToolCallFunctionDelta};
 
 const TOOL_CALL_START: &str = "<|tool\u{2581}calls\u{2581}begin|>";
@@ -151,6 +157,11 @@ fn repair_unquoted_keys(s: &str) -> String {
     out
 }
 
+/// 对无法直接解析的 JSON 文本做逐级修复，返回首个能通过 `serde_json` 解析的版本。
+///
+/// 修复步骤依次尝试：单引号替换为双引号、转义非法反斜杠、
+/// 为未加引号的键补双引号。每步修复后立即验证，通过即返回。
+/// 返回 `None` 表示所有修复手段都无法得到合法 JSON。
 pub fn repair_json(s: &str) -> Option<String> {
     let step0: String = s.chars().map(|c| if c == '\'' { '"' } else { c }).collect();
     if step0 != s && serde_json::from_str::<serde_json::Value>(&step0).is_ok() {
@@ -167,11 +178,16 @@ pub fn repair_json(s: &str) -> Option<String> {
     None
 }
 
+/// 流式工具调用标记解析器。
+///
+/// 以字符级状态机扫描输入，识别工具调用包裹标记并缓冲内部 JSON，
+/// 解析状态跨 chunk 保持，适配增量到达的 SSE 文本。
 pub struct ToolCallParser {
     state: ParseState,
     json_buf: String,
     tag_buf: String,
     tool_call_index: u32,
+    /// 当前是否处于工具调用块内部（已见开始标记、未见结束标记）。
     pub in_tool: bool,
 }
 
@@ -184,6 +200,7 @@ enum ParseState {
 }
 
 impl ToolCallParser {
+    /// 创建处于初始状态（块外、缓冲为空）的解析器。
     pub fn new() -> Self {
         Self {
             state: ParseState::Normal,
@@ -194,6 +211,14 @@ impl ToolCallParser {
         }
     }
 
+    /// 喂入一段增量文本，返回本次解析结果。
+    ///
+    /// - `content`：本次到达的文本片段，可跨多次调用拼接出完整输出。
+    ///
+    /// 工具调用块之外的普通文本进入 [`ParsedOutput::normal_text`]；识别到完整
+    /// 工具调用块时，内部 JSON 经自修复解析后输出 [`ParsedOutput::tool_deltas`]；
+    /// 疑似标记的不完整前缀会缓冲到内部状态，留待下一轮继续判断。
+    /// JSON 解析失败时将整块降级为普通文本并记录警告日志。
     pub fn process_chunk(&mut self, content: &str) -> ParsedOutput {
         let mut normal_text = String::new();
         let mut tool_deltas: Vec<ToolCallDelta> = Vec::new();
@@ -493,6 +518,7 @@ impl ToolCallParser {
         })
     }
 
+    /// 返回当前是否仍在未闭合的工具调用块内，供流式收尾时决定 `finish_reason`。
     pub fn is_in_tool_call(&self) -> bool {
         self.in_tool
     }
@@ -547,6 +573,9 @@ fn extract_json_string_field(raw: &str, field: &str) -> Option<String> {
     None
 }
 
+/// 将流式工具调用增量补全为完整的 OpenAI 工具调用对象。
+///
+/// 增量中缺失的 `id`、函数名、参数以空字符串兜底，`type` 固定为 `function`。
 pub fn tool_delta_to_full_call(delta: &ToolCallDelta) -> ToolCall {
     ToolCall {
         id: delta.id.clone().unwrap_or_default(),
@@ -566,9 +595,12 @@ pub fn tool_delta_to_full_call(delta: &ToolCallDelta) -> ToolCall {
     }
 }
 
+/// 单次 [`ToolCallParser::process_chunk`] 的解析结果。
 #[derive(Debug)]
 pub struct ParsedOutput {
+    /// 位于工具调用块之外的普通文本。
     pub normal_text: String,
+    /// 本次识别出的工具调用增量，按出现顺序排列。
     pub tool_deltas: Vec<ToolCallDelta>,
 }
 

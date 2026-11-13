@@ -1,45 +1,85 @@
+//! 工具调用标记方言识别与解析。
+//! 支持四类方言：canonical（`<tool_call>` 通用 JSON 形式）、Anthropic
+//! （`<tool_use>` 形式）、GLM 紧凑形式（`<tool_call>名▁参数▁params▁JSON`）
+//! 与 call_tool 函数式语法（`call_tool Name(key=value)`）；并提供显式工具
+//! 意图检测，供 broker 判断"输出了工具痕迹但未形成合法调用"的情形。
+
 use crate::adapter::tool_call::ToolCallParser;
 
 const GLM_OPEN: &str = "<tool_call>";
 const GLM_PARAMS: &str = "▁params▁";
 const CALL_TOOL_PREFIX: &str = "call_tool ";
 
+/// 工具调用标记的方言类型。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ToolDialect {
+    /// 通用 JSON 形式（canonical 标记格式）。
     Canonical,
+    /// Anthropic 风格的 `<tool_use>` 形式。
     Anthropic,
+    /// GLM 紧凑形式（`▁params▁` 分隔的头部 + JSON 参数）。
     GlmCompact,
+    /// `call_tool Name(...)` 函数式语法。
     CallTool,
 }
 
+/// 从文本中解析出的单个工具调用（未做工具名 / schema 校验）。
 #[derive(Debug, Clone, PartialEq)]
 pub struct DialectToolCall {
+    /// 工具名称。
     pub name: String,
+    /// 工具入参（已解析为 JSON 对象）。
     pub input: serde_json::Value,
+    /// 该调用所属的方言。
     pub dialect: ToolDialect,
 }
 
+/// 增量缓冲解析器：分片接收流式文本，结束时统一解析。
+/// 仅供测试使用（`#[cfg(test)]` 门控）。
 #[derive(Debug, Default)]
 #[cfg(test)]
 pub struct DialectParser {
+    /// 已接收的文本缓冲。
     buffer: String,
 }
 
 #[cfg(test)]
 impl DialectParser {
+    /// 创建空的解析器。
     pub fn new() -> Self {
         Self::default()
     }
 
+    /// 追加一段流式文本到缓冲。
+    ///
+    /// # 参数
+    /// - `chunk`：本次到达的文本片段。
     pub fn push_chunk(&mut self, chunk: &str) {
         self.buffer.push_str(chunk);
     }
 
+    /// 结束收集并解析缓冲中的全部工具调用。
+    ///
+    /// # 返回
+    /// 解析出的工具调用列表。
+    ///
+    /// # 错误
+    /// 解析失败时返回描述性错误字符串（同 [`parse_known_tool_calls`]）。
     pub fn finish(self) -> Result<Vec<DialectToolCall>, String> {
         parse_known_tool_calls(&self.buffer)
     }
 }
 
+/// 检测文本中是否出现显式的工具调用标记痕迹。
+///
+/// 命中任一已知标记（GLM 开标记、`<tool_use>`、canonical begin 标记、
+/// `call_tool ` 前缀）即视为有意图；纯自然语言提及工具不会命中。
+///
+/// # 参数
+/// - `text`：待检测文本。
+///
+/// # 返回
+/// `true` 表示存在显式工具调用痕迹。
 pub fn has_explicit_tool_intent(text: &str) -> bool {
     text.contains(GLM_OPEN)
         || text.contains("<tool_use>")
@@ -48,6 +88,20 @@ pub fn has_explicit_tool_intent(text: &str) -> bool {
         || text.contains(CALL_TOOL_PREFIX)
 }
 
+/// 解析文本中的全部工具调用，按方言优先级依次尝试。
+///
+/// 尝试顺序：GLM 紧凑形式 → call_tool 函数式语法 → canonical / Anthropic
+/// 通用解析器；前一类命中即返回，不继续尝试。
+///
+/// # 参数
+/// - `text`：待解析文本。
+///
+/// # 返回
+/// 解析出的工具调用列表（含方言标记）；无任何标记时为空列表。
+///
+/// # 错误
+/// 标记内部结构不完整（缺少工具名 / params 标记 / 括号未闭合）、
+/// 参数不是合法 JSON 等情形返回描述性错误字符串。
 pub fn parse_known_tool_calls(text: &str) -> Result<Vec<DialectToolCall>, String> {
     let glm_calls = parse_glm_calls(text)?;
     if !glm_calls.is_empty() {

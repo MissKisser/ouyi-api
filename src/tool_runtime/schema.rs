@@ -1,5 +1,24 @@
+//! 面向编译器的工具 schema 改写。
+//! 把 Write/Edit/MultiEdit 等工具入参 schema 中的长文本字段（content、
+//! old_string、new_string）替换为对应的 `*_ref` 引用字段，使编译器输出的
+//! 长正文通过 payload 引用传递；其余工具 schema 原样保留。
+
 use crate::tool_runtime::protocol::ToolSpec;
 
+/// 改写单个工具 schema 以适配编译器输出约定。
+///
+/// 改写规则：
+/// - `Write`：`content` 字段替换为 `content_ref`；
+/// - `Edit`：`old_string` / `new_string` 替换为对应的 `*_ref`；
+/// - `MultiEdit`：`edits[].items` 内的两个文本字段替换为 `*_ref`；
+/// - 其它工具原样克隆返回。
+/// `required` 列表中的同名项同步替换；schema 结构不符合预期时保持原样。
+///
+/// # 参数
+/// - `spec`：原始工具规格。
+///
+/// # 返回
+/// 改写后的工具规格副本。
 pub fn compiler_tool_spec(spec: &ToolSpec) -> ToolSpec {
     match spec.name.as_str() {
         "Write" => rewrite_object_fields(spec, &[("content", "content_ref")]),
@@ -15,6 +34,13 @@ pub fn compiler_tool_spec(spec: &ToolSpec) -> ToolSpec {
     }
 }
 
+/// 批量改写工具 schema 列表（逐项调用 [`compiler_tool_spec`]）。
+///
+/// # 参数
+/// - `specs`：原始工具规格列表。
+///
+/// # 返回
+/// 改写后的工具规格列表，顺序与输入一致。
 pub fn compiler_tool_specs(specs: &[ToolSpec]) -> Vec<ToolSpec> {
     specs.iter().map(compiler_tool_spec).collect()
 }

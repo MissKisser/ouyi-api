@@ -1,29 +1,51 @@
+//! 模型目录（catalog）数据结构与构建逻辑。
+//! `ModelCatalog` 汇总某平台下用户可用的模型列表，供 `/v1/models` 类接口
+//! 与内部路由表消费；支持从欧易 8.0（Tmpl）与 7.0（memberInfo/sysEnum）
+//! 两种数据源构建，并为 7.0 提供能力位与供应商的推断工具。
+
 use crate::model::ouyi::{TmplCapabilities, TmplResponse};
 use crate::model::ouyi_v7::{MemberInfoResult, Ouyi7EnumItem};
 use crate::platform::OuyiPlatform;
 use serde::{Deserialize, Serialize};
 
-/// 模型目录
+/// 模型目录：某一平台下全部可用模型及所属平台的集合。
 #[derive(Debug, Clone)]
 pub struct ModelCatalog {
+    /// 目录归属的平台标识。
     pub platform: OuyiPlatform,
+    /// 该平台下收录的模型条目列表。
     pub models: Vec<ModelCatalogItem>,
 }
 
-/// 模型目录项
+/// 模型目录中的单个模型条目。
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ModelCatalogItem {
+    /// 对外暴露的模型标识，客户端请求 `model` 字段时使用该值。
     pub id: String,
+    /// 展示用名称，用于前端列表与日志。
     pub label: String,
+    /// 供应商标识 key（如 `"openai"`、`"claude"`、`"ouyi7"`）。
     pub provider_key: String,
+    /// 供应商展示名称（如 `"OpenAI"`、`"Claude"`）。
     pub provider_name: String,
+    /// 模型能力位（流式 / 工具 / 思考 / 图片输入等）。
     pub capabilities: TmplCapabilities,
+    /// 附加元数据（如 7.0 的路由信息 `routing` / `role_id`）；缺省时序列化会跳过该字段。
     #[serde(skip_serializing_if = "Option::is_none")]
     pub metadata: Option<serde_json::Value>,
 }
 
 impl ModelCatalog {
-    /// 从 8.0 TmplResponse 转换
+    /// 从欧易 8.0 的 Tmpl 响应构建模型目录。
+    ///
+    /// 直接映射 `data.models` 列表，条目的 `value` / `label` / 供应商与能力位
+    /// 原样搬入，`metadata` 置空；响应无 `data` 时得到空目录。
+    ///
+    /// # 参数
+    /// - `resp`：欧易 8.0 模板接口的响应。
+    ///
+    /// # 返回
+    /// 平台标识为 `OuyiPlatform::Ouyi8` 的模型目录。
     pub fn from_tmpl(resp: &TmplResponse) -> Self {
         let models = resp
             .data
@@ -49,15 +71,22 @@ impl ModelCatalog {
         }
     }
 
-    /// 从 7.0 数据转换
+    /// 从欧易 7.0 的用户信息与模型枚举构建模型目录。
     ///
-    /// 实地 JWT 探测确认的后端模型路由机制：
+    /// 7.0 后端的模型路由机制：
     /// - `privileges[].customAIModels`（字符串名，如 "deepseek-chat"）→ 用 `roleId=1` + `params.model="字符串名"` 路由
     /// - `privileges[].aiModels`（数字 value 数组，对应 sysEnum）→ 用 `roleId=value` 路由
     ///
-    /// 因此 catalog 只收录这两类用户实际订阅的模型，不再无脑加全部 sysEnum
-    /// （旧实现会把 GPT-3.5 系列、Claude 1/2、ERNIE 等已淘汰/无权的 66 个模型全列出来）。
-    /// 路由信息存进 `metadata`，由 client 的路由表读取。
+    /// 因此 catalog 只收录 privileges 中通过这两类字段订阅的模型，sysEnum 中
+    /// 未被订阅的枚举项不会进入目录。路由信息写入各条目的 `metadata`
+    /// （`routing` / `role_id` / `model` / `name` 等），由 client 的路由表读取。
+    ///
+    /// # 参数
+    /// - `member_info`：欧易 7.0 的用户信息（含订阅的 privileges）。
+    /// - `enum_items`：sysEnum 模型枚举列表，用于把数字 role_id 映射为可读名称。
+    ///
+    /// # 返回
+    /// 平台标识为 `OuyiPlatform::Ouyi7` 的模型目录；无 group_info 时为空目录。
     pub fn from_ouyi_v7(member_info: &MemberInfoResult, enum_items: &[Ouyi7EnumItem]) -> Self {
         let mut models = Vec::new();
         let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
@@ -110,8 +139,8 @@ impl ModelCatalog {
 
                     // 用 describe（人类可读、符合 OpenAI 标准命名，如 "gpt-4o"/"gpt-3.5-turbo"/"claude-2"）
                     // 作 id —— 与 customAIModels 风格一致、与 8.0 列表一致、与用户认知一致。
-                    // name（如 "ChatGPT4o"）只是后端内部枚举 key，不应对外暴露。
-                    // 实地探测确认 describe 与 customAIModels 零重叠，去重安全。
+                    // name（如 "ChatGPT4o"）只是后端内部枚举 key，不对外暴露，
+                    // 仅保留在 metadata 中；describe 与 customAIModels 取值不重叠，去重安全。
                     let id = if enum_item.describe.is_empty() {
                         enum_item.name.clone()
                     } else {
@@ -150,7 +179,10 @@ impl ModelCatalog {
     }
 }
 
-/// 7.0 默认能力位（无法从后端拿到真实 capabilities 时的兜底）
+/// 返回欧易 7.0 模型的默认能力位。
+///
+/// 后端不提供真实 capabilities 元数据时的兜底值：仅 `system_role` 为 `true`，
+/// 流式 / 工具 / 思考 / 图片输入 / 文件输入 / 自动思考检测均为 `false`。
 pub fn default_ouyi_v7_capabilities() -> TmplCapabilities {
     TmplCapabilities {
         stream: false,
@@ -163,13 +195,19 @@ pub fn default_ouyi_v7_capabilities() -> TmplCapabilities {
     }
 }
 
-/// 根据模型名推断 7.0 模型的能力位。
+/// 根据模型名推断欧易 7.0 模型的能力位。
 ///
-/// 7.0 后端的 memberInfo/sysEnum 都不暴露 capabilities 元数据，
-/// 但模型名本身包含明显的能力暗示（实测订阅的 60 个 customAIModels + 29 个 aiModels）：
+/// 7.0 后端的 memberInfo/sysEnum 不暴露 capabilities 元数据，
+/// 因此按模型名中的关键词推断：
 /// - thinking：deepseek-r1/reasoner、qwq-32b、grok-3-reasoning、glm-4.1v-thinking、o1/o3 系列等
 /// - image_input：gpt-4o、gpt-4-vision、glm-4v、qwen-vl、grok-2-vision 等
-/// - stream/tools 仍按 false（7.0 上游不支持原生 SSE/tools，由反代侧模拟/外挂）
+/// - stream/tools 固定为 false（7.0 上游不支持原生 SSE/tools，由反代侧模拟/外挂）
+///
+/// # 参数
+/// - `model_name`：模型名（大小写不敏感，函数内部会转小写匹配）。
+///
+/// # 返回
+/// 推断出的能力位；`auto_detect_thinking` 与 `thinking` 保持一致。
 pub fn infer_ouyi_v7_capabilities(model_name: &str) -> TmplCapabilities {
     let name_lower = model_name.to_lowercase();
     let thinking = is_thinking_model(&name_lower);
@@ -295,8 +333,8 @@ mod tests {
         assert!(json.contains("\"label\":\"GPT-4\""));
     }
 
-    /// 回归：旧 from_ouyi_v7 会把 sysEnum 全部模型塞进 catalog，
-    /// 新逻辑只收录 customAIModels + aiModels 订阅的。
+    /// 校验 from_ouyi_v7 只收录 privileges 订阅的模型
+    /// （customAIModels + aiModels），sysEnum 中未订阅的枚举项不进入目录。
     #[test]
     fn from_ouyi_v7_only_includes_subscribed_models_not_all_enums() {
         use crate::model::ouyi_v7::{GroupInfo, MemberInfoResult, Privilege};

@@ -3,6 +3,7 @@
 import * as React from "react"
 import { cn } from "@/lib/utils"
 
+/** 单值滑块（range input 封装），min / max / step 受控，经 onValueChange 回传数组值。 */
 const Slider = React.forwardRef<
   HTMLInputElement,
   Omit<React.ComponentProps<"input">, "type" | "value" | "onChange" | "min" | "max" | "step"> & {

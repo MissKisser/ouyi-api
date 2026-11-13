@@ -1,3 +1,11 @@
+//! OpenAI Responses API 端点：`POST /v1/responses` 与 `POST /openai/v1/responses`。
+//! 职责：把 Responses 请求（字符串或结构化 input、`previous_response_id` 会话续接、
+//! `instructions`、tools）转换为内部 Chat Completions 请求，按当前平台（Ouyi7 / Ouyi8）
+//! 分派到上游链路，并以 Responses API 规范回包——流式为 SSE 事件序列
+//! （见子模块 `responses_stream`），非流式为 `ResponsesResponse` JSON
+//! （见子模块 `responses_non_stream`）；带 tools 的请求经工具运行时 pipeline 决策，
+//! 并把响应历史持久化到 `responses_state` 供 `previous_response_id` 续接。
+
 use std::sync::Arc;
 
 use axum::Json;
@@ -23,6 +31,30 @@ mod responses_stream;
 #[path = "responses_non_stream.rs"]
 mod responses_non_stream;
 
+/// OpenAI Responses 推理入口（`POST /v1/responses` 与 `POST /openai/v1/responses`）。
+///
+/// 入参 `req` 为 Responses API 请求体：`input` 为用户输入（字符串或结构化消息数组，
+/// 支持 `message` / `function_call` / `function_call_output` 项），`previous_response_id`
+/// 指向此前响应以续接会话历史，`instructions` 注入系统提示，`stream` 决定 SSE 或 JSON，
+/// `tools` / `tool_choice` 启用函数工具调用。
+///
+/// 处理步骤：解析 `previous_response_id` 取回历史消息并转换为内部 Chat Completions 请求，
+/// 登记活跃请求统计后按当前平台（Ouyi7 / Ouyi8）分派。带 tools 的请求分别走
+/// `responses_v7_tools` / `responses_v8_tools` 流水线，判定结果（工具调用或最终回答）
+/// 会持久化响应历史供后续续接。
+///
+/// 副作用：登记与更新请求统计（开始 / 成功 / 失败）、创建并清理上游会话、
+/// 维护活跃会话表，带 tools 时向 `responses_state` 写入响应历史。
+///
+/// 可能出现的错误：
+/// - `ResponseNotFound`：`previous_response_id` 对应的历史响应不存在；
+/// - `BadRequest`：`input` 类型非法、`function_call` 参数 JSON 无效、
+///   `function_call_output` 找不到对应调用、input 类型不受支持或消息列表为空；
+/// - `Internal`：请求转换为上游格式失败或当前平台客户端不匹配；
+/// - `BadRequest`（token 缺失）/`Upstream`（会话创建与聊天请求失败、上游应用层报错）/
+///   `SseStream`（字节流读取或 UTF-8 解码失败）/`PayloadTooLarge`（响应超过大小限制）；
+/// - `Config`：当前平台缺少对应配置；
+/// - `ToolProtocol`：工具运行时 pipeline 协议错误。
 pub async fn responses(
     State(state): State<Arc<AppState>>,
     Json(req): Json<ResponsesRequest>,
@@ -1911,16 +1943,16 @@ mod tests {
             .await
             .unwrap_err();
 
-        // 7.0 + tools 现在走 responses_v7_tools 流水线：尝试连接不可达 base url
-        // 时会在聊天请求阶段失败（AppError::Upstream），而不是返回 BadRequest。
+        // 7.0 + tools 走 responses_v7_tools 流水线：尝试连接不可达 base url
+        // 时会在聊天请求阶段失败，归类为 Upstream（或 Internal）错误而非参数错误。
         assert!(matches!(err, AppError::Upstream(_)) || matches!(err, AppError::Internal(_)));
         assert_eq!(state.stats.stats.active_requests.load(Ordering::Relaxed), 0);
     }
 
     #[tokio::test]
     async fn test_ouyi8_responses_with_tools_routes_to_pipeline_path() {
-        // 8.0 + tools 现在走 responses_v8_tools 流水线：尝试连接不可达 base url
-        // 时会在创建会话阶段失败（AppError::Upstream），而不是返回 BadRequest。
+        // 8.0 + tools 走 responses_v8_tools 流水线：尝试连接不可达 base url
+        // 时会在创建会话阶段失败，归类为 Upstream（或 Internal）错误而非参数错误。
         let state = make_test_state(test_config("http://127.0.0.1:1".to_string()));
         let req = ResponsesRequest {
             model: "gpt-4o".to_string(),
@@ -1944,7 +1976,7 @@ mod tests {
             .await
             .unwrap_err();
 
-        // 不再是 BadRequest；上游不可达导致 Upstream 错误
+        // 上游不可达时归类为 Upstream 错误而非参数错误
         assert!(matches!(err, AppError::Upstream(_)) || matches!(err, AppError::Internal(_)));
         assert_eq!(state.stats.stats.active_requests.load(Ordering::Relaxed), 0);
     }

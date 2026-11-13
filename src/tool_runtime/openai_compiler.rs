@@ -1,3 +1,9 @@
+//! 外部工具编译器客户端：把主模型输出的工具意图交给独立的工具模型
+//! 转换为结构化 tool_calls / tool_use。
+//! 支持 OpenAI-compatible 与 Anthropic 两类编译器后端（按端点与配置选择），
+//! 内置首次请求失败后的结构化重试、payload 引用落地与 schema / tool_choice
+//! 校验；所有请求携带单跳标记头并由 provider 模块做自环防护。
+
 use crate::config::{ToolRuntimeConfig, ToolRuntimeProvider};
 use crate::error::AppError;
 use crate::model::anthropic::{AnthropicTool, MessagesRequest};
@@ -6,30 +12,41 @@ use crate::tool_runtime::protocol::{
 };
 use serde::{Deserialize, Serialize};
 
-/// 编译后的工具调用结构
+/// 编译后的工具调用结构。
 #[derive(Debug, Clone)]
 pub struct CompiledToolCall {
+    /// 调用唯一标识（来自编译器响应，调用方可再做归一化）。
     pub id: String,
+    /// 工具名称（已校验存在于可用工具列表）。
     pub name: String,
+    /// 工具入参（已解析为 JSON 对象并落地 payload 引用）。
     pub input: serde_json::Value,
 }
 
-/// 编译器决策结果
+/// 编译器决策结果。
 #[derive(Debug, Clone)]
 pub enum CompilerDecision {
+    /// 编译出工具调用列表。
     ToolCalls(Vec<CompiledToolCall>),
+    /// 编译器判定为最终回答，无需调用工具。
     FinalAnswer,
 }
 
+/// 编译器调用的 token 用量统计。
 #[derive(Debug, Clone)]
 pub struct CompilerUsage {
+    /// 编译器请求消耗的输入 token 数；响应缺失时为 0。
     pub prompt_tokens: u64,
+    /// 编译器请求消耗的输出 token 数；响应缺失时为 0。
     pub completion_tokens: u64,
 }
 
+/// 编译器单次调用的完整结果。
 #[derive(Debug, Clone)]
 pub struct CompilerResult {
+    /// 决策结果（工具调用或最终回答）。
     pub decision: CompilerDecision,
+    /// 本次编译的 token 用量。
     pub usage: CompilerUsage,
 }
 
@@ -237,7 +254,27 @@ fn parse_anthropic_tool_uses(
     Ok(compiled_calls)
 }
 
-/// 带 payload 的工具决策编译（旧函数委托至此）
+/// 编译工具决策（Anthropic Messages 请求入口），附带主模型输出中的 payload。
+///
+/// 把 Anthropic 请求规范化为协议无关上下文（时间线 + 工具规格 + tool_choice），
+/// 携带传入的 payload 列表后委托给 [`compile_tool_decision_for_context`]。
+///
+/// # 参数
+/// - `http_client`：用于请求编译器的 HTTP 客户端。
+/// - `config`：工具运行时配置（模型、地址、密钥、超时）。
+/// - `req`：Anthropic Messages 请求。
+/// - `ouyi_output`：主模型的原始输出文本。
+/// - `payloads`：从输出中抽离的长文本负载列表。
+///
+/// # 返回
+/// 编译结果（决策 + token 用量）。
+///
+/// # 错误
+/// 消息历史不规范、编译器配置缺失、地址自环、网络 / 响应解析失败、
+/// 工具名未知或校验不通过时返回对应 `AppError`。
+///
+/// # 副作用
+/// 发起外部 HTTP 调用（失败重试时最多两次调用）并消耗编译器 token 配额。
 pub async fn compile_tool_decision_with_usage_and_payloads(
     http_client: reqwest::Client,
     config: &ToolRuntimeConfig,
@@ -268,9 +305,27 @@ pub async fn compile_tool_decision_with_usage_and_payloads(
     compile_tool_decision_for_context(http_client, config, &context, ouyi_output).await
 }
 
-/// 基于协议无关上下文编译工具决策
-/// OpenAI 端点只使用 OpenAI-compatible 工具模型
-/// Anthropic 端点根据配置选择 provider
+/// 基于协议无关上下文编译工具决策。
+///
+/// 端点路由：OpenAI 端点只使用 OpenAI-compatible 工具模型；
+/// Anthropic 端点按配置的 provider 选择编译器后端。
+/// 工具列表为空时直接返回最终回答（零用量），不发起网络请求。
+///
+/// # 参数
+/// - `http_client`：用于请求编译器的 HTTP 客户端。
+/// - `config`：工具运行时配置。
+/// - `context`：协议无关的工具运行时上下文。
+/// - `ouyi_output`：主模型的原始输出文本。
+///
+/// # 返回
+/// 编译结果（决策 + token 用量）。
+///
+/// # 错误
+/// 编译器配置缺失、地址自环、网络 / 响应解析失败、工具名未知或校验
+/// 不通过时返回对应 `AppError`。
+///
+/// # 副作用
+/// 发起外部 HTTP 调用（首次失败会结构化重试一次）并消耗编译器 token 配额。
 pub async fn compile_tool_decision_for_context(
     http_client: reqwest::Client,
     config: &ToolRuntimeConfig,

@@ -1,8 +1,20 @@
+//! 管理后台模块：JWT 鉴权中间件、后台 API 路由与前端静态资源服务。
+//!
+//! - [`accounts`]: 上游账号池存储与运行时状态
+//! - [`auth`]: 密码哈希校验、JWT 签发验证与登录限流
+//! - [`handlers`]: 各后台 API 端点处理器
+//! - [`stats`]: 请求 / 运行时 / 工具运行时统计采集
+
+/// 上游账号池存储与运行时状态。
 pub(crate) mod accounts;
+/// 管理员密码哈希、JWT 签发验证与登录限流。
 pub(crate) mod auth;
+/// 后台 API 端点处理器（仅本模块内挂载路由使用）。
 mod handlers;
+/// 请求与运行日志的统计采集。
 pub(crate) mod stats;
 
+/// 账号池存储的 crate 内统一导出。
 pub(crate) use accounts::AccountStore;
 
 use std::sync::Arc;
@@ -19,6 +31,8 @@ use axum::{
 
 use crate::AppState;
 
+/// 组装管理后台 API 路由，并挂载 JWT 鉴权中间件
+/// （`/admin/api/setup` 与 `/admin/api/login` 豁免校验）。
 pub(crate) fn admin_routes(state: Arc<AppState>) -> Router<Arc<AppState>> {
     Router::new()
         .route("/admin/api/setup", post(handlers::admin_setup))
@@ -63,6 +77,8 @@ pub(crate) fn admin_routes(state: Arc<AppState>) -> Router<Arc<AppState>> {
         .with_state(state)
 }
 
+/// 鉴权中间件：校验请求 `Authorization: Bearer <JWT>`，无效时返回 401；
+/// setup 与 login 两个路径跳过校验直接放行。
 async fn jwt_middleware(State(state): State<Arc<AppState>>, req: Request, next: Next) -> Response {
     let skip_paths = ["/admin/api/setup", "/admin/api/login"];
     let path = req.uri().path();
@@ -91,6 +107,7 @@ async fn jwt_middleware(State(state): State<Arc<AppState>>, req: Request, next: 
     next.run(req).await
 }
 
+/// 从请求头提取 Bearer token 字符串；缺失或格式不符时返回 `None`。
 fn extract_bearer_token(req: &Request) -> Option<&str> {
     req.headers()
         .get("authorization")
@@ -98,6 +115,8 @@ fn extract_bearer_token(req: &Request) -> Option<&str> {
         .and_then(|h| h.strip_prefix("Bearer "))
 }
 
+/// 组装前端静态资源路由：`web/dist` 目录存在时以目录服务挂载 `/admin`
+/// （SPA 回退到 index.html）；目录不存在时回退到编译期内嵌资源服务。
 pub(crate) fn static_file_router() -> Router<Arc<AppState>> {
     use tower_http::services::{ServeDir, ServeFile};
 
@@ -112,10 +131,13 @@ pub(crate) fn static_file_router() -> Router<Arc<AppState>> {
     }
 }
 
+/// 编译期内嵌的前端静态资源（用于 `web/dist` 目录不存在时的回退服务）。
 #[derive(rust_embed::Embed)]
 #[folder = "web/dist/"]
 struct WebAssets;
 
+/// 从内嵌资源服务 `/admin/**` 路径：命中静态文件按 MIME 返回，未命中或
+/// 目录请求回退 `index.html`（SPA 路由）；非 admin 路径或无内嵌资源返回 404。
 async fn serve_embedded_fallback(uri: axum::http::Uri) -> Response {
     let path = uri.path();
     if path == "/admin" || path.starts_with("/admin/") {
@@ -544,7 +566,7 @@ prompt_on_start = false
     }
 
     /// 同平台改 token：用户没切换平台时（platform.default 与活动平台一致），
-    /// 仍走旧的"同平台 client 重建"分支。
+    /// 走"同平台 client 重建"分支。
     #[tokio::test]
     async fn platform_default_unchanged_keeps_legacy_same_platform_rebuild() {
         let state = make_test_state_with_limit(0);

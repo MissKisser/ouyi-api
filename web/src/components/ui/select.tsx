@@ -3,6 +3,7 @@
 import * as React from "react"
 import { cn } from "@/lib/utils"
 
+/** 原生 select 封装，用 value / onValueChange 受控，支持 placeholder 占位项。 */
 const Select = React.forwardRef<
   HTMLSelectElement,
   React.ComponentProps<"select"> & {
@@ -35,6 +36,7 @@ const Select = React.forwardRef<
 })
 Select.displayName = "Select"
 
+/** 下拉选项分组（optgroup 封装）。 */
 const SelectGroup = React.forwardRef<
   HTMLOptGroupElement,
   React.ComponentProps<"optgroup">
@@ -50,6 +52,7 @@ const SelectGroup = React.forwardRef<
 })
 SelectGroup.displayName = "SelectGroup"
 
+/** 下拉单个选项（option 封装）。 */
 const SelectItem = React.forwardRef<
   HTMLOptionElement,
   React.ComponentProps<"option">

@@ -1,3 +1,9 @@
+//! HTTP 路由组装模块。
+//!
+//! 把模型列表路由与推理路由合并为应用路由：推理路由（OpenAI chat/completions、
+//! Responses、Anthropic messages）统一挂载全局并发限流中间件与工具运行时递归防护中间件；
+//! 模型列表路由不受限流约束。管理后台路由与静态资源路由由 `main` 在此基础上合并。
+
 use std::sync::Arc;
 
 use axum::Router;
@@ -11,6 +17,13 @@ use crate::AppState;
 use crate::concurrency::{ConcurrencyLimiter, limit_inference_requests};
 use crate::handler;
 
+/// 组装应用路由。
+/// - 模型列表：`/v1/models`、`/openai/v1/models`、`/anthropic/v1/models`；
+/// - 推理：`/v1/chat/completions`、`/openai/v1/chat/completions`、`/openai/v1/responses`、
+///   `/v1/responses`、`/anthropic/v1/messages`、`/anthropic/messages`，全部经过
+///   [`limit_inference_requests`] 限流与 [`reject_tool_runtime_recursion`] 递归防护。
+/// - `limiter`: 全局并发限流器（与 `AppState` 中的实例共享同一份计数）。
+/// 返回以 `Arc<AppState>` 为状态的 `Router`，由 `main` 再合并管理后台与静态资源路由。
 pub fn app(limiter: ConcurrencyLimiter) -> Router<Arc<AppState>> {
     let models = Router::new()
         .route("/v1/models", get(handler::models::list_models))
@@ -36,6 +49,9 @@ pub fn app(limiter: ConcurrencyLimiter) -> Router<Arc<AppState>> {
     models.merge(inference)
 }
 
+/// 工具运行时递归防护中间件：请求携带的递归跳数头部大于等于 1 时，说明是
+/// 工具运行时的内部请求回流到了推理入口，直接以 [`AppError::ToolRecursion`]（502）拒绝；
+/// 否则放行到下一层处理。
 async fn reject_tool_runtime_recursion(request: Request, next: Next) -> Response {
     let hop = request
         .headers()

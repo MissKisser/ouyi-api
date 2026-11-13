@@ -1,3 +1,8 @@
+//! OpenAI / Anthropic 请求到 ouyi 7.0 结构化输入的适配。
+//!
+//! 将两种协议的多轮消息归一为 [`Ouyi7ChatInput`]：system 消息合并为系统提示、
+//! 最后一条用户消息独立为当前输入 content、其余消息截断后作为历史列表，
+//! 工具调用与工具结果以标记文本形式保留在历史中。
 use crate::error::AppError;
 use crate::model::anthropic::{
     AnthropicContent, ContentBlock, MessagesRequest, SystemBlock, SystemContent,
@@ -5,18 +10,36 @@ use crate::model::anthropic::{
 use crate::model::openai::{ChatCompletionRequest, ChatMessage};
 use crate::model::ouyi_v7::Ouyi7HistoryMessage;
 
-/// 7.0 聊天输入结构
+/// ouyi 7.0 聊天输入结构，由请求适配函数构造后交给上游客户端发送。
 #[derive(Debug, Clone)]
 pub struct Ouyi7ChatInput {
+    /// 目标模型名。
     pub model: String,
+    /// 合并后的系统提示文本；请求中无 system 内容时为空字符串。
     pub system_message: String,
+    /// 历史消息列表（已按上限截断，system 提示位于首位；不含当前输入）。
     pub messages: Vec<Ouyi7HistoryMessage>,
+    /// 当前这轮的用户输入文本；请求中没有用户消息时为空字符串。
     pub content: String,
+    /// 透传的采样温度；请求未指定时为 `None`。
     pub temperature: Option<f64>,
+    /// 透传的最大生成长度；请求未指定时为 `None`。
     pub max_tokens: Option<u64>,
 }
 
-/// 将 OpenAI ChatCompletionRequest 转换为 7.0 输入
+/// 将 OpenAI ChatCompletion 请求转换为 ouyi 7.0 输入。
+///
+/// - `req`：OpenAI 格式请求，含多轮消息与采样参数；
+/// - `model`：目标模型名；
+/// - `max_history_messages`：历史消息保留上限（system 提示不计入）。
+///
+/// 转换规则：system 消息合并进 `system_message`；assistant 消息携带的
+/// tool_calls 以工具调用标记文本保留在历史中；tool 结果按 `tool_call_id`
+/// 反查工具名后以 `<tool_result>` 包裹并入历史；最后一条用户消息从历史中
+/// 取出作为当前输入 `content`，剩余历史经 [`truncate_history`] 截断。
+///
+/// 返回 [`Ouyi7ChatInput`]；`messages` 为空或 tool 结果找不到对应工具名时
+/// 返回 `Err`（`AppError::BadRequest`）。
 pub fn from_openai_chat(
     req: &ChatCompletionRequest,
     model: String,
@@ -135,7 +158,18 @@ pub fn from_openai_chat(
     })
 }
 
-/// 将 Anthropic MessagesRequest 转换为 7.0 输入
+/// 将 Anthropic Messages 请求转换为 ouyi 7.0 输入。
+///
+/// - `req`：Anthropic 格式请求（`max_tokens` 为必填字段）；
+/// - `model`：目标模型名；
+/// - `max_history_messages`：历史消息保留上限（system 提示不计入）。
+///
+/// 转换规则：请求自带 system 合并进 `system_message`；user 消息中的
+/// tool_result 块转为 `<tool_result>` 文本、assistant 消息中的 tool_use 块
+/// 转为 `<tool_use>` 文本保留在历史中；最后一条用户消息从历史中取出作为
+/// 当前输入 `content`，剩余历史经 [`truncate_history`] 截断。
+///
+/// 返回 [`Ouyi7ChatInput`]；`messages` 为空时返回 `Err`（`AppError::BadRequest`）。
 pub fn from_anthropic_messages(
     req: &MessagesRequest,
     model: String,
@@ -223,7 +257,14 @@ pub fn from_anthropic_messages(
     })
 }
 
-/// 截断历史消息，优先保留 system 和最近消息
+/// 按上限截断消息列表，优先保留 system 与最近的消息。
+///
+/// - `system_messages`：置于结果头部的 system 消息；
+/// - `history_messages`：待截断的历史消息；
+/// - `max_history_messages`：结果总长度上限。
+///
+/// 历史未超限时原样拼接返回；超限时按上限扣除 system 占用名额后
+/// 从末尾保留尽可能多的最近消息。返回拼接后的消息列表。
 pub fn truncate_history(
     system_messages: Vec<Ouyi7HistoryMessage>,
     history_messages: Vec<Ouyi7HistoryMessage>,

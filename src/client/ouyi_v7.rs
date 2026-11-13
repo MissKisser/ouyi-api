@@ -1,3 +1,7 @@
+//! ouyi 7.0 上游 HTTP 客户端：基于"话题（topic）"生命周期的一次性聊天
+//! 流程（创建话题 → 发送消息 → 拉取响应 → 删除话题），并维护从模型目录
+//! 推导出的模型路由表。
+
 use crate::error::AppError;
 use crate::model::catalog::ModelCatalog;
 use crate::model::ouyi_v7::{
@@ -10,12 +14,13 @@ use std::sync::Arc;
 
 /// 7.0 模型路由策略。
 ///
-/// 实地 JWT 探测 api-8.rcouyi.com 后端确认的两种路由方式：
+/// 上游后端仅支持两种模型指定方式：
 /// - `Custom`：customAIModels 字符串名 → `roleId=1` + `params.model = "<name>"`
 /// - `Standard`：aiModels 数字 value → `roleId = <value>`
 ///
-/// 后端会忽略其他方式选择模型，默认 fallback 到 gpt-3.5-turbo —— 这是
-/// 旧版反代"模型路由完全失效"的根因（params 永远是 "{}"、role_id 恒为 1）。
+/// 当 `roleId` 与 `params` 未按上述约定携带模型信息（例如 `params` 为空
+/// 对象且 `roleId` 恒为 1）时，后端会忽略所选路由并回落到默认模型
+/// gpt-3.5-turbo。
 #[derive(Debug, Clone)]
 pub enum V7ModelRouting {
     /// customAIModel，走 roleId=1 + params.model
@@ -38,6 +43,7 @@ impl V7ModelRouting {
 }
 
 impl V7ModelRouting {
+    /// 构造按 customAIModels 字符串名路由的策略。
     pub fn as_custom(model: &str) -> Self {
         V7ModelRouting::Custom { model: model.to_string() }
     }
@@ -68,7 +74,7 @@ pub fn build_routing_table_from_catalog(catalog: &ModelCatalog) -> Arc<DashMap<S
     table
 }
 
-/// 7.0 HTTP 客户端
+/// ouyi 7.0 上游的 HTTP 客户端，封装鉴权头、端点拼接与模型路由表。
 #[derive(Clone)]
 pub struct Ouyi7HttpClient {
     http_client: Client,
@@ -81,6 +87,13 @@ pub struct Ouyi7HttpClient {
 }
 
 impl Ouyi7HttpClient {
+    /// 构建客户端，路由表初始为空（`create_topic` 在空表时对未知模型按
+    /// Custom 路径回落处理）。
+    ///
+    /// * `http_client` - 底层共享的 reqwest 客户端
+    /// * `base_url` - 上游服务根地址
+    /// * `chatapi_prefix` - 聊天 API 路径前缀（如 "/chatapi"）
+    /// * `jwt_token` - 上游 JWT 凭据
     pub fn new(
         http_client: Client,
         base_url: String,
@@ -97,7 +110,8 @@ impl Ouyi7HttpClient {
     }
 
     /// 用最新 catalog 构造的路由表替换 client 持有的表。
-    /// 由 main.rs 后台刷新任务调用；对正在处理中的请求无影响（旧请求已读到旧值）。
+    /// 由 main.rs 后台刷新任务调用；正在处理中的请求已按替换前的表完成
+    /// 路由决策，不受影响。传入表与当前表指针相同时跳过复制。
     pub fn update_routing(&self, table: Arc<DashMap<String, V7ModelRouting>>) {
         // 用 ptr_eq 避免无谓替换
         if !Arc::ptr_eq(&table, &self.routing_table) {
@@ -109,17 +123,24 @@ impl Ouyi7HttpClient {
         }
     }
 
+    /// 返回上游服务根地址。
     pub fn base_url(&self) -> &str {
         &self.base_url
     }
 
-    /// 验证 JWT token
+    /// 验证 JWT token 是否有效：请求用户信息并按是否携带组信息判定。
+    /// 副作用：向上游发起 GET 请求；请求/解析失败经 `?` 透传为
+    /// `Err(AppError)`。
     pub async fn verify_token(&self) -> Result<bool, AppError> {
         let result = self.fetch_member_info().await?;
         Ok(result.group_info.is_some())
     }
 
-    /// 获取用户信息
+    /// 获取当前 JWT 对应的用户信息。
+    ///
+    /// 副作用：向上游发起 GET 请求。
+    /// 返回 `Err(AppError::Upstream)`：HTTP 状态非 2xx、业务码非 200 或
+    /// 返回空结果；网络与 JSON 解析错误经 `?` 透传。
     pub async fn fetch_member_info(&self) -> Result<MemberInfoResult, AppError> {
         let url = format!(
             "{}{}{}",
@@ -154,7 +175,11 @@ impl Ouyi7HttpClient {
             .ok_or_else(|| AppError::Upstream("memberInfo result is null".to_string()))
     }
 
-    /// 获取系统模型枚举
+    /// 获取上游系统模型枚举列表（`InterfaceAIModelEnum`）。
+    ///
+    /// 副作用：向上游发起 GET 请求。
+    /// 返回 `Err(AppError::Upstream)`：HTTP 状态非 2xx、业务码非 200 或
+    /// 返回空结果；网络与 JSON 解析错误经 `?` 透传。
     pub async fn fetch_model_enum(&self) -> Result<Vec<Ouyi7EnumItem>, AppError> {
         let url = format!(
             "{}{}",
@@ -250,7 +275,7 @@ impl Ouyi7HttpClient {
             .ok_or_else(|| AppError::Upstream("create_topic result is null".to_string()))
     }
 
-    /// 删除话题
+    /// 删除上游话题；失败仅记录告警日志、不视为错误（清理属尽力而为）。
     async fn delete_topic(&self, topic_id: i64) -> Result<(), AppError> {
         let url = format!(
             "{}{}{}?id={}",
@@ -274,7 +299,8 @@ impl Ouyi7HttpClient {
         Ok(())
     }
 
-    /// 发送消息第一阶段
+    /// 发送消息第一阶段：提交历史消息与本次内容，返回
+    /// `(user_msg_id, ai_msg_id)`。
     async fn send_message_phase1(
         &self,
         topic_id: i64,
@@ -324,7 +350,7 @@ impl Ouyi7HttpClient {
             .ok_or_else(|| AppError::Upstream("message phase1 result is null".to_string()))
     }
 
-    /// 获取消息响应（第二阶段）
+    /// 获取消息响应（第二阶段）：按 AI 消息 ID 拉取响应原文文本。
     async fn get_message_response(&self, ai_msg_id: i64) -> Result<String, AppError> {
         let url = format!(
             "{}{}{}{}{}",
@@ -352,7 +378,10 @@ impl Ouyi7HttpClient {
         Ok(text)
     }
 
-    /// 完整聊天流程：save -> message -> message/{id} -> delete
+    /// 完整聊天流程：创建话题 → 发送消息 → 拉取响应 → 删除话题。
+    ///
+    /// 无论消息阶段成败都会尽力删除话题；话题删除失败仅记告警。
+    /// 返回 AI 响应的原文文本；消息阶段失败返回 `Err(AppError)`。
     pub async fn chat_once(
         &self,
         input: &crate::adapter::ouyi_v7_request::Ouyi7ChatInput,

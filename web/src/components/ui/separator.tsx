@@ -2,6 +2,7 @@ import { Separator as SeparatorPrimitive } from "@base-ui/react/separator"
 
 import { cn } from "@/lib/utils"
 
+/** 分隔线，orientation 支持 horizontal / vertical。 */
 function Separator({
   className,
   orientation = "horizontal",

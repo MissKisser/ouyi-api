@@ -3,6 +3,7 @@
 import * as React from "react"
 import { cn } from "@/lib/utils"
 
+/** 折叠容器，通过 open / onOpenChange 受控展开状态。 */
 const Collapsible = React.forwardRef<
   HTMLDivElement,
   React.ComponentProps<"div"> & {
@@ -18,6 +19,7 @@ const Collapsible = React.forwardRef<
 })
 Collapsible.displayName = "Collapsible"
 
+/** 折叠触发按钮（透传 onClick，展开逻辑由调用方控制）。 */
 const CollapsibleTrigger = React.forwardRef<
   HTMLButtonElement,
   React.ComponentProps<"button"> & {
@@ -36,6 +38,7 @@ const CollapsibleTrigger = React.forwardRef<
 })
 CollapsibleTrigger.displayName = "CollapsibleTrigger"
 
+/** 折叠内容区，open 为 false 时直接不渲染子内容。 */
 const CollapsibleContent = React.forwardRef<
   HTMLDivElement,
   React.ComponentProps<"div"> & {

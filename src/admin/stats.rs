@@ -1,3 +1,7 @@
+//! 统计采集：全局请求计数、按模型聚合的用量，以及请求日志 / 运行日志 /
+//! 工具运行时日志的内存缓存（超容量时淘汰最旧条目），供管理后台的
+//! 统计与日志页面读取。
+
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::time::Instant;
@@ -5,14 +9,21 @@ use std::time::Instant;
 use chrono::{DateTime, Utc};
 use dashmap::DashMap;
 
-/// 单个请求的统计快照
+/// 全局请求统计计数器（原子操作，可跨线程共享）。
 pub struct RequestStats {
+    /// 累计收到的请求数。
     pub total_requests: AtomicU64,
+    /// 当前处理中的请求数。
     pub active_requests: AtomicUsize,
+    /// 累计成功完成的请求数。
     pub successful_requests: AtomicU64,
+    /// 累计失败的请求数。
     pub failed_requests: AtomicU64,
+    /// 全部请求的延迟总和（毫秒），除以总请求数即平均延迟。
     pub total_latency_ms: AtomicU64,
+    /// 累计消耗的 prompt token 数。
     pub total_prompt_tokens: AtomicU64,
+    /// 累计产出的 completion token 数。
     pub total_completion_tokens: AtomicU64,
 }
 
@@ -30,55 +41,84 @@ impl Default for RequestStats {
     }
 }
 
-/// 运行日志条目
+/// 运行日志条目。
 #[derive(Clone, Debug)]
 pub struct LogEntry {
+    /// 日志产生时间（UTC）。
     pub timestamp: DateTime<Utc>,
+    /// 日志级别（如 "INFO" / "WARN" / "ERROR"）。
     pub level: String,
+    /// 日志正文。
     pub message: String,
+    /// 可选的附加详情。
     pub details: Option<String>,
 }
 
-/// 请求日志条目
+/// 单次请求的日志条目。
 #[derive(Clone, Debug)]
 pub struct RequestLog {
+    /// 请求完成时间（UTC）。
     pub timestamp: DateTime<Utc>,
+    /// 请求使用的模型名。
     pub model: String,
+    /// HTTP 状态码字符串（"200" / "500"）。
     pub status: String,
+    /// 请求耗时（毫秒）。
     pub latency_ms: u64,
+    /// 消耗的 prompt token 数；失败请求为 0。
     pub prompt_tokens: u64,
+    /// 产出的 completion token 数；失败请求为 0。
     pub completion_tokens: u64,
+    /// 失败时的错误描述；成功请求为 `None`。
     pub error: Option<String>,
+    /// 处理该请求的平台标识。
     pub platform: String,
 }
 
-/// 工具运行时日志条目
+/// 单次工具运行时调用的日志条目。
 #[derive(Clone, Debug)]
 pub struct ToolRuntimeLog {
+    /// 记录时间（UTC）。
     pub timestamp: DateTime<Utc>,
+    /// 所属请求 ID。
     pub request_id: String,
+    /// 请求入口端点。
     pub endpoint: String,
+    /// 运行模式（"compiler" / "broker"）。
     pub mode: String,
+    /// 工具模型提供方标识。
     pub provider: String,
+    /// 工具模型名。
     pub model: String,
+    /// 工具模型服务地址（已脱敏）。
     pub base_url: String,
+    /// 决策结果（"tool_calls" / "final_answer"）。
     pub decision: String,
+    /// 本次涉及的工具名列表。
     pub tool_names: Vec<String>,
+    /// 消耗的 prompt token 数。
     pub prompt_tokens: u64,
+    /// 产出的 completion token 数。
     pub completion_tokens: u64,
+    /// 耗时（毫秒）。
     pub latency_ms: u64,
+    /// 调用是否成功。
     pub success: bool,
+    /// 失败时的错误描述；成功时为 `None`。
     pub error: Option<String>,
 }
 
-/// 工具运行时决策类型
+/// 工具运行时的最终决策类型。
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum ToolRuntimeDecision {
+    /// 判定需要发起工具调用。
     ToolCalls,
+    /// 判定可直接产出最终回答。
     FinalAnswer,
 }
 
 impl ToolRuntimeDecision {
+    /// 返回决策的日志标识串（"tool_calls" / "final_answer"）。
     pub fn as_str(&self) -> &'static str {
         match self {
             ToolRuntimeDecision::ToolCalls => "tool_calls",
@@ -87,14 +127,17 @@ impl ToolRuntimeDecision {
     }
 }
 
-/// 工具运行时模式
+/// 工具运行时的运行模式。
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum ToolRuntimeMode {
+    /// 编译器模式：把工具清单编译进对工具模型的请求，按调用协议解析其决策。
     Compiler,
+    /// 中介模式：解析主模型输出中携带的工具调用标记，据此产出决策。
     Broker,
 }
 
 impl ToolRuntimeMode {
+    /// 返回模式的日志标识串（"compiler" / "broker"）。
     pub fn as_str(&self) -> &'static str {
         match self {
             ToolRuntimeMode::Compiler => "compiler",
@@ -103,16 +146,21 @@ impl ToolRuntimeMode {
     }
 }
 
-/// 模型统计条目
+/// 单个模型的用量统计条目（原子计数）。
 #[derive(Debug, Default)]
 pub struct ModelStats {
+    /// 请求次数。
     pub requests: AtomicU64,
+    /// 累计消耗的 prompt token。
     pub prompt_tokens: AtomicU64,
+    /// 累计产出的 completion token。
     pub completion_tokens: AtomicU64,
 }
 
-/// 全局统计数据容器
+/// 全局统计数据容器：持有全局计数与三类日志的内存缓存（按自增 ID 写入，
+/// 超容量时淘汰最旧条目），可在多线程间共享。
 pub struct StatsCollector {
+    /// 全局请求计数器，供热路径直接读取。
     pub stats: Arc<RequestStats>,
     request_logs: DashMap<u64, RequestLog>,
     next_log_id: AtomicU64,
@@ -125,6 +173,7 @@ pub struct StatsCollector {
 }
 
 impl StatsCollector {
+    /// 创建空统计容器，运行时长从此刻起算。
     pub fn new() -> Self {
         Self {
             stats: Arc::new(RequestStats::default()),
@@ -139,6 +188,7 @@ impl StatsCollector {
         }
     }
 
+    /// 记录一次请求开始：总请求数与活跃请求数各加 1。
     pub fn record_start(&self) {
         self.stats.total_requests.fetch_add(1, Ordering::Relaxed);
         self.stats.active_requests.fetch_add(1, Ordering::Relaxed);
@@ -152,6 +202,12 @@ impl StatsCollector {
         );
     }
 
+    /// 记录一次成功完成：活跃计数减 1，成功数、延迟与 token 总量累加，
+    /// 并写入一条 200 请求日志。
+    ///
+    /// * `latency_ms` - 请求耗时（毫秒）
+    /// * `prompt_tokens` / `completion_tokens` - 本次消耗/产出的 token 数
+    /// * `model` / `platform` - 模型名与平台标识，用于日志与聚合
     pub fn record_success(
         &self,
         latency_ms: u64,
@@ -186,6 +242,12 @@ impl StatsCollector {
         });
     }
 
+    /// 记录一次失败请求：活跃计数减 1，失败数与延迟累加，并写入一条
+    /// 500 请求日志（token 计数为 0）。
+    ///
+    /// * `latency_ms` - 请求耗时（毫秒）
+    /// * `model` / `platform` - 模型名与平台标识
+    /// * `error` - 错误描述，写入日志条目
     pub fn record_error(&self, latency_ms: u64, model: &str, error: &str, platform: &str) {
         self.finish_active_request();
         self.stats.failed_requests.fetch_add(1, Ordering::Relaxed);
@@ -205,6 +267,7 @@ impl StatsCollector {
         });
     }
 
+    /// 追加一条运行日志；缓存超过 500 条时淘汰最旧条目。
     pub fn add_runtime_log(&self, entry: LogEntry) {
         let id = self.next_runtime_id.fetch_add(1, Ordering::Relaxed);
         self.runtime_logs.insert(id, entry);
@@ -214,6 +277,7 @@ impl StatsCollector {
         }
     }
 
+    /// 返回最多 `limit` 条请求日志，按时间倒序（最新在前）。
     pub fn get_request_logs(&self, limit: usize) -> Vec<RequestLog> {
         let mut entries: Vec<_> = self
             .request_logs
@@ -225,6 +289,7 @@ impl StatsCollector {
         entries
     }
 
+    /// 返回最多 `limit` 条运行日志，按时间倒序（最新在前）。
     pub fn get_runtime_logs(&self, limit: usize) -> Vec<LogEntry> {
         let mut entries: Vec<_> = self
             .runtime_logs
@@ -236,6 +301,7 @@ impl StatsCollector {
         entries
     }
 
+    /// 返回容器创建至今的运行时长（秒）。
     pub fn uptime_secs(&self) -> u64 {
         self.start_time.elapsed().as_secs()
     }
@@ -249,7 +315,9 @@ impl StatsCollector {
         }
     }
 
-    /// 记录工具运行时成功调用
+    /// 记录一次工具模型成功调用：token 累加进全局总量，写入
+    /// `tool-runtime::<model>` 键的模型统计，并追加一条成功日志
+    /// （`base_url` 先脱敏再存储）。
     pub fn record_tool_runtime_success(
         &self,
         request_id: &str,
@@ -296,7 +364,8 @@ impl StatsCollector {
         self.add_tool_runtime_log(log);
     }
 
-    /// 记录工具运行时失败调用
+    /// 记录一次工具模型失败调用：已消耗的 token 仍累加进全局总量与模型
+    /// 统计，并追加一条携带错误描述的失败日志。
     pub fn record_tool_runtime_error(
         &self,
         request_id: &str,
@@ -344,7 +413,7 @@ impl StatsCollector {
         self.add_tool_runtime_log(log);
     }
 
-    /// 获取工具运行时日志
+    /// 返回最多 `limit` 条工具运行时日志，按时间倒序（最新在前）。
     pub fn get_tool_runtime_logs(&self, limit: usize) -> Vec<ToolRuntimeLog> {
         let mut entries: Vec<_> = self
             .tool_runtime_logs
@@ -356,7 +425,8 @@ impl StatsCollector {
         entries
     }
 
-    /// 获取模型统计
+    /// 返回按模型聚合的用量统计，元素为
+    /// `(模型键, 请求数, prompt token 总量, completion token 总量)`。
     pub fn get_model_stats(&self) -> Vec<(String, u64, u64, u64)> {
         self.model_stats
             .iter()

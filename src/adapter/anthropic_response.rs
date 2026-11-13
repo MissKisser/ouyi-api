@@ -1,3 +1,10 @@
+//! ouyi 输出到 Anthropic Messages 响应的适配。
+//!
+//! [`AnthropicStreamConverter`] 把增量文本实时转换为 Anthropic SSE 事件序列
+//! （message_start / content_block_* / message_delta / message_stop），识别
+//! `<think>` 思考块与工具调用块并生成对应类型的 content block；
+//! [`AnthropicCollector`] 聚合完整输出后一次性构造非流式消息。
+//! 两条路径均会清理模型自造的 `<tool_result>` 内容并还原 HTML 实体。
 use crate::adapter::tool_call::ToolCallParser;
 use crate::model::anthropic::*;
 use bytes::Bytes;
@@ -5,6 +12,10 @@ use bytes::Bytes;
 const THINK_OPEN: &str = "<think";
 const THINK_CLOSE: &str = "</thinking>";
 
+/// ouyi 增量文本到 Anthropic 流式 SSE 事件的转换器。
+///
+/// 内部维护思考块状态、工具调用解析状态与 content block 索引，
+/// 保证输出的 start / delta / stop 事件索引与块类型连续一致。
 pub struct AnthropicStreamConverter {
     model: String,
     task_id: String,
@@ -13,11 +24,15 @@ pub struct AnthropicStreamConverter {
     current_block_type: Option<BlockType>,
     in_thinking: bool,
     think_buffer: String,
+    /// 本次响应中是否已输出过 tool_use 块；置位后忽略后续文本事件。
     pub has_tool_use: bool,
+    /// 最近一次输出的 tool_use 块 ID。
     pub last_tool_use_id: Option<String>,
     usage: ResponseUsage,
     pending_text: String,
+    /// 是否已输出过任何 content block（含空文本块），用于 done 时兜底空文本。
     pub has_content: bool,
+    /// done 收尾是否已处理过，防止重复输出收尾事件序列。
     pub done_processed: bool,
 }
 
@@ -161,6 +176,10 @@ fn find_think_close_cutoff(s: &str) -> usize {
 }
 
 impl AnthropicStreamConverter {
+    /// 创建流式转换器。
+    ///
+    /// - `model`：写入 message_start 事件的模型名；
+    /// - `task_id`：作为消息 ID。
     pub fn new(model: String, task_id: String) -> Self {
         Self {
             model,
@@ -182,6 +201,9 @@ impl AnthropicStreamConverter {
         }
     }
 
+    /// 生成流式响应的 `message_start` 事件字节。
+    ///
+    /// 携带消息元信息（ID、角色、模型名）与当前用量（初始为零）。
     pub fn start_event(&self) -> Bytes {
         serialize_stream_event(&StreamEvent::MessageStart {
             message: MessageStartInfo {
@@ -200,6 +222,16 @@ impl AnthropicStreamConverter {
         })
     }
 
+    /// 处理一段 ouyi 增量文本，返回零到多个序列化的 Anthropic SSE 事件字节。
+    ///
+    /// - `text`：本次到达的文本增量；
+    /// - `is_done`：是否为流结束信号；为真时冲刷未闭合的思考块与待发文本、
+    ///   在无任何内容时补空文本块、闭合当前块并输出 message_delta / message_stop
+    ///   收尾序列（`stop_reason` 为 `tool_use` 或 `end_turn`），重复调用返回空。
+    ///
+    /// 文本按 `<think>` 开闭边界拆分为 thinking 块与正文块，正文再经工具调用
+    /// 解析拆出 tool_use 块；不完整的标记前缀会缓冲到下一轮继续判断。
+    /// 副作用：更新内部缓冲、块索引与用量状态。
     pub fn process_ouyi_event(&mut self, text: &str, is_done: bool) -> Vec<Bytes> {
         let mut events: Vec<Bytes> = Vec::new();
 
@@ -438,6 +470,8 @@ impl AnthropicStreamConverter {
         events
     }
 
+    /// 输出一个空的 text content block（start + stop 事件），用于整次响应
+    /// 无任何内容时的兜底，保证客户端能收到合法的内容序列。
     pub fn emit_empty_text(&mut self) -> Vec<Bytes> {
         let mut events = Vec::new();
         let idx = self.next_block_index;
@@ -455,11 +489,16 @@ impl AnthropicStreamConverter {
         events
     }
 
+    /// 更新 token 用量，随 message_delta 事件透出。
+    ///
+    /// - `input_tokens`：输入 token 数；
+    /// - `output_tokens`：输出 token 数。
     pub fn update_usage(&mut self, input_tokens: u64, output_tokens: u64) {
         self.usage.input_tokens = input_tokens;
         self.usage.output_tokens = output_tokens;
     }
 
+    /// 返回当前 token 用量 `(input_tokens, output_tokens)`。
     pub fn tokens(&self) -> (u64, u64) {
         (self.usage.input_tokens, self.usage.output_tokens)
     }
@@ -545,6 +584,7 @@ fn base64_encode_signature(n: u128) -> String {
 
 // ── Non-streaming Collector ───────────────────────────────────────────────
 
+/// ouyi SSE 事件聚合器，收集完整输出后构造 Anthropic 非流式 Messages 响应。
 pub struct AnthropicCollector {
     content_parts: Vec<String>,
     model: String,
@@ -554,6 +594,10 @@ pub struct AnthropicCollector {
 }
 
 impl AnthropicCollector {
+    /// 创建收集器。
+    ///
+    /// - `model`：写入响应体的模型名；
+    /// - `task_id`：作为消息 ID。
     pub fn new(model: String, task_id: String) -> Self {
         Self {
             content_parts: Vec::new(),
@@ -564,6 +608,10 @@ impl AnthropicCollector {
         }
     }
 
+    /// 累积一个 ouyi SSE 事件。
+    ///
+    /// string 事件追加文本片段；object 事件尝试读取并覆盖 token 用量；
+    /// 其余事件类型忽略。
     pub fn push_event(&mut self, event: &crate::model::ouyi::OuyiSseEvent) {
         let event_type = crate::client::sse::OuyiEventType::from(event.event_type.as_str());
         match event_type {
@@ -587,6 +635,7 @@ impl AnthropicCollector {
         }
     }
 
+    /// 返回捕获的 token 用量 `(input_tokens, output_tokens)`；未捕获时为 `(0, 0)`。
     pub fn tokens(&self) -> (u64, u64) {
         match &self.usage {
             Some(u) => (u.prompt_tokens, u.completion_tokens),
@@ -594,6 +643,12 @@ impl AnthropicCollector {
         }
     }
 
+    /// 构造 Anthropic 非流式 Messages 响应。
+    ///
+    /// 对全部文本按 `<think>` 边界与工具调用标记拆分为 thinking / text /
+    /// tool_use 块（顺序保持出现次序）；存在 tool_use 块时丢弃 text 块并把
+    /// `stop_reason` 置为 `tool_use`，否则为 `end_turn`；无任何内容时输出一个
+    /// 空 text 块；token 用量未捕获时填 0。消费收集器自身。
     pub fn build_response(mut self) -> MessagesResponse {
         let full_text: String = self.content_parts.join("");
 
@@ -721,12 +776,12 @@ mod tests {
     }
 
     /// 模拟上游返回 tool_use 文本 → 验证 SSE 事件包含 tool_use 块
-    /// 文本不再缓冲，立即透传输出。
+    /// 文本增量到达后立即透传输出，不做缓冲聚合。
     #[test]
     fn test_stream_converter_tool_use_detection() {
         let mut conv = AnthropicStreamConverter::new("test-model".into(), "msg_1".into());
 
-        // 发送普通文本（由于 flush_threshold=0，立即输出 content_block_start + text_delta）
+        // 发送普通文本，立即输出 content_block_start + text_delta
         let events = conv.process_ouyi_event("Let me check that.", false);
         let _joined = join_bytes(events);
 
@@ -795,12 +850,12 @@ mod tests {
         );
     }
 
-    /// 验证纯文本响应正常结束（文本立即输出，不再缓冲到 done）
+    /// 验证纯文本响应正常结束（文本增量到达后立即输出，不做缓冲聚合）
     #[test]
     fn test_stream_converter_text_response_done() {
         let mut conv = AnthropicStreamConverter::new("test-model".into(), "msg_1".into());
 
-        // 文本立即输出（flush_threshold=0）
+        // 文本增量到达后立即输出
         let events = conv.process_ouyi_event("Hello world", false);
         let joined = join_bytes(events);
         assert!(

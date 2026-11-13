@@ -4,6 +4,7 @@ import * as React from "react"
 
 import { cn } from "@/lib/utils"
 
+/** 表单标签，与相邻禁用控件联动时自动弱化。 */
 function Label({ className, ...props }: React.ComponentProps<"label">) {
   return (
     <label

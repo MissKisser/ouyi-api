@@ -1,14 +1,24 @@
 import { Component, type ReactNode, type ErrorInfo } from 'react';
 
+/** 边界组件的属性。 */
 interface Props {
+  /** 被边界包裹的子内容，正常时原样渲染。 */
   children: ReactNode;
 }
 
+/** 边界组件的内部状态。 */
 interface State {
+  /** 子树抛出错误后置为 true，后续渲染降级 UI。 */
   hasError: boolean;
+  /** 捕获到的错误对象，无错误时为 null。 */
   error: Error | null;
 }
 
+/**
+ * 全局错误边界：捕获子组件渲染期的未处理异常，降级为全屏错误页
+ * （展示错误信息并提供"重新加载"按钮），同时把错误与组件栈打印到 console。
+ * 恢复方式为整页刷新；事件处理器与异步回调中的异常不经过此边界。
+ */
 export class ErrorBoundary extends Component<Props, State> {
   constructor(props: Props) {
     super(props);

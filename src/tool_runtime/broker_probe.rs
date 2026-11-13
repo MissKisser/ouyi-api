@@ -1,4 +1,5 @@
-//! 探针：绕过 minimax 编译器，直接验证 broker 解析层对"主脑应该吐的"工具调用标记的解析能力。
+//! 探针测试：不经过外部编译器链路，直接验证 broker 解析层对上游模型
+//! 输出的工具调用标记的解析与长时任务识别能力。
 //!
 //! 跑法：cargo test --bin ouyi-api tool_runtime::broker_probe -- --nocapture
 //!

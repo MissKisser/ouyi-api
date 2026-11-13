@@ -2,6 +2,12 @@ import { useState, useCallback, useEffect } from 'react';
 import { AuthContext } from '@/lib/auth-context';
 import { getToken, setToken, clearToken, apiLogin, apiSetup, ApiError, setOnUnauthorized } from '@/lib/api';
 
+/**
+ * 认证状态提供者：持有 token 状态（初始值读自 localStorage），向子树提供
+ * login / setup / logout 操作与 isAuthenticated 标志。
+ * 副作用：登录或初始化成功后把 token 写入 localStorage；挂载时注册全局 401 回调，
+ * 收到 401 时清空状态（配合路由守卫跳转登录页），卸载时注销该回调。
+ */
 export function AuthProvider({ children }: { children: React.ReactNode }) {
   const [token, setTokenState] = useState<string | null>(getToken());
 

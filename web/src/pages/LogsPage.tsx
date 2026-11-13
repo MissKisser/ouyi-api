@@ -22,23 +22,28 @@ import {
 import { ScrollText, Terminal, Wrench, ChevronLeft, ChevronRight } from 'lucide-react';
 import { useTranslation } from 'react-i18next';
 
+/** 运行日志分页的每页条数。 */
 const PAGE_SIZE = 50;
 
+/** 把秒级 Unix 时间戳按当前语言（zh-CN / en-US）格式化为本地时间文本。 */
 function formatTime(ts: number, locale: string): string {
   return new Date(ts * 1000).toLocaleString(locale === 'zh' ? 'zh-CN' : 'en-US');
 }
 
+/** 把 token 数量缩写为 K / M 形式的紧凑文本。 */
 function formatTokens(n: number): string {
   if (n >= 1_000_000) return `${(n / 1_000_000).toFixed(1)}M`;
   if (n >= 1_000) return `${(n / 1_000).toFixed(1)}K`;
   return String(n);
 }
 
+/** 把毫秒耗时格式化为 ms / s 文本（超过 1 秒时保留一位小数）。 */
 function formatLatency(ms: number): string {
   if (ms >= 1000) return `${(ms / 1000).toFixed(1)}s`;
   return `${ms}ms`;
 }
 
+/** 把日志级别映射为 Badge 的 variant（ERROR 用 destructive，WARN 用 secondary，其余 outline）。 */
 const levelVariant = (level: string) => {
   switch (level) {
     case 'ERROR': return 'destructive';
@@ -50,6 +55,7 @@ const levelVariant = (level: string) => {
   }
 };
 
+/** 把日志级别映射为 Badge 的配色 className（红/黄/蓝/灰）。 */
 const levelColor = (level: string) => {
   switch (level) {
     case 'ERROR': return 'bg-red-500/15 text-red-700 border-red-200';
@@ -63,6 +69,7 @@ const levelColor = (level: string) => {
 
 // ── 请求日志 Tab ──────────────────────────────────────────────────────────
 
+/** 请求日志标签页：SWR 每 5 秒轮询 /admin/api/logs?limit=100，以表格展示时间、模型、API key、token 用量、耗时与成败状态。 */
 function RequestLogsTab() {
   const { t, i18n } = useTranslation();
   const { data: logs, error } = useSWR<RequestLog[]>(
@@ -148,6 +155,7 @@ function RequestLogsTab() {
 
 // ── 运行日志 Tab ──────────────────────────────────────────────────────────
 
+/** 运行日志标签页：SWR 每 3 秒按页轮询运行日志（每页 PAGE_SIZE 条），支持上下翻页，级别以彩色徽标展示。 */
 function RuntimeLogsTab() {
   const { t } = useTranslation();
   const [page, setPage] = useState(0);
@@ -259,6 +267,7 @@ function RuntimeLogsTab() {
 
 // ── 工具日志 Tab ──────────────────────────────────────────────────────────
 
+/** 工具日志标签页：SWR 每 5 秒轮询最近 100 条工具模型调用日志，展示端点、供应商、模型、路由决策、工具名与用量耗时。 */
 function ToolRuntimeLogsTab() {
   const { t } = useTranslation();
 
@@ -375,6 +384,10 @@ function ToolRuntimeLogsTab() {
 
 // ── 主页面 ────────────────────────────────────────────────────────────────
 
+/**
+ * 日志页：标题与三个标签切换按钮钉在主区域顶部，按当前标签渲染
+ * 请求日志 / 运行日志 / 工具日志三个子组件；切换标签不保留子组件状态。
+ */
 export function LogsPage() {
   const { t } = useTranslation();
   const [tab, setTab] = useState<'request' | 'runtime' | 'toolRuntime'>('request');

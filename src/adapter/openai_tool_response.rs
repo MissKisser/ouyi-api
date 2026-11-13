@@ -1,3 +1,8 @@
+//! 编译后的工具调用到 OpenAI 响应结构的构造器。
+//!
+//! 为工具模型路径提供统一的响应体与 SSE chunk 构造能力：
+//! 非流式整体响应、以及流式序列所需的 role / tool_call 增量 / finish /
+//! 文本 content / finish 各类 chunk。
 use crate::model::openai::{
     ChatCompletionChunk, ChatCompletionResponse, ChunkChoice, ChunkDelta, ResponseChoice,
     ResponseMessage, ToolCall, ToolCallDelta, ToolCallFunction, ToolCallFunctionDelta, Usage,
@@ -12,7 +17,14 @@ fn now_unix_secs() -> u64 {
         .as_secs()
 }
 
-/// 构造非流式工具调用响应
+/// 构造非流式工具调用 OpenAI 响应。
+///
+/// - `model` / `task_id`：响应中的模型名与响应 ID；
+/// - `calls`：已编译的工具调用列表，`input` 序列化为 arguments JSON，
+///   序列化失败时以 `{}` 兜底；
+/// - `prompt_tokens` / `completion_tokens`：写入 usage，total 为两者之和。
+///
+/// 返回 `finish_reason` 为 `tool_calls`、`content` 为 `None` 的响应体。
 pub fn build_openai_tool_call_response(
     model: &str,
     task_id: &str,
@@ -54,7 +66,13 @@ pub fn build_openai_tool_call_response(
     }
 }
 
-/// 构造非流式文本响应
+/// 构造非流式纯文本 OpenAI 响应。
+///
+/// - `model` / `task_id`：响应中的模型名与响应 ID；
+/// - `content`：助手回复的完整文本；
+/// - `prompt_tokens` / `completion_tokens`：写入 usage，total 为两者之和。
+///
+/// 返回 `finish_reason` 为 `stop`、无工具调用的响应体。
 pub fn build_openai_text_response(
     model: &str,
     task_id: &str,
@@ -84,7 +102,9 @@ pub fn build_openai_text_response(
     }
 }
 
-/// 构造流式工具调用的 role chunk
+/// 构造流式工具调用序列的起始 chunk。
+///
+/// 仅携带 `role: assistant`，无内容增量，`finish_reason` 为 `None`。
 pub fn build_tool_call_role_chunk(model: &str, task_id: &str) -> ChatCompletionChunk {
     ChatCompletionChunk {
         id: task_id.to_string(),
@@ -104,7 +124,10 @@ pub fn build_tool_call_role_chunk(model: &str, task_id: &str) -> ChatCompletionC
     }
 }
 
-/// 构造流式工具调用的 tool call chunk
+/// 构造单个工具调用的增量 chunk。
+///
+/// - `idx`：该调用在多工具序列中的序号；
+/// - `call`：已编译的工具调用，函数名与 arguments 直接透传。
 pub fn build_tool_call_delta_chunk(
     model: &str,
     task_id: &str,
@@ -139,7 +162,7 @@ pub fn build_tool_call_delta_chunk(
     }
 }
 
-/// 构造流式工具调用的 finish chunk
+/// 构造工具调用序列的收尾 chunk，`finish_reason` 为 `tool_calls`，无内容增量。
 pub fn build_tool_call_finish_chunk(model: &str, task_id: &str) -> ChatCompletionChunk {
     ChatCompletionChunk {
         id: task_id.to_string(),
@@ -159,7 +182,7 @@ pub fn build_tool_call_finish_chunk(model: &str, task_id: &str) -> ChatCompletio
     }
 }
 
-/// 构造流式文本的 role chunk
+/// 构造流式文本序列的起始 chunk，仅携带 `role: assistant`，无内容增量。
 pub fn build_text_role_chunk(model: &str, task_id: &str) -> ChatCompletionChunk {
     ChatCompletionChunk {
         id: task_id.to_string(),
@@ -179,7 +202,9 @@ pub fn build_text_role_chunk(model: &str, task_id: &str) -> ChatCompletionChunk 
     }
 }
 
-/// 构造流式文本的 content chunk
+/// 构造文本内容增量 chunk。
+///
+/// - `content`：本次到达的文本片段，原样放入 delta。
 pub fn build_text_content_chunk(model: &str, task_id: &str, content: &str) -> ChatCompletionChunk {
     ChatCompletionChunk {
         id: task_id.to_string(),
@@ -199,7 +224,7 @@ pub fn build_text_content_chunk(model: &str, task_id: &str, content: &str) -> Ch
     }
 }
 
-/// 构造流式文本的 finish chunk
+/// 构造文本流的收尾 chunk，`finish_reason` 为 `stop`，无内容增量。
 pub fn build_text_finish_chunk(model: &str, task_id: &str) -> ChatCompletionChunk {
     ChatCompletionChunk {
         id: task_id.to_string(),

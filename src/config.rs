@@ -1,49 +1,80 @@
+//! 应用配置模块。
+//!
+//! 定义 `config.toml` 各配置段对应的反序列化结构（`[server]` / `[ouyi]` / `[limits]` /
+//! `[admin]` / `[tool_call]` / `[tool_runtime]` / `[openai_tool_runtime]` / `[platform]` /
+//! `[ouyi_v7]`），并提供两类能力：
+//! - 读取：[`AppConfig::load`] 系列函数从磁盘加载配置；
+//! - 写回：[`write_app_config`] 等函数经 `config_store` 以"读原文档 → 修改 → 校验候选文本
+//!   → 原子替换"的方式持久化，保留文件中未被触及的段落与注释。
+
 use serde::Deserialize;
 use std::path::Path;
 
 use crate::error::AppError;
 use crate::platform::OuyiPlatform;
 
+/// 应用配置根结构，对应 `config.toml` 全文件。
 #[derive(Debug, Clone, Deserialize)]
 pub struct AppConfig {
+    /// HTTP 服务监听配置（`[server]` 段），必填。
     pub server: ServerConfig,
+    /// Ouyi 8.0 平台对接配置（`[ouyi]` 段），必填。
     pub ouyi: OuyiConfig,
+    /// 请求处理限制配置（`[limits]` 段），必填。
     pub limits: LimitsConfig,
+    /// 管理后台认证配置（`[admin]` 段），可选；缺省时启动生成随机 JWT 密钥、不设密码。
     pub admin: Option<AdminConfig>,
+    /// 工具调用协议的自定义标记配置（`[tool_call]` 段），可选，缺省为空列表。
     #[serde(default)]
     pub tool_call: ToolCallConfig,
+    /// Anthropic 协议的工具运行时配置（`[tool_runtime]` 段），可选；缺省表示未配置。
     #[serde(default)]
     pub tool_runtime: Option<ToolRuntimeConfig>,
+    /// OpenAI 协议的工具运行时配置（`[openai_tool_runtime]` 段），可选；缺省表示未配置。
     #[serde(default)]
     pub openai_tool_runtime: Option<ToolRuntimeConfig>,
+    /// 平台选择配置（`[platform]` 段），可选；缺省按"8.0 平台 + 启动不询问"处理。
     #[serde(default)]
     pub platform: Option<PlatformConfig>,
+    /// Ouyi 7.0 平台对接配置（`[ouyi_v7]` 段），选择 7.0 平台时使用，多数字段有内置默认值。
     pub ouyi_v7: Option<Ouyi7Config>,
 }
 
+/// 工具调用协议解析的自定义标记配置。
 #[derive(Debug, Clone, Deserialize, Default)]
 pub struct ToolCallConfig {
+    /// 追加的工具调用起始标记列表，用于识别上游返回文本中的工具调用片段。
     #[serde(default)]
     pub extra_starts: Vec<String>,
+    /// 追加的工具调用结束标记列表。
     #[serde(default)]
     pub extra_ends: Vec<String>,
 }
 
+/// 工具运行时配置：由独立的外部工具模型承担工具调用的编译与执行。
 #[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
 pub struct ToolRuntimeConfig {
+    /// 是否启用工具运行时；缺省为 `true`。
     #[serde(default = "default_tool_runtime_enabled")]
     pub enabled: bool,
+    /// 运行模式声明：`native` 或 `compiler`；缺省为 `compiler`。
     #[serde(default = "default_tool_runtime_mode")]
     pub mode: ToolRuntimeMode,
+    /// 工具模型服务提供方类型（必填），决定请求协议形态。
     pub provider: ToolRuntimeProvider,
+    /// 工具模型服务的基础 URL；未配置时按提供方默认地址处理。
     #[serde(default)]
     pub base_url: Option<String>,
+    /// 直接写在配置文件里的 API 密钥；存在时优先于 `api_key_env`。
     #[serde(default)]
     pub api_key: Option<String>,
+    /// 存放 API 密钥的环境变量名；仅在未配置 `api_key` 时读取。
     #[serde(default)]
     pub api_key_env: Option<String>,
+    /// 工具调用使用的模型 ID；未配置时由提供方决定默认模型。
     #[serde(default)]
     pub model: Option<String>,
+    /// 单次工具模型请求的超时秒数；缺省为 120。
     #[serde(default = "default_tool_runtime_timeout_secs")]
     pub timeout_secs: u64,
 }
@@ -52,17 +83,23 @@ fn default_tool_runtime_enabled() -> bool {
     true
 }
 
+/// 工具运行时的运行模式声明，配置值为 `native` / `compiler`。
 #[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum ToolRuntimeMode {
+    /// 原生模式（配置值 `native`）。
     Native,
+    /// 编译模式（配置值 `compiler`），工具运行时的缺省模式。
     Compiler,
 }
 
+/// 工具运行时对接的服务提供方类型，配置值为 `anthropic` / `openai-compatible`。
 #[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "kebab-case")]
 pub enum ToolRuntimeProvider {
+    /// Anthropic Messages API（配置值 `anthropic`）。
     Anthropic,
+    /// OpenAI 兼容的 chat/completions API（配置值 `openai-compatible`）。
     OpenaiCompatible,
 }
 
@@ -75,6 +112,9 @@ fn default_tool_runtime_mode() -> ToolRuntimeMode {
 }
 
 impl ToolRuntimeConfig {
+    /// 解析工具运行时的 API 密钥。
+    /// 优先返回配置中的 `api_key`；否则读取 `api_key_env` 指定的环境变量（副作用：读进程环境）。
+    /// 返回 `Err(AppError::Config)`：两者都未配置，或指定的环境变量未设置。
     pub fn get_api_key(&self) -> Result<String, crate::error::AppError> {
         if let Some(key) = &self.api_key {
             return Ok(key.clone());
@@ -94,30 +134,44 @@ impl ToolRuntimeConfig {
     }
 }
 
+/// 管理后台认证配置。
 #[derive(Debug, Clone, Deserialize)]
 pub struct AdminConfig {
+    /// 后台签发 JWT 使用的密钥；缺省时启动阶段生成随机 UUID 充当密钥。
     pub jwt_secret: Option<String>,
+    /// 管理员密码的哈希值；缺省或为空表示未设置密码。
     pub password_hash: Option<String>,
 }
 
+/// HTTP 服务监听配置。
 #[derive(Debug, Clone, Deserialize)]
 pub struct ServerConfig {
+    /// 监听地址，如 `127.0.0.1` 或 `0.0.0.0`。
     pub host: String,
+    /// 监听端口。
     pub port: u16,
 }
 
+/// Ouyi 8.0 平台对接配置。
 #[derive(Debug, Clone, Deserialize)]
 pub struct OuyiConfig {
+    /// 平台 API 的基础地址。
     pub base_url: String,
+    /// 访问平台使用的 JWT Token；为空时启动阶段告警，初始化失败会进入交互修复流程。
     pub jwt_token: String,
+    /// 上报给平台的客户端版本号。
     pub app_version: String,
+    /// 后台模型列表自动刷新的间隔秒数。
     pub model_refresh_interval_secs: u64,
 }
 
+/// 平台选择配置。
 #[derive(Debug, Clone, Deserialize)]
 pub struct PlatformConfig {
+    /// 缺省平台；未配置该键时为 8.0。
     #[serde(default = "default_platform")]
     pub default: OuyiPlatform,
+    /// 交互终端启动时是否询问平台选择；未配置该键时为 `true`。
     #[serde(default = "default_prompt_on_start")]
     pub prompt_on_start: bool,
 }
@@ -130,19 +184,27 @@ fn default_prompt_on_start() -> bool {
     true
 }
 
+/// Ouyi 7.0 平台对接配置。
 #[derive(Debug, Clone, Deserialize)]
 pub struct Ouyi7Config {
+    /// 平台 API 基础地址；未配置该键时为 `https://api-8.rcouyi.com`。
     pub base_url: String,
+    /// 对话接口路径前缀；未配置该键时为 `/chatapi`。
     #[serde(default = "default_ouyi_v7_chatapi_prefix")]
     pub chatapi_prefix: String,
+    /// 访问平台的 JWT Token；未配置该键时为空。
     #[serde(default)]
     pub jwt_token: String,
+    /// 未指定模型时使用的默认模型 ID；未配置该键时为 `ouyi-chat`。
     #[serde(default = "default_ouyi_v7_model")]
     pub default_model: String,
+    /// 模型列表自动刷新间隔秒数；未配置该键时为 3600。
     #[serde(default = "default_model_refresh_interval_secs")]
     pub model_refresh_interval_secs: u64,
+    /// 送往平台的历史消息条数上限；未配置该键时为 20。
     #[serde(default = "default_ouyi_v7_max_history_messages")]
     pub max_history_messages: usize,
+    /// 非流式响应模拟流式输出时每个分片的字符数；未配置该键时为 80。
     #[serde(default = "default_ouyi_v7_stream_chunk_chars")]
     pub simulated_stream_chunk_chars: usize,
 }
@@ -167,37 +229,57 @@ fn default_ouyi_v7_stream_chunk_chars() -> usize {
     80
 }
 
+/// 请求处理限制配置。
 #[derive(Debug, Clone, Deserialize)]
 pub struct LimitsConfig {
+    /// 上游请求的整体超时秒数（HTTP 客户端超时）。
     pub request_timeout_secs: u64,
+    /// 流式响应在无新数据到达时的超时秒数。
     pub no_data_timeout_secs: u64,
+    /// 单个上游响应体允许的最大字节数。
     pub max_response_bytes: usize,
+    /// 单个请求消息体允许的最大字节数。
     pub max_messages_bytes: usize,
+    /// 全局最大并发推理请求数；`0` 表示不限流，未配置该键时为 `0`。
     #[serde(default)]
     pub max_concurrent_requests: usize,
 }
 
 impl AppConfig {
+    /// 从配置文件加载应用配置。
+    /// 配置路径取环境变量 `OUYI_CONFIG`，未设置时默认为当前目录的 `config.toml`。
+    /// 副作用：读进程环境变量与磁盘文件。
+    /// 返回 `Err`：文件不可读，或 TOML 解析 / 字段校验失败。
     pub fn load() -> Result<Self, Box<dyn std::error::Error>> {
         let path = std::env::var("OUYI_CONFIG").unwrap_or_else(|_| "config.toml".to_string());
         Self::load_from_path(Path::new(&path))
     }
 
+    /// 从指定路径加载并解析配置。
+    /// - `path`: TOML 配置文件路径。
+    /// 返回 `Err`：文件不可读，或解析出的字段不符合结构定义。
     pub fn load_from_path(path: &Path) -> Result<Self, Box<dyn std::error::Error>> {
         let content = std::fs::read_to_string(path)?;
         Ok(toml::from_str(&content)?)
     }
 
+    /// 返回当前生效的配置文件路径字符串。
+    /// 取环境变量 `OUYI_CONFIG`，未设置时为 `config.toml`。
     pub fn config_path() -> String {
         std::env::var("OUYI_CONFIG").unwrap_or_else(|_| "config.toml".to_string())
     }
 }
 
-/// Persist a complete in-memory configuration as one validated, atomic file update.
+/// 将完整的内存配置持久化为一次经校验的原子文件更新。
 ///
-/// The existing per-section writers remain available for startup/self-healing paths, but
-/// admin updates should use this function so a request cannot leave only half of its fields
-/// written when a later validation or persistence step fails.
+/// 经 `config_store::update_document` 执行"读取原文件 → 重写各配置段 → 反序列化校验候选文本
+/// → 原子替换"，避免校验或落盘中途失败导致只写入了一半字段；管理后台的全量配置更新应走此函数。
+/// 文件中未被该函数触及的段落与注释保持不变，`admin` / `platform` / `ouyi_v7` /
+/// `tool_runtime` / `openai_tool_runtime` 段在对应配置为 `None` 时从文件中移除。
+/// - `path`: 配置文件路径；`config`: 要持久化的完整配置。
+/// - 返回：替换成功后重新解析出的 `AppConfig`。
+/// - 返回 `Err(AppError::Config)`：目标段不是普通 table、`max_concurrent_requests` 超出
+///   可持久化范围，或文件读取 / 解析 / 校验 / 替换失败。
 pub fn write_app_config(path: &Path, config: &AppConfig) -> Result<AppConfig, AppError> {
     crate::config_store::update_document(path, |doc| {
         let server = ensure_table(doc, "server")?;
@@ -237,6 +319,8 @@ pub fn write_app_config(path: &Path, config: &AppConfig) -> Result<AppConfig, Ap
     })
 }
 
+/// 取出（必要时创建）文档顶层的普通 table 段。
+/// 返回 `Err(AppError::Config)`：同名键已存在但不是普通 table。
 fn ensure_table<'a>(
     doc: &'a mut toml_edit::DocumentMut,
     name: &str,
@@ -249,6 +333,7 @@ fn ensure_table<'a>(
         .ok_or_else(|| AppError::Config(format!("配置 [{name}] 必须是普通 table")))
 }
 
+/// 写入 `[admin]` 段；配置为 `None` 时从文档中移除该段，可选字段为 `None` 时移除对应键。
 fn write_optional_admin(
     doc: &mut toml_edit::DocumentMut,
     config: Option<&AdminConfig>,
@@ -263,6 +348,7 @@ fn write_optional_admin(
     Ok(())
 }
 
+/// 写入 `[platform]` 段；配置为 `None` 时从文档中移除该段。
 fn write_optional_platform(
     doc: &mut toml_edit::DocumentMut,
     config: Option<&PlatformConfig>,
@@ -280,6 +366,7 @@ fn write_optional_platform(
     Ok(())
 }
 
+/// 写入 `[ouyi_v7]` 段；配置为 `None` 时从文档中移除该段。
 fn write_optional_ouyi_v7(
     doc: &mut toml_edit::DocumentMut,
     config: Option<&Ouyi7Config>,
@@ -301,6 +388,8 @@ fn write_optional_ouyi_v7(
     Ok(())
 }
 
+/// 写入指定名称的工具运行时段（`[tool_runtime]` 或 `[openai_tool_runtime]`）；
+/// 配置为 `None` 时从文档中移除该段，可选字段为 `None` 时移除对应键。
 fn write_optional_tool_runtime(
     doc: &mut toml_edit::DocumentMut,
     name: &str,
@@ -328,6 +417,7 @@ fn write_optional_tool_runtime(
     Ok(())
 }
 
+/// 在 table 中写入可选字符串键；值为 `None` 时移除该键。
 fn set_optional_string(table: &mut toml_edit::Table, key: &str, value: Option<&str>) {
     match value {
         Some(value) => table[key] = toml_edit::value(value),
@@ -337,6 +427,9 @@ fn set_optional_string(table: &mut toml_edit::Table, key: &str, value: Option<&s
     }
 }
 
+/// 将 Ouyi 8.0 平台的新 JWT Token 原子写入配置文件的 `[ouyi]` 段并记录日志。
+/// 其余段落与注释保持不变；不触碰 `[ouyi_v7]` 段。
+/// 返回 `Err(AppError::Config)`：文件缺少 `[ouyi]` 段，或读取 / 解析 / 替换失败。
 pub fn update_ouyi_jwt_token(path: &Path, jwt_token: &str) -> Result<(), crate::error::AppError> {
     crate::config_store::update_document(path, |doc| {
         if !doc.contains_key("ouyi") {
@@ -353,6 +446,10 @@ pub fn update_ouyi_jwt_token(path: &Path, jwt_token: &str) -> Result<(), crate::
     Ok(())
 }
 
+/// 将 Ouyi 7.0 平台的新 JWT Token 原子写入配置文件的 `[ouyi_v7]` 段并记录日志。
+/// 段不存在时以内置默认字段（base_url / chatapi_prefix / default_model 等）创建该段；
+/// 段存在时只改写 `jwt_token` 键，其余段落保持不变。
+/// 返回 `Err(AppError::Config)`：读取 / 解析 / 校验 / 替换失败。
 pub fn update_ouyi_v7_jwt_token(
     path: &Path,
     jwt_token: &str,
@@ -379,6 +476,9 @@ pub fn update_ouyi_v7_jwt_token(
     Ok(())
 }
 
+/// 将管理后台的 JWT 密钥与密码哈希原子写入配置文件的 `[admin]` 段并记录日志。
+/// 段不存在时自动创建；其余段落保持不变。
+/// 返回 `Err(AppError::Config)`：读取 / 解析 / 校验 / 替换失败。
 pub fn write_admin_config(
     path: &Path,
     jwt_secret: &str,
@@ -398,6 +498,9 @@ pub fn write_admin_config(
     Ok(())
 }
 
+/// （仅测试）将限制配置写入配置文件的 `[limits]` 段并记录日志。
+/// 段不存在时自动创建；`max_concurrent_requests` 超出可持久化范围时直接报错，不改动文件。
+/// 返回 `Err(AppError::Config)`：目标段不是普通 table、数值超范围，或读取 / 解析 / 替换失败。
 #[cfg(test)]
 pub fn write_limits_config(path: &Path, config: &LimitsConfig) -> Result<(), AppError> {
     let max_concurrent_requests = i64::try_from(config.max_concurrent_requests)
@@ -426,6 +529,8 @@ pub fn write_limits_config(path: &Path, config: &LimitsConfig) -> Result<(), App
     Ok(())
 }
 
+/// （仅测试）将 Ouyi 8.0 平台配置写入配置文件的 `[ouyi]` 段并记录日志。
+/// 段不存在时自动创建；原子替换整个文件，其余段落与注释保持不变。
 #[cfg(test)]
 pub fn write_ouyi_config(path: &Path, config: &OuyiConfig) -> Result<(), crate::error::AppError> {
     let content = std::fs::read_to_string(path)
@@ -451,6 +556,8 @@ pub fn write_ouyi_config(path: &Path, config: &OuyiConfig) -> Result<(), crate::
     Ok(())
 }
 
+/// （仅测试）将 Ouyi 7.0 平台配置写入配置文件的 `[ouyi_v7]` 段并记录日志。
+/// 段不存在时自动创建；原子替换整个文件，其余段落与注释保持不变。
 #[cfg(test)]
 pub fn write_ouyi_v7_config(
     path: &Path,
@@ -483,6 +590,8 @@ pub fn write_ouyi_v7_config(
     Ok(())
 }
 
+/// （仅测试）将服务监听配置写入配置文件的 `[server]` 段并记录日志。
+/// 段不存在时自动创建；原子替换整个文件，其余段落与注释保持不变。
 #[cfg(test)]
 pub fn write_server_config(
     path: &Path,
@@ -508,6 +617,8 @@ pub fn write_server_config(
     Ok(())
 }
 
+/// （仅测试）将平台选择配置写入配置文件的 `[platform]` 段并记录日志。
+/// 段不存在时自动创建；原子替换整个文件，其余段落与注释保持不变。
 #[cfg(test)]
 pub fn write_platform_config(
     path: &Path,
@@ -537,6 +648,8 @@ pub fn write_platform_config(
     Ok(())
 }
 
+/// （仅测试）将 `[tool_runtime]` 段整体替换为给定配置。
+/// 可选字段为 `None` 时不写入对应键；原子替换整个文件。
 #[cfg(test)]
 pub fn write_tool_runtime_config(
     path: &Path,
@@ -580,6 +693,7 @@ pub fn write_tool_runtime_config(
     Ok(())
 }
 
+/// （仅测试）从配置文件中移除 `[tool_runtime]` 段；原子替换整个文件。
 #[cfg(test)]
 pub fn remove_tool_runtime_config(path: &Path) -> Result<(), crate::error::AppError> {
     let content = std::fs::read_to_string(path)
@@ -596,6 +710,8 @@ pub fn remove_tool_runtime_config(path: &Path) -> Result<(), crate::error::AppEr
     Ok(())
 }
 
+/// （仅测试）将 `[openai_tool_runtime]` 段整体替换为给定配置（provider 固定为 openai-compatible）。
+/// 可选字段为 `None` 时不写入对应键；原子替换整个文件。
 #[cfg(test)]
 pub fn write_openai_tool_runtime_config(
     path: &Path,
@@ -636,6 +752,7 @@ pub fn write_openai_tool_runtime_config(
     Ok(())
 }
 
+/// （仅测试）从配置文件中移除 `[openai_tool_runtime]` 段；原子替换整个文件。
 #[cfg(test)]
 pub fn remove_openai_tool_runtime_config(path: &Path) -> Result<(), crate::error::AppError> {
     let content = std::fs::read_to_string(path)

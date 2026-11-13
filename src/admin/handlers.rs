@@ -1,3 +1,10 @@
+//! 管理后台 HTTP 处理器：初始化与登录、状态与统计查询、配置读写、
+//! 模型列表、请求/运行时/工具运行时日志、工具模型连通性测试，
+//! 以及账号池增删查接口。
+//!
+//! 除 `admin_setup` 与 `admin_login` 外，其余路由统一由 `super::jwt_middleware`
+//! 保护；配置写路径共享 [`CONFIG_UPDATE_LOCK`] 以串行化并发修改。
+
 use axum::Json;
 use axum::extract::{Query, State};
 use axum::http::StatusCode;
@@ -29,16 +36,27 @@ use bcrypt::{DEFAULT_COST, hash};
 
 // ── Setup / Login ─────────────────────────────────────────────────────────
 
+/// 初始化设置 / 登录请求体。
 #[derive(Deserialize)]
 pub struct LoginRequest {
+    /// 管理员明文密码。
     password: String,
 }
 
+/// 初始化设置 / 登录成功响应体。
 #[derive(Serialize)]
 pub struct LoginResponse {
+    /// 后续请求应携带的 Bearer JWT。
     token: String,
 }
 
+/// 首次初始化接口：为管理后台设置密码。
+///
+/// 仅在未完成初始化时可用；成功后把密码哈希持久化到 admin 配置文件并
+/// 签发登录 token。副作用：写配置文件、更新内存中的密码哈希。
+///
+/// 失败时返回：409（已完成初始化）、500（密码哈希失败 / token 生成失败 /
+/// 配置写盘失败，附错误信息）。
 pub async fn admin_setup(
     State(state): State<Arc<AppState>>,
     Json(req): Json<LoginRequest>,
@@ -87,6 +105,10 @@ pub async fn admin_setup(
     Ok(Json(LoginResponse { token }))
 }
 
+/// 管理后台登录接口：校验密码并签发 JWT。
+///
+/// 按客户端 IP 做登录限流。失败时返回：403（未完成初始化）、429（触发
+/// 限流）、401（密码错误）、500（token 生成失败）。
 pub async fn admin_login(
     State(state): State<Arc<AppState>>,
     extract: axum::extract::ConnectInfo<std::net::SocketAddr>,
@@ -138,27 +160,43 @@ pub async fn admin_login(
 
 // ── Status ────────────────────────────────────────────────────────────────
 
+/// `GET /admin/api/status` 响应体：账号池与当前活动平台的整体状态。
 #[derive(Serialize)]
 pub struct AdminStatusResponse {
+    /// 各账号的摘要（邮箱、启用、是否持有 token、运行状态）。
     accounts: Vec<serde_json::Value>,
+    /// 账号总数。
     total: usize,
+    /// 空闲账号数。
     idle: usize,
+    /// 忙碌账号数。
     busy: usize,
+    /// 出错账号数。
     error: usize,
+    /// 失效账号数。
     invalid: usize,
+    /// 当前活动平台的状态视图。
     platform: PlatformStatusView,
 }
 
+/// 当前活动平台的状态视图。
 #[derive(Serialize)]
 pub struct PlatformStatusView {
+    /// 平台标识（如 "ouyi7" / "ouyi8"）。
     platform: String,
+    /// 平台展示名（如 "Ouyi 7.0"）。
     label: String,
+    /// 平台上游服务地址。
     base_url: String,
+    /// 当前已加载的可用模型数量。
     model_count: usize,
+    /// 上游凭据是否经最近一次校验有效。
     token_valid: bool,
+    /// 最近一次平台选择时间的 RFC3339 字符串。
     last_selected_at: Option<String>,
 }
 
+/// 查询账号池状态与当前活动平台信息。只读，无副作用。
 pub async fn admin_status(State(state): State<Arc<AppState>>) -> impl IntoResponse {
     let stats = state.account_store.pool_stats().await;
     let accounts = state.account_store.get_accounts().await;
@@ -211,33 +249,52 @@ pub async fn admin_status(State(state): State<Arc<AppState>>) -> impl IntoRespon
 
 // ── Stats ─────────────────────────────────────────────────────────────────
 
+/// `GET /admin/api/stats` 响应体：全服务请求统计快照。
 #[derive(Serialize)]
 pub struct StatsSnapshot {
+    /// 总请求数。
     total_requests: u64,
+    /// 成功请求数。
     success_requests: u64,
+    /// 失败请求数。
     failed_requests: u64,
+    /// 平均延迟（毫秒）；尚无请求时为 0。
     avg_latency_ms: u64,
+    /// 累计消耗的 prompt token 数（含工具模型调用）。
     total_prompt_tokens: u64,
+    /// 累计产出的 completion token 数（含工具模型调用）。
     total_completion_tokens: u64,
+    /// 服务运行时长（秒）。
     uptime_secs: u64,
+    /// 按模型聚合的用量统计；工具模型以 `tool-runtime::<model>` 为键。
     models: HashMap<String, ModelStatsEntry>,
+    /// 按 API key 聚合的用量统计（当前未启用，恒为空表）。
     keys: HashMap<String, KeyStatsEntry>,
 }
 
+/// 单个模型的用量统计条目。
 #[derive(Serialize)]
 pub struct ModelStatsEntry {
+    /// 该模型累计消耗的 prompt token。
     prompt_tokens: u64,
+    /// 该模型累计产出的 completion token。
     completion_tokens: u64,
+    /// 该模型的请求次数。
     requests: u64,
 }
 
+/// 单个 API key 的用量统计条目。
 #[derive(Serialize)]
 pub struct KeyStatsEntry {
+    /// 该 key 累计消耗的 prompt token。
     prompt_tokens: u64,
+    /// 该 key 累计产出的 completion token。
     completion_tokens: u64,
+    /// 该 key 的请求次数。
     requests: u64,
 }
 
+/// 汇总全服务请求统计并按模型聚合。只读，无副作用。
 pub async fn admin_stats(State(state): State<Arc<AppState>>) -> impl IntoResponse {
     let collector = &state.stats;
     let stats = &collector.stats;
@@ -295,101 +352,160 @@ pub async fn admin_stats(State(state): State<Arc<AppState>>) -> impl IntoRespons
 
 // ── Models ────────────────────────────────────────────────────────────────
 
+/// 转发到 OpenAI 兼容的模型列表接口，返回当前平台可用模型。
 pub async fn admin_models(state: State<Arc<AppState>>) -> impl IntoResponse {
     list_openai_models(state).await.into_response()
 }
 
 // ── Config ────────────────────────────────────────────────────────────────
 
+/// 管理员凭据配置视图。
 #[derive(Serialize)]
 pub struct AdminConfigResponse {
+    /// 是否已设置管理员密码（即已完成初始化）。
     password_set: bool,
+    /// 当前登录 JWT 的签发时间戳（当前未跟踪，恒为 0）。
     jwt_issued_at: u64,
 }
 
+/// 工具调用标记扩展配置视图。
 #[derive(Serialize)]
 pub struct ToolCallTagConfig {
+    /// 额外识别为工具调用开始的标记串（当前恒为空表）。
     extra_starts: Vec<String>,
+    /// 额外识别为工具调用结束的标记串（当前恒为空表）。
     extra_ends: Vec<String>,
 }
 
+/// ouyi 8.0 上游配置视图，对应配置文件 `[ouyi]` 段。
 #[derive(Serialize)]
 pub struct DeepSeekConfigView {
+    /// 上游服务地址。
     api_base: String,
+    /// 预留字段，当前恒为空串。
     wasm_url: String,
+    /// 预留字段，当前恒为空串。
     user_agent: String,
+    /// 客户端版本标识（对应 `ouyi.app_version`）。
     client_version: String,
+    /// 预留字段，当前恒为空串。
     client_platform: String,
+    /// 预留字段，当前恒为空串。
     client_locale: String,
+    /// 预留字段，当前恒为空表。
     model_types: Vec<String>,
+    /// 预留字段，当前恒为空表。
     max_input_tokens: Vec<u32>,
+    /// 预留字段，当前恒为空表。
     max_output_tokens: Vec<u32>,
+    /// 预留字段，当前恒为空表。
     model_aliases: Vec<String>,
+    /// 工具调用标记扩展配置。
     tool_call: ToolCallTagConfig,
-    /// JWT token for ouyi API auth (对应后端 ouyi.jwt_token)
+    /// JWT token for ouyi API auth（对应后端 ouyi.jwt_token），返回时已脱敏。
     jwt_token: String,
+    /// 模型列表后台刷新间隔（秒）。
     model_refresh_interval_secs: u64,
 }
 
+/// 服务监听配置视图。
 #[derive(Serialize)]
 pub struct ServerConfigView {
+    /// 监听地址。
     host: String,
+    /// 监听端口。
     port: u16,
+    /// 允许的 CORS 来源列表。
     cors_origins: Vec<String>,
 }
 
+/// 代理配置视图。
 #[derive(Serialize)]
 pub struct ProxyConfigView {
+    /// 出站代理地址；未配置时为 `None`。
     url: Option<String>,
 }
 
+/// 工具运行时配置视图（anthropic 工具模型与 OpenAI 工具模型共用结构）。
 #[derive(Serialize)]
 pub struct ToolRuntimeConfigView {
+    /// 是否启用。
     enabled: bool,
+    /// 工具模型提供方（"anthropic" / "openai-compatible"）；未启用时为 `None`。
     provider: Option<String>,
+    /// 工具模型服务地址；未配置时为 `None`。
     base_url: Option<String>,
+    /// API key（返回时已脱敏）；未配置时为 `None`。
     api_key: Option<String>,
+    /// 工具模型名；未配置时为 `None`。
     model: Option<String>,
+    /// 请求超时（秒）。
     timeout_secs: u64,
 }
 
+/// 平台配置视图。
 #[derive(Serialize)]
 pub struct PlatformConfigView {
+    /// 启动默认平台标识。
     default: String,
+    /// 启动时是否提示确认平台选择。
     prompt_on_start: bool,
 }
 
+/// ouyi 7.0 上游配置视图，对应配置文件 `[ouyi_v7]` 段。
 #[derive(Serialize)]
 pub struct Ouyi7ConfigView {
+    /// 上游服务根地址。
     base_url: String,
+    /// 聊天 API 路径前缀（如 "/chatapi"）。
     chatapi_prefix: String,
+    /// JWT 凭据（返回时已脱敏）。
     jwt_token: String,
+    /// 默认模型名。
     default_model: String,
+    /// 模型列表后台刷新间隔（秒）。
     model_refresh_interval_secs: u64,
+    /// 发送消息时携带的最大历史消息条数。
     max_history_messages: usize,
+    /// 模拟流式输出的每个分块字符数。
     simulated_stream_chunk_chars: usize,
 }
 
+/// 并发限制配置视图。
 #[derive(Serialize)]
 pub struct LimitsConfigView {
+    /// 最大并发请求数；0 表示不限制。
     max_concurrent_requests: usize,
 }
 
+/// `GET /admin/api/config` 响应体：完整配置视图的聚合。
 #[derive(Serialize)]
 pub struct FullConfigResponse {
+    /// 服务监听配置。
     server: ServerConfigView,
+    /// 并发限制配置。
     limits: LimitsConfigView,
+    /// ouyi 8.0 上游配置。
     deepseek: DeepSeekConfigView,
+    /// 代理配置。
     proxy: ProxyConfigView,
+    /// 管理员凭据状态。
     admin: AdminConfigResponse,
+    /// 账号列表摘要（token 已脱敏、密码不回传）。
     accounts: Vec<serde_json::Value>,
+    /// API key 列表（当前未启用，恒为空表）。
     api_keys: Vec<serde_json::Value>,
+    /// anthropic 工具运行时配置。
     tool_runtime: ToolRuntimeConfigView,
+    /// OpenAI 工具运行时配置。
     openai_tool_runtime: ToolRuntimeConfigView,
+    /// 平台配置；配置文件无 `[platform]` 段时以当前活动平台兜底填充。
     platform: Option<PlatformConfigView>,
+    /// ouyi 7.0 上游配置；未配置时为 `None`。
     ouyi_v7: Option<Ouyi7ConfigView>,
 }
 
+/// 查询完整配置视图。只读，无副作用；敏感字段（JWT/API key）脱敏返回。
 pub async fn admin_config(State(state): State<Arc<AppState>>) -> impl IntoResponse {
     let store = state.admin_store.read().await;
     let config = state.config.read().await.clone();
@@ -842,110 +958,177 @@ async fn send_anthropic_tool_runtime_test(
     Ok(())
 }
 
+/// `PUT /admin/api/config` 请求体：各配置段的可选更新，`None` 表示不修改。
 #[derive(Clone, Deserialize)]
 pub struct ConfigUpdate {
+    /// 服务监听配置更新。
     pub server: Option<ServerConfigUpdate>,
+    /// 并发限制更新。
     pub limits: Option<LimitsConfigUpdate>,
+    /// ouyi 8.0 上游配置更新（字段名沿用 `deepseek`）。
     pub deepseek: Option<OuyiConfigUpdate>,
+    /// 代理配置更新。
     pub proxy: Option<ProxyConfigUpdate>,
+    /// 管理员密码更新。
     pub admin: Option<AdminUpdate>,
+    /// 账号池整体替换列表。
     pub accounts: Option<Vec<AccountEntryRaw>>,
+    /// anthropic 工具运行时配置更新。
     pub tool_runtime: Option<ToolRuntimeConfigUpdate>,
+    /// OpenAI 工具运行时配置更新。
     pub openai_tool_runtime: Option<ToolRuntimeConfigUpdate>,
+    /// 平台配置更新。
     pub platform: Option<PlatformConfigUpdate>,
+    /// ouyi 7.0 上游配置更新。
     pub ouyi_v7: Option<Ouyi7ConfigUpdate>,
 }
 
+/// 并发限制更新段。
 #[derive(Clone, Deserialize)]
 pub struct LimitsConfigUpdate {
+    /// 新的最大并发请求数；`None` 表示不修改。
     pub max_concurrent_requests: Option<usize>,
 }
 
+/// 工具运行时配置更新段（两种提供方共用结构）。
 #[derive(Clone, Deserialize)]
 pub struct ToolRuntimeConfigUpdate {
+    /// 是否启用；显式传 `false` 时移除该运行时配置。
     pub enabled: Option<bool>,
+    /// 提供方标识（"anthropic" / "openai-compatible"）。
     pub provider: Option<String>,
+    /// 工具模型服务地址。
     pub base_url: Option<String>,
+    /// API key；脱敏占位值会被忽略以保留原值。
     pub api_key: Option<String>,
+    /// 工具模型名。
     pub model: Option<String>,
+    /// 请求超时（秒）。
     pub timeout_secs: Option<u64>,
 }
 
+/// 工具模型连通性测试请求体（字段语义同 [`ToolRuntimeConfigUpdate`]，
+/// 仅作用于本次测试，不落盘）。
 #[derive(Deserialize)]
 pub struct ToolRuntimeTestRequest {
+    /// 是否启用（不启用时测试直接拒绝）。
     pub enabled: Option<bool>,
+    /// 提供方标识。
     pub provider: Option<String>,
+    /// 工具模型服务地址。
     pub base_url: Option<String>,
+    /// API key。
     pub api_key: Option<String>,
+    /// 工具模型名。
     pub model: Option<String>,
+    /// 请求超时（秒）。
     pub timeout_secs: Option<u64>,
 }
 
+/// 工具模型连通性测试响应体。
 #[derive(Serialize)]
 pub struct ToolRuntimeTestResponse {
+    /// 测试是否通过。
     pub success: bool,
+    /// 结果描述或失败原因。
     pub message: String,
+    /// 测试请求耗时（毫秒）。
     pub latency_ms: u64,
+    /// 运行模式（"compiler"，未启用时为 "disabled"）。
     pub mode: String,
+    /// 提供方标识。
     pub provider: String,
+    /// 参与测试的模型名。
     pub model: String,
+    /// 参与测试的服务地址。
     pub base_url: String,
 }
 
+/// 服务监听配置更新段。
 #[derive(Clone, Deserialize)]
 pub struct ServerConfigUpdate {
+    /// 新监听地址；`None` 表示不修改。
     pub host: Option<String>,
+    /// 新监听端口；`None` 表示不修改。
     pub port: Option<u16>,
+    /// 新 CORS 来源列表；`None` 表示不修改。
     pub cors_origins: Option<Vec<String>>,
 }
 
+/// ouyi 8.0 上游配置更新段。
 #[derive(Clone, Deserialize)]
 pub struct OuyiConfigUpdate {
+    /// 上游服务地址；`None` 表示不修改。
     pub api_base: Option<String>,
+    /// 客户端版本标识；`None` 表示不修改。
     pub client_version: Option<String>,
-    /// 前端传来的 jwt_token 字段（对应后端 ouyi.jwt_token）
+    /// 前端传来的 jwt_token 字段（对应后端 ouyi.jwt_token）；脱敏占位值会被忽略。
     pub jwt_token: Option<String>,
+    /// 模型列表刷新间隔（秒）；`None` 表示不修改。
     pub model_refresh_interval_secs: Option<u64>,
 }
 
+/// 平台配置更新段。
 #[derive(Clone, Deserialize)]
 pub struct PlatformConfigUpdate {
+    /// 启动默认平台标识；`None` 表示不修改。
     pub default: Option<String>,
+    /// 启动时是否提示确认；`None` 表示不修改。
     pub prompt_on_start: Option<bool>,
 }
 
+/// ouyi 7.0 上游配置更新段，各字段 `None` 表示不修改。
 #[derive(Clone, Deserialize)]
 pub struct Ouyi7ConfigUpdate {
+    /// 上游服务根地址。
     pub base_url: Option<String>,
+    /// 聊天 API 路径前缀。
     pub chatapi_prefix: Option<String>,
+    /// JWT 凭据；脱敏占位值会被忽略以保留原值。
     pub jwt_token: Option<String>,
+    /// 默认模型名。
     pub default_model: Option<String>,
+    /// 模型列表刷新间隔（秒）。
     pub model_refresh_interval_secs: Option<u64>,
+    /// 最大历史消息条数。
     pub max_history_messages: Option<usize>,
+    /// 模拟流式输出的每个分块字符数。
     pub simulated_stream_chunk_chars: Option<usize>,
 }
 
+/// 代理配置更新段。
 #[derive(Clone, Deserialize)]
 pub struct ProxyConfigUpdate {
+    /// 出站代理地址；`None` 表示不修改。
     pub url: Option<String>,
 }
 
+/// 管理员密码更新段：需同时提供旧密码与新密码才会生效。
 #[derive(Clone, Deserialize)]
 pub struct AdminUpdate {
+    /// 当前密码，用于校验操作者身份。
     pub old_password: Option<String>,
+    /// 要设置的新密码，不能为空。
     pub new_password: Option<String>,
 }
 
+/// 账号条目的原始请求形态（密码为明文，由服务端负责哈希）。
 #[derive(Clone, Deserialize)]
 pub struct AccountEntryRaw {
+    /// 账号登录邮箱，作为唯一主键。
     pub email: String,
+    /// 账号绑定手机号。
     pub mobile: String,
+    /// 手机号区号；缺省为空串。
     #[serde(default)]
     pub area_code: String,
+    /// 明文密码；为空时保留该账号已存的密码哈希。
     #[serde(default)]
     pub password: String,
+    /// JWT 凭据；脱敏占位值或空串会保留/清空已存值。
     #[serde(default)]
     pub token: Option<String>,
+    /// 是否启用；缺省为 `false`。
     #[serde(default)]
     pub enabled: bool,
 }
@@ -980,15 +1163,21 @@ fn build_account_entry_from_raw(
 }
 
 const MAX_CONCURRENT_REQUESTS: usize = 1000;
+/// 串行化所有管理后台配置写操作的互斥锁，避免并发写配置文件产生竞态。
 pub(super) static CONFIG_UPDATE_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 
+/// 测试辅助：并发上限配置更新的失败类别。
 #[derive(Debug)]
 #[cfg(test)]
 pub(super) enum LimitsConfigUpdateError {
+    /// 数值超出允许范围（0..=1000）。
     Invalid(String),
+    /// 配置文件持久化失败。
     Persistence(AppError),
 }
 
+/// 测试辅助：校验并持久化并发上限配置，成功后同步内存配置与限流器；
+/// 持久化失败时不改动任何运行时状态。
 #[cfg(test)]
 pub(super) async fn apply_limits_config_update(
     state: &AppState,
@@ -1021,18 +1210,34 @@ pub(super) async fn apply_limits_config_update(
     Ok(())
 }
 
+/// 配置更新主流程完成后交付给调用方的剩余处理信息。
 pub(super) struct PreparedConfigUpdate {
+    /// 是否修改了服务监听地址/端口（需重启才能生效，调用方据此附提示）。
     server_changed: bool,
+    /// 待整体替换的账号列表；`None` 表示本次更新未涉及账号。
     accounts: Option<Vec<AccountEntryRaw>>,
 }
 
+/// 配置更新流程的失败类别。
 #[derive(Debug)]
 pub(super) enum ConfigUpdateError {
+    /// 请求参数非法（映射为 400）。
     BadRequest(String),
+    /// 鉴权失败，如旧密码不正确、新密码为空（映射为 401）。
     Unauthorized(String),
+    /// 配置写盘失败（映射为 500）。
     Persistence(AppError),
 }
 
+/// 校验合并配置更新，持久化到配置文件并提交运行时状态。
+///
+/// 副作用：写配置文件；按更新内容刷新内存配置、并发限流器、管理员密码
+/// 哈希；当解析出的目标平台与当前活动平台不同时，重建上游客户端、切换
+/// 平台标记、刷新平台状态，并后台异步重载模型列表。写盘失败时不提交
+/// 任何内存改动。
+///
+/// 成功返回 [`PreparedConfigUpdate`] 供调用方继续处理账号替换；
+/// 失败返回 [`ConfigUpdateError`]。
 pub(super) async fn prepare_and_commit_config_update(
     state: &Arc<AppState>,
     config_path: &Path,
@@ -1280,7 +1485,7 @@ pub(super) async fn prepare_and_commit_config_update(
             }
         });
     } else {
-        // 没有切换平台，沿用旧路径：仅当当前活动平台的 token/base_url 变了才重建同平台 client
+        // 未切换平台：仅当当前活动平台的 token/base_url 变了才重建同平台 client
         let active_platform = *state.platform.read().await;
         if deepseek_changed && active_platform == crate::platform::OuyiPlatform::Ouyi8 {
             let new_client = OuyiHttpClient::new(
@@ -1313,6 +1518,12 @@ pub(super) async fn prepare_and_commit_config_update(
     })
 }
 
+/// 全量配置更新接口（`PUT /admin/api/config`）。
+///
+/// 解析请求体为 [`ConfigUpdate`]，在 [`CONFIG_UPDATE_LOCK`] 保护下执行
+/// [`prepare_and_commit_config_update`]，随后按需整体替换账号池。
+/// 副作用：写配置文件、更新内存配置 / 限流器 / 上游客户端 / 账号池。
+/// 失败时返回：400（参数非法）、401（鉴权失败）、500（写盘失败）。
 pub async fn admin_put_config(
     State(state): State<Arc<AppState>>,
     Json(body): Json<serde_json::Value>,
@@ -1771,24 +1982,37 @@ async fn legacy_admin_put_config(
 
 // ── Logs ──────────────────────────────────────────────────────────────────
 
+/// `GET /admin/api/logs` 响应元素：单条请求日志。
 #[derive(Serialize)]
 pub struct RequestLogResponse {
+    /// 完成时间（Unix 秒时间戳）。
     timestamp: i64,
+    /// 请求标识（按列表序号生成）。
     request_id: String,
+    /// 请求使用的模型名。
     model: String,
+    /// API key 标识（当前恒为 "single"）。
     api_key: String,
+    /// 消耗的 prompt token 数。
     prompt_tokens: u64,
+    /// 产出的 completion token 数。
     completion_tokens: u64,
+    /// 请求耗时（毫秒）。
     latency_ms: u64,
+    /// 是否成功。
     success: bool,
+    /// 处理该请求的平台标识。
     platform: String,
 }
 
+/// `GET /admin/api/logs` 查询参数。
 #[derive(Deserialize)]
 pub struct LogsQuery {
+    /// 返回条数上限；缺省为 100。
     limit: Option<usize>,
 }
 
+/// 查询最近的请求日志，按时间倒序返回。只读，无副作用。
 pub async fn admin_logs(
     State(state): State<Arc<AppState>>,
     Query(query): Query<LogsQuery>,
@@ -1818,28 +2042,42 @@ pub async fn admin_logs(
 
 // ── Runtime Logs ──────────────────────────────────────────────────────────
 
+/// 运行日志响应元素：单条运行日志。
 #[derive(Serialize)]
 pub struct RuntimeLogEntry {
+    /// 产生时间（UTC，ISO8601 带毫秒）。
     timestamp: String,
+    /// 日志级别（如 "INFO" / "WARN"）。
     level: String,
+    /// 日志来源标识（当前恒为 "ouyi-api"）。
     target: String,
+    /// 日志正文。
     message: String,
 }
 
+/// `GET /admin/api/runtime-logs` 响应体。
 #[derive(Serialize)]
 pub struct RuntimeLogsResponse {
+    /// 命中的日志总数（分页前的全量条数）。
     total: usize,
+    /// 本次返回的起始偏移。
     offset: usize,
+    /// 本次返回的条数上限。
     limit: usize,
+    /// 日志条目列表。
     logs: Vec<RuntimeLogEntry>,
 }
 
+/// `GET /admin/api/runtime-logs` 查询参数。
 #[derive(Deserialize)]
 pub struct RuntimeLogsQuery {
+    /// 起始偏移；缺省为 0。
     offset: Option<usize>,
+    /// 返回条数上限；缺省为 100。
     limit: Option<usize>,
 }
 
+/// 按偏移与条数分页查询运行日志。只读，无副作用。
 pub async fn admin_runtime_logs(
     State(state): State<Arc<AppState>>,
     Query(query): Query<RuntimeLogsQuery>,
@@ -1869,12 +2107,16 @@ pub async fn admin_runtime_logs(
     })
 }
 
+/// `GET /admin/api/models/categorized` 响应体：按类别分组的模型列表。
 #[derive(Serialize)]
 pub struct CategorizedModelsResponse {
+    /// 当前活动平台标识。
     platform: String,
+    /// 按用途分类的模型分组。
     categories: Vec<ModelCategory>,
 }
 
+/// 返回按类别分组的当前平台模型列表。只读，无副作用。
 pub async fn admin_categorized_models(State(state): State<Arc<AppState>>) -> impl IntoResponse {
     let categories = state.model_mapper.get_categorized_models();
     let platform_status = state.platform_status.read().await;
@@ -1890,29 +2132,47 @@ pub async fn admin_categorized_models(State(state): State<Arc<AppState>>) -> imp
 
 // ── Tool Runtime Logs ────────────────────────────────────────────────────
 
+/// `GET /admin/api/tool-runtime-logs` 响应元素：单条工具运行时日志。
 #[derive(Serialize)]
 pub struct ToolRuntimeLogResponse {
+    /// 记录时间（UTC，ISO8601 带毫秒）。
     timestamp: String,
+    /// 所属请求 ID。
     request_id: String,
+    /// 请求入口端点。
     endpoint: String,
+    /// 运行模式（"compiler" / "broker"）。
     mode: String,
+    /// 工具模型提供方标识。
     provider: String,
+    /// 工具模型名。
     model: String,
+    /// 工具模型服务地址（已脱敏）。
     base_url: String,
+    /// 决策结果（"tool_calls" / "final_answer"）。
     decision: String,
+    /// 本次涉及的工具名列表。
     tool_names: Vec<String>,
+    /// 消耗的 prompt token 数。
     prompt_tokens: u64,
+    /// 产出的 completion token 数。
     completion_tokens: u64,
+    /// 耗时（毫秒）。
     latency_ms: u64,
+    /// 调用是否成功。
     success: bool,
+    /// 失败时的错误描述；成功时为 `None`。
     error: Option<String>,
 }
 
+/// `GET /admin/api/tool-runtime-logs` 查询参数。
 #[derive(Deserialize)]
 pub struct ToolRuntimeLogsQuery {
+    /// 返回条数上限；缺省为 100。
     limit: Option<usize>,
 }
 
+/// 查询最近的工具运行时日志，按时间倒序返回。只读，无副作用。
 pub async fn admin_tool_runtime_logs(
     State(state): State<Arc<AppState>>,
     Query(query): Query<ToolRuntimeLogsQuery>,
@@ -1944,6 +2204,11 @@ pub async fn admin_tool_runtime_logs(
     Json(response)
 }
 
+/// 工具模型连通性测试接口（anthropic 工具运行时）。
+///
+/// 用请求体（缺省字段取当前配置）构造测试配置，向工具模型发送一次最小
+/// 请求（"ping"，max_tokens=8）。副作用：向上游发起 HTTP 请求，不落盘。
+/// 失败时返回：400（未启用 / 配置缺失）、502（上游请求失败）。
 pub async fn admin_tool_runtime_test(
     State(state): State<Arc<AppState>>,
     Json(body): Json<ToolRuntimeTestRequest>,
@@ -2064,6 +2329,10 @@ pub async fn admin_tool_runtime_test(
     }
 }
 
+/// 工具模型连通性测试接口（OpenAI 工具运行时）。
+///
+/// 行为与 [`admin_tool_runtime_test`] 相同，仅固定走 openai-compatible
+/// 提供方。副作用：向上游发起 HTTP 请求，不落盘。
 pub async fn admin_openai_tool_runtime_test(
     State(state): State<Arc<AppState>>,
     Json(body): Json<ToolRuntimeTestRequest>,
@@ -2189,17 +2458,27 @@ pub async fn admin_openai_tool_runtime_test(
 
 // ── Accounts ──────────────────────────────────────────────────────────────
 
+/// `GET /admin/api/accounts` 响应元素：账号的列表视图。
 #[derive(Serialize)]
 pub struct AccountView {
+    /// 账号登录邮箱。
     pub email: String,
+    /// 绑定手机号。
     pub mobile: String,
+    /// 手机号区号。
     pub area_code: String,
+    /// JWT 凭据（已脱敏）；未持有时为 `None`。
     pub token: Option<String>,
+    /// 是否启用。
     pub enabled: bool,
+    /// 运行状态（"idle" / "busy" / "error:<次数>" / "invalid"，
+    /// 无运行时记录时为 "unknown"）。
     pub state: String,
+    /// 累计被调度使用次数。
     pub request_count: u64,
 }
 
+/// 列出全部账号及其运行时状态。只读，无副作用；token 脱敏返回。
 pub async fn admin_list_accounts(State(state): State<Arc<AppState>>) -> impl IntoResponse {
     let accounts = state.account_store.get_accounts().await;
     let runtime = state.account_store.get_runtime_stats().await;
@@ -2372,19 +2651,28 @@ mod tests {
 
 use crate::admin::accounts::AccountState;
 
+/// `POST /admin/api/accounts` 请求体：新增单个账号。
 #[derive(Deserialize)]
 pub struct AddAccountRequest {
+    /// 账号登录邮箱（池内唯一）。
     pub email: String,
+    /// 绑定手机号。
     pub mobile: String,
+    /// 手机号区号；缺省为空串。
     #[serde(default)]
     pub area_code: String,
+    /// 明文密码；为空则不设置，非空时由服务端 bcrypt 哈希后存储。
     #[serde(default)]
     pub password: String,
+    /// JWT 凭据；空串视为未持有。
     pub token: Option<String>,
+    /// 是否启用；缺省为 `false`。
     #[serde(default)]
     pub enabled: bool,
 }
 
+/// 新增单个账号；邮箱重复时返回 409，成功返回 200。
+/// 副作用：修改内存账号池。
 pub async fn admin_add_account(
     State(state): State<Arc<AppState>>,
     Json(req): Json<AddAccountRequest>,
@@ -2415,11 +2703,15 @@ pub async fn admin_add_account(
     }
 }
 
+/// `POST /admin/api/accounts/remove` 请求体。
 #[derive(Deserialize)]
 pub struct RemoveAccountRequest {
+    /// 要移除的账号邮箱。
     pub email: String,
 }
 
+/// 移除指定邮箱的账号；不存在时返回 404，成功返回 200。
+/// 副作用：整体替换内存账号池内容。
 pub async fn admin_remove_account(
     State(state): State<Arc<AppState>>,
     Json(req): Json<RemoveAccountRequest>,
@@ -2442,6 +2734,8 @@ pub async fn admin_remove_account(
     (StatusCode::OK, Json(serde_json::json!({"ok": true}))).into_response()
 }
 
+/// 返回账号池中所有已持有 token 的脱敏列表及数量；仅读取内存数据，
+/// 不向上游请求任何内容。
 pub async fn admin_refresh_token(State(state): State<Arc<AppState>>) -> impl IntoResponse {
     let accounts = state.account_store.get_accounts().await;
     let tokens: Vec<String> = accounts

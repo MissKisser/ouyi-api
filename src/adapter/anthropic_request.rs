@@ -1,10 +1,20 @@
+//! Anthropic Messages 请求到 ouyi 文本协议的请求适配。
+//!
+//! 将消息列表（含 thinking / tool_use / tool_result 块）拍平为带角色前缀的
+//! 单段文本，注入工具协作协议说明（长正文经 ouyi_payload 块承载、短意图用
+//! 自然语言表达），并对超长工具结果做 UTF-8 安全截断。
 use crate::model::anthropic::{
     AnthropicContent, AnthropicTool, ContentBlock, MessagesRequest, SystemContent,
 };
 
+/// 转换后的 ouyi 请求载荷。
 pub struct OuyiRequest {
+    /// 拼接后的系统提示（工具协作协议在前、请求自带 system 在后）；无内容时为 `None`。
     pub system_prompt: Option<String>,
+    /// 拍平后的对话正文，角色以 `[User]:` / `[Assistant]:` 等前缀标注，
+    /// 工具调用以标记块内嵌、工具结果以 `<tool_result>` 包裹。
     pub text: String,
+    /// 是否启用思考模式；调用方判定为需要思考或模型名包含 `-thinking` 时为真。
     pub thinking: bool,
 }
 
@@ -135,6 +145,20 @@ fn example_value_for_key(key: &str, v: &serde_json::Value) -> String {
     }
 }
 
+/// 将 Anthropic Messages 请求转换为 ouyi 文本协议请求。
+///
+/// - `req`：Anthropic 格式请求，消息 content 支持纯文本或块数组（text /
+///   thinking / tool_use / tool_result）；
+/// - `model_full`：完整模型名，包含 `-thinking` 时启用思考模式；
+/// - `should_thinking`：调用方显式指定的思考开关，与模型名判定取或。
+///
+/// 转换规则：携带工具定义时把工具协作协议注入 `system_prompt`（位于请求
+/// 自带 system 之前）；thinking 块转为 `<think>` 文本；tool_use 块转为工具
+/// 调用标记块并登记 id → 工具名映射；tool_result 块按映射还原工具名后以
+/// `<tool_result>` 包裹，正文超过 64 KiB 时按 UTF-8 边界截断并附加截断说明；
+/// `tool_choice` 指定强制工具时在正文末尾注入强制提示与未闭合的 `<think>` 引导块。
+///
+/// 返回拼装好的 [`OuyiRequest`]；`messages` 为空时返回 `Err`。
 pub fn convert_anthropic_request(
     req: &MessagesRequest,
     model_full: &str,
