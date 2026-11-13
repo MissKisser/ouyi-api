@@ -54,8 +54,5 @@ logs/
 deploy-staging/
 deploy-build/
 
-# 本地部署经验记录（不推送远程）
-docs/deployments/2026-08-20-yn8-docker-redeploy.md
-
 # 本地 prebuilt 实验（不在生产使用）
 Dockerfile.prebuilt

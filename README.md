@@ -2,7 +2,7 @@
 
 欧亿 AI 平台反向代理服务，提供 OpenAI 和 Anthropic 兼容的 API 接口，附 Web 管理面板。
 
-项目级目标、边界和验收标准见 [SPEC.md](./SPEC.md)。
+项目级目标、边界和验收标准记录在本地文档目录 `docs/specs/SPEC.md`（本地文档不随仓库分发）。
 
 ## 特性
 
