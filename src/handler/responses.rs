@@ -1756,6 +1756,7 @@ mod tests {
                 prompt_on_start: false,
             }),
             ouyi_v7: None,
+            api_keys: None,
         }
     }
 
@@ -1806,6 +1807,7 @@ mod tests {
                 max_history_messages: 20,
                 simulated_stream_chunk_chars: 80,
             }),
+            api_keys: None,
         };
 
         Arc::new(AppState {

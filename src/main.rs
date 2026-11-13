@@ -8,6 +8,7 @@
 
 mod adapter;
 mod admin;
+pub mod api_auth;
 mod client;
 mod concurrency;
 mod config;
@@ -108,6 +109,16 @@ async fn main() -> Result<(), AppError> {
             .map_err(AppError::Config)?;
 
     tracing::info!("已选择平台: {}", selected_platform.label());
+
+    match config.api_keys.as_ref() {
+        Some(section) if !section.keys.is_empty() => {
+            tracing::info!("api_keys=ENABLED ({} key(s))", section.keys.len());
+        }
+        Some(_) => {
+            tracing::warn!("api_keys 段存在但 keys 为空，按未启用处理");
+        }
+        None => tracing::info!("api_keys=DISABLED"),
+    }
 
     if config.ouyi.jwt_token.is_empty() {
         tracing::warn!("JWT token 未配置，请设置 config.toml 中的 ouyi.jwt_token");
@@ -225,7 +236,8 @@ async fn main() -> Result<(), AppError> {
                 Ok(catalog) => {
                     // V7：catalog 加载后同步模型路由表给 client（customAIModels/aiModels 的路由决策）
                     if let crate::client::OuyiClient::V7(v7) = &*client {
-                        let table = crate::client::ouyi_v7::build_routing_table_from_catalog(&catalog);
+                        let table =
+                            crate::client::ouyi_v7::build_routing_table_from_catalog(&catalog);
                         v7.update_routing(table);
                     }
                     refresh_state.model_mapper.load_from_catalog(&catalog);
@@ -246,7 +258,7 @@ async fn main() -> Result<(), AppError> {
     let admin_router = admin::admin_routes(state.clone());
     let static_router = admin::static_file_router();
 
-    let app = router::app(state.concurrency_limiter.clone())
+    let app = router::app(state.clone())
         .merge(admin_router)
         .merge(static_router)
         .layer(CorsLayer::permissive())

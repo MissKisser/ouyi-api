@@ -14,18 +14,21 @@ use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
 
 use crate::AppState;
-use crate::concurrency::{ConcurrencyLimiter, limit_inference_requests};
+use crate::concurrency::limit_inference_requests;
 use crate::handler;
 
 /// 组装应用路由。
 /// - 模型列表：`/v1/models`、`/openai/v1/models`、`/anthropic/v1/models`；
 /// - 推理：`/v1/chat/completions`、`/openai/v1/chat/completions`、`/openai/v1/responses`、
-///   `/v1/responses`、`/anthropic/v1/messages`、`/anthropic/messages`，全部经过
-///   [`limit_inference_requests`] 限流与 [`reject_tool_runtime_recursion`] 递归防护。
-/// - `limiter`: 全局并发限流器（与 `AppState` 中的实例共享同一份计数）。
+///   `/v1/responses`、`/anthropic/v1/messages`、`/anthropic/messages`，经
+///   [`limit_inference_requests`] 限流与 [`reject_tool_runtime_recursion`] 递归防护；
+/// - 上述全部路由再经 [`crate::api_auth::require_api_key`] 鉴权（最外层，
+///   `[api_keys]` 未配置时放行）。
+/// - `state`: 应用共享状态（并发限流器自其中获取）。
 ///
 /// 返回以 `Arc<AppState>` 为状态的 `Router`，由 `main` 再合并管理后台与静态资源路由。
-pub fn app(limiter: ConcurrencyLimiter) -> Router<Arc<AppState>> {
+pub fn app(state: Arc<AppState>) -> Router<Arc<AppState>> {
+    let limiter = state.concurrency_limiter.clone();
     let models = Router::new()
         .route("/v1/models", get(handler::models::list_models))
         .route("/openai/v1/models", get(handler::models::list_models))
@@ -36,7 +39,10 @@ pub fn app(limiter: ConcurrencyLimiter) -> Router<Arc<AppState>> {
             "/v1/chat/completions",
             post(handler::chat::chat_completions),
         )
-        .route("/openai/v1/chat/completions", post(handler::chat::chat_completions))
+        .route(
+            "/openai/v1/chat/completions",
+            post(handler::chat::chat_completions),
+        )
         .route("/openai/v1/responses", post(handler::responses::responses))
         .route("/v1/responses", post(handler::responses::responses))
         .route("/anthropic/v1/messages", post(handler::anthropic::messages))
@@ -47,7 +53,12 @@ pub fn app(limiter: ConcurrencyLimiter) -> Router<Arc<AppState>> {
         ))
         .route_layer(middleware::from_fn(reject_tool_runtime_recursion));
 
-    models.merge(inference)
+    models
+        .merge(inference)
+        .route_layer(middleware::from_fn_with_state(
+            state,
+            crate::api_auth::require_api_key,
+        ))
 }
 
 /// 工具运行时递归防护中间件：请求携带的递归跳数头部大于等于 1 时，说明是
@@ -76,8 +87,9 @@ mod tests {
     use crate::client::http::OuyiHttpClient;
     use crate::client::ouyi_v7::Ouyi7HttpClient;
     use crate::config::{
-        AdminConfig, AppConfig, LimitsConfig, Ouyi7Config, OuyiConfig, PlatformConfig,
-        ServerConfig, ToolCallConfig, ToolRuntimeConfig, ToolRuntimeMode, ToolRuntimeProvider,
+        AdminConfig, ApiKeysConfig, AppConfig, LimitsConfig, Ouyi7Config, OuyiConfig,
+        PlatformConfig, ServerConfig, ToolCallConfig, ToolRuntimeConfig, ToolRuntimeMode,
+        ToolRuntimeProvider,
     };
     use crate::model::mapper::ModelMapper;
     use crate::platform::{OuyiPlatform, PlatformStatus};
@@ -100,7 +112,7 @@ mod tests {
     }
 
     async fn spawn_protocol_app(state: Arc<AppState>) -> String {
-        let app = super::app(state.concurrency_limiter.clone())
+        let app = super::app(state.clone())
             .merge(crate::admin::admin_routes(state.clone()))
             .with_state(state);
         spawn_http_server(app).await
@@ -169,6 +181,7 @@ mod tests {
                 max_history_messages: 20,
                 simulated_stream_chunk_chars: 80,
             }),
+            api_keys: None,
         };
 
         let ouyi_client = match platform {
@@ -722,5 +735,127 @@ mod tests {
         assert_eq!(value["stop_reason"], "tool_use");
         assert_eq!(value["content"][0]["type"], "tool_use");
         assert_eq!(value["content"][0]["name"], "Bash");
+    }
+
+    async fn enable_api_keys(state: &Arc<AppState>, keys: &[&str]) {
+        state.config.write().await.api_keys = Some(ApiKeysConfig {
+            keys: keys.iter().map(|k| k.to_string()).collect(),
+        });
+    }
+
+    #[tokio::test]
+    async fn inference_open_when_api_keys_not_configured() {
+        let state = make_state(
+            OuyiPlatform::Ouyi8,
+            "http://127.0.0.1:1".to_string(),
+            String::new(),
+        );
+        let base_url = spawn_protocol_app(state).await;
+        let client = reqwest::Client::builder().no_proxy().build().unwrap();
+
+        for headers in [None, Some(("authorization", "Bearer sk-anything-goes"))] {
+            let mut req = client.get(format!("{base_url}/v1/models"));
+            if let Some((name, value)) = headers {
+                req = req.header(name, value);
+            }
+            let response = req.send().await.unwrap();
+            assert_eq!(response.status(), StatusCode::OK);
+        }
+    }
+
+    #[tokio::test]
+    async fn inference_rejects_missing_or_wrong_key_when_enabled() {
+        let state = make_state(
+            OuyiPlatform::Ouyi8,
+            "http://127.0.0.1:1".to_string(),
+            String::new(),
+        );
+        enable_api_keys(&state, &["sk-correct-key-0123456789"]).await;
+        let base_url = spawn_protocol_app(state.clone()).await;
+        let client = reqwest::Client::builder().no_proxy().build().unwrap();
+
+        let missing = client
+            .get(format!("{base_url}/v1/models"))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(missing.status(), StatusCode::UNAUTHORIZED);
+        let body: serde_json::Value = missing.json().await.unwrap();
+        assert_eq!(body["error"]["code"], "invalid_api_key");
+
+        let wrong = client
+            .get(format!("{base_url}/v1/models"))
+            .header("authorization", "Bearer sk-wrong-key-0123456789")
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(wrong.status(), StatusCode::UNAUTHORIZED);
+
+        let anthropic_missing = client
+            .post(format!("{base_url}/anthropic/v1/messages"))
+            .header("content-type", "application/json")
+            .body("{}")
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(anthropic_missing.status(), StatusCode::UNAUTHORIZED);
+        let a_body: serde_json::Value = anthropic_missing.json().await.unwrap();
+        assert_eq!(a_body["error"]["type"], "authentication_error");
+    }
+
+    #[tokio::test]
+    async fn inference_accepts_valid_key_and_admin_jwt_when_enabled() {
+        let state = make_state(
+            OuyiPlatform::Ouyi8,
+            "http://127.0.0.1:1".to_string(),
+            String::new(),
+        );
+        enable_api_keys(&state, &["sk-correct-key-0123456789"]).await;
+        let admin_token = state
+            .admin_store
+            .read()
+            .await
+            .generate_token("admin")
+            .unwrap();
+        let base_url = spawn_protocol_app(state).await;
+        let client = reqwest::Client::builder().no_proxy().build().unwrap();
+
+        for header in [
+            ("authorization", "Bearer sk-correct-key-0123456789"),
+            ("x-api-key", "sk-correct-key-0123456789"),
+            ("authorization", &format!("Bearer {admin_token}")),
+        ] {
+            let response = client
+                .get(format!("{base_url}/v1/models"))
+                .header(header.0, header.1)
+                .send()
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::OK, "{header:?}");
+        }
+    }
+
+    #[tokio::test]
+    async fn admin_login_unaffected_by_api_key_auth() {
+        let state = make_state(
+            OuyiPlatform::Ouyi8,
+            "http://127.0.0.1:1".to_string(),
+            String::new(),
+        );
+        enable_api_keys(&state, &["sk-correct-key-0123456789"]).await;
+        let base_url = spawn_protocol_app(state).await;
+
+        let response = reqwest::Client::builder()
+            .no_proxy()
+            .build()
+            .unwrap()
+            .post(format!("{base_url}/admin/api/login"))
+            .header("content-type", "application/json")
+            .body("{}")
+            .send()
+            .await
+            .unwrap();
+        let text = response.text().await.unwrap();
+        assert!(!text.contains("invalid_api_key"));
     }
 }

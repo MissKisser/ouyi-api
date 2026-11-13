@@ -13,6 +13,7 @@ import {
 import { Card, CardContent, CardHeader, CardTitle } from '@/components/ui/card';
 import { Button } from '@/components/ui/button';
 import { Input } from '@/components/ui/input';
+import { Textarea } from '@/components/ui/textarea';
 import { Badge } from '@/components/ui/badge';
 import { Separator } from '@/components/ui/separator';
 import { Switch } from '@/components/ui/switch';
@@ -96,6 +97,8 @@ export function ConfigPage() {
   const [testingOpenAiToolRuntime, setTestingOpenAiToolRuntime] = useState(false);
   const [toolRuntimeTest, setToolRuntimeTest] = useState<ToolRuntimeTestResponse | null>(null);
   const [openAiToolRuntimeTest, setOpenAiToolRuntimeTest] = useState<ToolRuntimeTestResponse | null>(null);
+  const [apiKeyInput, setApiKeyInput] = useState('');
+  const [savingApiKeys, setSavingApiKeys] = useState(false);
 
   const defaultPlatform = config?.platform ?? {
     default: 'ouyi8' as const,
@@ -224,6 +227,58 @@ export function ConfigPage() {
       });
     } finally {
       setSavingConcurrency(false);
+    }
+  };
+
+  /** 保存接口鉴权设置：文本框为空不发起请求并提示保持不变；有内容则整体替换。 */
+  const handleSaveApiKeys = async () => {
+    const lines = apiKeyInput
+      .split('\n')
+      .map((line) => line.trim())
+      .filter((line) => line.length > 0);
+    if (lines.length === 0) {
+      setMessage({ type: 'ok', text: t('config.apiKeys.noChange') });
+      return;
+    }
+    if (lines.some((line) => line.length < 16)) {
+      setMessage({ type: 'err', text: t('config.apiKeys.tooShort') });
+      return;
+    }
+    setSavingApiKeys(true);
+    setMessage(null);
+    try {
+      await apiSaveConfig({ api_keys: { keys: lines } });
+      setMessage({ type: 'ok', text: t('config.apiKeys.saved') });
+      setApiKeyInput('');
+      const fresh = await apiFetchConfig();
+      setConfig(fresh);
+    } catch (e: unknown) {
+      setMessage({
+        type: 'err',
+        text: t('config.saveFailed', { error: e instanceof Error ? e.message : String(e) }),
+      });
+    } finally {
+      setSavingApiKeys(false);
+    }
+  };
+
+  /** 清空全部 API key 并关闭接口鉴权：经确认后提交空 key 列表并回读刷新配置。 */
+  const handleClearApiKeys = async () => {
+    if (!window.confirm(t('config.apiKeys.clearConfirm'))) return;
+    setSavingApiKeys(true);
+    setMessage(null);
+    try {
+      await apiSaveConfig({ api_keys: { keys: [] } });
+      const fresh = await apiFetchConfig();
+      setConfig(fresh);
+      setMessage({ type: 'ok', text: t('config.apiKeys.cleared') });
+    } catch (e: unknown) {
+      setMessage({
+        type: 'err',
+        text: t('config.saveFailed', { error: e instanceof Error ? e.message : String(e) }),
+      });
+    } finally {
+      setSavingApiKeys(false);
     }
   };
 
@@ -519,6 +574,56 @@ export function ConfigPage() {
           </div>
         </div>
       </Section>
+
+      {/* API Key auth */}
+      <Card>
+        <CardHeader>
+          <CardTitle>{t('config.apiKeys.title')}</CardTitle>
+        </CardHeader>
+        <CardContent className="space-y-3">
+          <p className="text-sm text-muted-foreground">{t('config.apiKeys.desc')}</p>
+          <p className="text-sm">
+            {t('config.apiKeys.current', {
+              count: config.api_keys?.length ?? 0,
+              state:
+                (config.api_keys?.length ?? 0) > 0
+                  ? t('config.apiKeys.enabled')
+                  : t('config.apiKeys.disabled'),
+            })}
+          </p>
+          {(config.api_keys?.length ?? 0) > 0 && (
+            <ul className="space-y-1">
+              {config.api_keys?.map((entry, index) => (
+                <li
+                  key={index}
+                  className="w-fit rounded bg-muted px-2 py-1 font-mono text-xs"
+                >
+                  {entry.masked}
+                </li>
+              ))}
+            </ul>
+          )}
+          <Textarea
+            value={apiKeyInput}
+            onChange={(e) => setApiKeyInput(e.target.value)}
+            placeholder={t('config.apiKeys.placeholder')}
+            rows={3}
+            className="font-mono text-xs"
+          />
+          <div className="flex gap-2">
+            <Button onClick={handleSaveApiKeys} disabled={savingApiKeys}>
+              {savingApiKeys ? t('config.apiKeys.saving') : t('config.apiKeys.save')}
+            </Button>
+            <Button
+              variant="destructive"
+              onClick={handleClearApiKeys}
+              disabled={(config.api_keys?.length ?? 0) === 0 || savingApiKeys}
+            >
+              {t('config.apiKeys.clear')}
+            </Button>
+          </div>
+        </CardContent>
+      </Card>
 
       {/* Ouyi 7 */}
       <Section title={t('config.sections.ouyi7')} icon={Globe}>

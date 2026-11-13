@@ -20,8 +20,8 @@ use crate::AppState;
 use crate::admin::accounts::AccountEntry;
 use crate::client::http::OuyiHttpClient;
 use crate::config::{
-    AdminConfig, AppConfig, Ouyi7Config, PlatformConfig, ToolRuntimeConfig, ToolRuntimeMode,
-    ToolRuntimeProvider, write_admin_config, write_app_config,
+    AdminConfig, ApiKeysConfig, AppConfig, Ouyi7Config, PlatformConfig, ToolRuntimeConfig,
+    ToolRuntimeMode, ToolRuntimeProvider, write_admin_config, write_app_config,
 };
 #[cfg(test)]
 use crate::config::{
@@ -493,7 +493,7 @@ pub struct FullConfigResponse {
     admin: AdminConfigResponse,
     /// 账号列表摘要（token 已脱敏、密码不回传）。
     accounts: Vec<serde_json::Value>,
-    /// API key 列表（当前未启用，恒为空表）。
+    /// API key 掩码列表（保留首尾少量字符；未配置时为空表）。
     api_keys: Vec<serde_json::Value>,
     /// anthropic 工具运行时配置。
     tool_runtime: ToolRuntimeConfigView,
@@ -575,6 +575,18 @@ pub async fn admin_config(State(state): State<Arc<AppState>>) -> impl IntoRespon
         }
     };
 
+    let api_keys: Vec<serde_json::Value> = config
+        .api_keys
+        .as_ref()
+        .map(|section| {
+            section
+                .keys
+                .iter()
+                .map(|key| serde_json::json!({ "masked": crate::api_auth::mask_key(key) }))
+                .collect()
+        })
+        .unwrap_or_default();
+
     Json(FullConfigResponse {
         server: ServerConfigView {
             host: config.server.host.clone(),
@@ -615,7 +627,7 @@ pub async fn admin_config(State(state): State<Arc<AppState>>) -> impl IntoRespon
             jwt_issued_at: 0,
         },
         accounts: account_values,
-        api_keys: vec![],
+        api_keys,
         tool_runtime: tool_runtime_view,
         openai_tool_runtime: openai_tool_runtime_view,
         platform: Some({
@@ -981,6 +993,8 @@ pub struct ConfigUpdate {
     pub platform: Option<PlatformConfigUpdate>,
     /// ouyi 7.0 上游配置更新。
     pub ouyi_v7: Option<Ouyi7ConfigUpdate>,
+    /// API Key 鉴权更新。
+    pub api_keys: Option<ApiKeysConfigUpdate>,
 }
 
 /// 并发限制更新段。
@@ -988,6 +1002,17 @@ pub struct ConfigUpdate {
 pub struct LimitsConfigUpdate {
     /// 新的最大并发请求数；`None` 表示不修改。
     pub max_concurrent_requests: Option<usize>,
+}
+
+/// API Key 鉴权更新段。
+#[derive(Clone, Deserialize)]
+pub struct ApiKeysConfigUpdate {
+    /// 新的 key 列表，按以下语义处理：
+    /// - `None`：不修改。
+    /// - 空数组：显式关闭鉴权并清空 key。
+    /// - 数组全部为空白或掩码占位项：视为未提供真实 key，保留现有 api_keys 不变。
+    /// - 含至少一个真实 key（≥16 字符）：空白与掩码项丢弃，真实项去重后整体替换。
+    pub keys: Option<Vec<String>>,
 }
 
 /// 工具运行时配置更新段（两种提供方共用结构）。
@@ -1412,6 +1437,18 @@ pub(super) async fn prepare_and_commit_config_update(
         );
     }
 
+    if let Some(api_keys_update) = update.api_keys.as_ref()
+        && let Some(raw_keys) = api_keys_update.keys.as_ref()
+    {
+        let keys =
+            crate::api_auth::normalize_keys(raw_keys).map_err(ConfigUpdateError::BadRequest)?;
+        // 空数组表示显式关闭鉴权并清空 key；数组非空但 normalize 后为空，说明
+        // 全部为空白或掩码占位项，未提供真实 key，保留既有 api_keys 不变。
+        if !keys.is_empty() || raw_keys.is_empty() {
+            candidate.api_keys = Some(ApiKeysConfig { keys });
+        }
+    }
+
     let path = config_path.to_path_buf();
     let persisted = tokio::task::spawn_blocking(move || write_app_config(&path, &candidate))
         .await
@@ -1439,8 +1476,7 @@ pub(super) async fn prepare_and_commit_config_update(
     // 所有配置改动。仅当用户在 platform.default 字段实际改了选择时才走这条路径。
     if let Some(target) = platform_switch_target {
         // 用最新配置构造目标平台的 client
-        let new_client =
-            crate::build_ouyi_client(&state.http_client, &persisted, target);
+        let new_client = crate::build_ouyi_client(&state.http_client, &persisted, target);
         let new_base_url = match &new_client {
             crate::client::OuyiClient::V7(v7) => v7.base_url().to_string(),
             crate::client::OuyiClient::V8(_) => persisted.ouyi.base_url.clone(),
@@ -1470,14 +1506,19 @@ pub(super) async fn prepare_and_commit_config_update(
                     let count = catalog.models.len();
                     // V7：把路由表同步给 client（customAIModels/aiModels 的路由决策）
                     if let crate::client::OuyiClient::V7(v7) = &*client {
-                        let table = crate::client::ouyi_v7::build_routing_table_from_catalog(&catalog);
+                        let table =
+                            crate::client::ouyi_v7::build_routing_table_from_catalog(&catalog);
                         v7.update_routing(table);
                     }
                     reload_state.model_mapper.load_from_catalog(&catalog);
                     let mut status = reload_state.platform_status.write().await;
                     status.model_count = reload_state.model_mapper.model_count();
                     status.token_valid = count > 0;
-                    tracing::info!(platform = status.platform.label(), count, "切换平台后模型列表已刷新");
+                    tracing::info!(
+                        platform = status.platform.label(),
+                        count,
+                        "切换平台后模型列表已刷新"
+                    );
                 }
                 Err(e) => {
                     tracing::warn!(error = %e, "切换平台后模型列表加载失败，等待后台刷新任务兜底");

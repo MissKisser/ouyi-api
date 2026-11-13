@@ -2,7 +2,7 @@
 //!
 //! 定义 `config.toml` 各配置段对应的反序列化结构（`[server]` / `[ouyi]` / `[limits]` /
 //! `[admin]` / `[tool_call]` / `[tool_runtime]` / `[openai_tool_runtime]` / `[platform]` /
-//! `[ouyi_v7]`），并提供两类能力：
+//! `[ouyi_v7]` / `[api_keys]`），并提供两类能力：
 //! - 读取：[`AppConfig::load`] 系列函数从磁盘加载配置；
 //! - 写回：[`write_app_config`] 等函数经 `config_store` 以"读原文档 → 修改 → 校验候选文本
 //!   → 原子替换"的方式持久化，保留文件中未被触及的段落与注释。
@@ -38,6 +38,18 @@ pub struct AppConfig {
     pub platform: Option<PlatformConfig>,
     /// Ouyi 7.0 平台对接配置（`[ouyi_v7]` 段），选择 7.0 平台时使用，多数字段有内置默认值。
     pub ouyi_v7: Option<Ouyi7Config>,
+    /// 推理入口 API Key 鉴权配置（`[api_keys]` 段），可选；缺省表示未启用。
+    #[serde(default)]
+    pub api_keys: Option<ApiKeysConfig>,
+}
+
+/// 推理入口 API Key 鉴权配置（`[api_keys]` 段）。
+#[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
+pub struct ApiKeysConfig {
+    /// 允许访问推理与模型列表端点的 API Key 列表；
+    /// 非空列表启用鉴权，空列表视为未启用。
+    #[serde(default)]
+    pub keys: Vec<String>,
 }
 
 /// 工具调用协议解析的自定义标记配置。
@@ -276,7 +288,7 @@ impl AppConfig {
 /// 经 `config_store::update_document` 执行"读取原文件 → 重写各配置段 → 反序列化校验候选文本
 /// → 原子替换"，避免校验或落盘中途失败导致只写入了一半字段；管理后台的全量配置更新应走此函数。
 /// 文件中未被该函数触及的段落与注释保持不变，`admin` / `platform` / `ouyi_v7` /
-/// `tool_runtime` / `openai_tool_runtime` 段在对应配置为 `None` 时从文件中移除。
+/// `tool_runtime` / `openai_tool_runtime` / `api_keys` 段在对应配置为 `None` 时从文件中移除。
 /// - `path`: 配置文件路径；`config`: 要持久化的完整配置。
 /// - 返回：替换成功后重新解析出的 `AppConfig`。
 /// - 返回 `Err(AppError::Config)`：目标段不是普通 table、`max_concurrent_requests` 超出
@@ -306,6 +318,20 @@ pub fn write_app_config(path: &Path, config: &AppConfig) -> Result<AppConfig, Ap
                 AppError::Config("max_concurrent_requests 超出可持久化范围".to_string())
             })?,
         );
+
+        match &config.api_keys {
+            Some(section) => {
+                let table = ensure_table(doc, "api_keys")?;
+                let mut keys = toml_edit::Array::new();
+                for key in &section.keys {
+                    keys.push(key.as_str());
+                }
+                table["keys"] = toml_edit::value(keys);
+            }
+            None => {
+                doc.remove("api_keys");
+            }
+        }
 
         write_optional_admin(doc, config.admin.as_ref())?;
         write_optional_platform(doc, config.platform.as_ref())?;
@@ -880,6 +906,193 @@ preserved = true
         assert!(content.contains("# keep this comment"));
 
         let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn test_write_app_config_persists_api_keys_with_standard_table_header() {
+        struct TempFileGuard(std::path::PathBuf);
+
+        impl Drop for TempFileGuard {
+            fn drop(&mut self) {
+                let _ = std::fs::remove_file(&self.0);
+            }
+        }
+
+        let temp_file = TempFileGuard(
+            std::env::temp_dir().join(format!("ouyi-api-keys-write-{}.toml", uuid::Uuid::new_v4())),
+        );
+        std::fs::write(
+            &temp_file.0,
+            r#"# keep api_keys roundtrip comment
+[server]
+host = "127.0.0.1"
+port = 3000
+
+[ouyi]
+base_url = "https://example.invalid"
+jwt_token = "test"
+app_version = "3.0.3"
+model_refresh_interval_secs = 3600
+
+[limits]
+request_timeout_secs = 30
+no_data_timeout_secs = 30
+max_response_bytes = 1048576
+max_messages_bytes = 1048576
+max_concurrent_requests = 1
+
+[custom]
+preserved = true
+"#,
+        )
+        .unwrap();
+
+        let mut config = AppConfig::load_from_path(&temp_file.0).unwrap();
+        config.api_keys = Some(ApiKeysConfig {
+            keys: vec![
+                "sk-inference-test-key-0001".to_string(),
+                "sk-inference-test-key-0002".to_string(),
+            ],
+        });
+
+        let persisted = write_app_config(&temp_file.0, &config).unwrap();
+
+        let content = std::fs::read_to_string(&temp_file.0).unwrap();
+        let parsed: toml::Value = content.parse().unwrap();
+
+        assert_eq!(persisted.api_keys, config.api_keys);
+        assert!(content.contains("[api_keys]"));
+        assert!(!content.contains("api_keys = {"));
+        let keys = parsed["api_keys"]["keys"].as_array().unwrap();
+        assert_eq!(keys.len(), 2);
+        assert_eq!(keys[0].as_str(), Some("sk-inference-test-key-0001"));
+        assert_eq!(keys[1].as_str(), Some("sk-inference-test-key-0002"));
+        assert_eq!(parsed["custom"]["preserved"].as_bool(), Some(true));
+        assert_eq!(parsed["server"]["port"].as_integer(), Some(3000));
+        assert!(content.contains("# keep api_keys roundtrip comment"));
+    }
+
+    #[test]
+    fn test_write_app_config_removes_api_keys_section_when_none() {
+        struct TempFileGuard(std::path::PathBuf);
+
+        impl Drop for TempFileGuard {
+            fn drop(&mut self) {
+                let _ = std::fs::remove_file(&self.0);
+            }
+        }
+
+        let temp_file = TempFileGuard(std::env::temp_dir().join(format!(
+            "ouyi-api-keys-remove-{}.toml",
+            uuid::Uuid::new_v4()
+        )));
+        std::fs::write(
+            &temp_file.0,
+            r#"
+[server]
+host = "127.0.0.1"
+port = 3000
+
+[ouyi]
+base_url = "https://example.invalid"
+jwt_token = "test"
+app_version = "3.0.3"
+model_refresh_interval_secs = 3600
+
+[limits]
+request_timeout_secs = 30
+no_data_timeout_secs = 30
+max_response_bytes = 1048576
+max_messages_bytes = 1048576
+max_concurrent_requests = 1
+
+[api_keys]
+keys = ["sk-inference-test-key-0001"]
+
+[custom]
+preserved = true
+"#,
+        )
+        .unwrap();
+
+        let mut config = AppConfig::load_from_path(&temp_file.0).unwrap();
+        config.api_keys = None;
+
+        write_app_config(&temp_file.0, &config).unwrap();
+
+        let content = std::fs::read_to_string(&temp_file.0).unwrap();
+        let parsed: toml::Value = content.parse().unwrap();
+
+        assert!(parsed.get("api_keys").is_none());
+        assert!(!content.contains("api_keys"));
+        assert_eq!(parsed["custom"]["preserved"].as_bool(), Some(true));
+        assert_eq!(parsed["server"]["port"].as_integer(), Some(3000));
+    }
+
+    #[test]
+    fn test_write_app_config_rejects_scalar_api_keys_without_panicking() {
+        struct TempFileGuard(std::path::PathBuf);
+
+        impl Drop for TempFileGuard {
+            fn drop(&mut self) {
+                let _ = std::fs::remove_file(&self.0);
+            }
+        }
+
+        let temp_file = TempFileGuard(std::env::temp_dir().join(format!(
+            "ouyi-api-keys-scalar-{}.toml",
+            uuid::Uuid::new_v4()
+        )));
+        let original = r#"api_keys = "scalar"
+
+[server]
+host = "127.0.0.1"
+port = 3000
+
+[ouyi]
+base_url = "https://example.invalid"
+jwt_token = "test"
+app_version = "3.0.3"
+model_refresh_interval_secs = 3600
+
+[limits]
+request_timeout_secs = 30
+no_data_timeout_secs = 30
+max_response_bytes = 1048576
+max_messages_bytes = 1048576
+max_concurrent_requests = 1
+"#;
+        std::fs::write(&temp_file.0, original).unwrap();
+
+        let mut config = toml::from_str::<AppConfig>(
+            r#"
+[server]
+host = "127.0.0.1"
+port = 3000
+
+[ouyi]
+base_url = "https://example.invalid"
+jwt_token = "test"
+app_version = "3.0.3"
+model_refresh_interval_secs = 3600
+
+[limits]
+request_timeout_secs = 30
+no_data_timeout_secs = 30
+max_response_bytes = 1048576
+max_messages_bytes = 1048576
+max_concurrent_requests = 1
+"#,
+        )
+        .unwrap();
+        config.api_keys = Some(ApiKeysConfig {
+            keys: vec!["sk-inference-test-key-0001".to_string()],
+        });
+
+        let result = write_app_config(&temp_file.0, &config);
+
+        assert!(matches!(result, Err(AppError::Config(_))));
+        assert_eq!(std::fs::read_to_string(&temp_file.0).unwrap(), original);
     }
 
     #[test]

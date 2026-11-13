@@ -1,6 +1,10 @@
+# 推理入口多轮工具调用探针：按协议族（OpenAI Chat / Anthropic Messages / Responses）
+# 发起带工具的多轮对话，校验模型是否真的走完工具链并给出最终答案。
+# 跑前：用 OUYI_BASE_URL 指向反代地址（默认 http://127.0.0.1:3000），
+# 用 OUYI_API_KEY 指向可用凭据（缺省时使用占位值）。
 [CmdletBinding()]
 param(
-    [string]$BaseUrl = 'https://ouyi.viaxv.cn',
+    [string]$BaseUrl = $(if ($env:OUYI_BASE_URL) { $env:OUYI_BASE_URL } elseif ($env:BASE_URL) { $env:BASE_URL } else { 'http://127.0.0.1:3000' }),
     [string[]]$Models = @('glm-5.2', 'gpt-5.6-sol'),
     [string[]]$Protocols = @('openai-chat', 'anthropic', 'responses'),
     [bool[]]$StreamModes = @($false, $true),

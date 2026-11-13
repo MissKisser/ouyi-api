@@ -118,6 +118,21 @@ curl http://127.0.0.1:3000/anthropic/v1/messages \
   -d '{"model":"claude-sonnet-4-6-thinking","max_tokens":200,"messages":[{"role":"user","content":"Hello"}],"stream":true}'
 ```
 
+## 鉴权（可选）
+
+默认不启用鉴权。在 `config.toml` 配置非空 `[api_keys]` 列表后，推理与模型列表端点要求凭据：
+
+```toml
+[api_keys]
+keys = ["sk-替换为你的密钥"]
+```
+
+- 请求头：`Authorization: Bearer <key>` 或 `x-api-key: <key>`（任一即可）。
+- 管理后台签发的 JWT 也能通过鉴权（内置对话测试页无需额外配置）。
+- 管理端「配置 → 接口鉴权」可热更新 key 列表；清空全部 key 即关闭鉴权。
+- 管理端提交非空 key 列表会**整体替换**全部现有 key；轮换时新旧 key 一并填入，删除旧 key 时再提交不含它的列表。
+- 单个 key 长度至少 16 个字符，可用 `openssl rand -hex 24` 生成。
+
 ## Claude Code 集成
 
 ### 方式一：环境变量

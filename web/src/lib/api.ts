@@ -423,14 +423,6 @@ export interface AccountEntry {
   enabled: boolean;
 }
 
-/** 对外开放的 API key 条目。 */
-export interface ApiKeyEntry {
-  /** key 值，调用方以 Bearer 方式携带。 */
-  key: string;
-  /** key 的用途描述。 */
-  description: string;
-}
-
 /** 分类模型列表响应（GET /admin/api/models/categorized）。 */
 export interface CategorizedModelsResponse {
   /** 当前生效的平台。 */
@@ -479,8 +471,8 @@ export interface FullConfig {
   admin: AdminConfigResponse;
   /** 上游账号池列表。 */
   accounts: AccountEntry[];
-  /** 对外 API key 列表。 */
-  api_keys: ApiKeyEntry[];
+  /** API key 掩码列表（服务端只回显首尾字符；未配置时为空数组）。 */
+  api_keys?: { masked: string }[];
   /** DeepSeek 工具链路配置。 */
   tool_runtime: ToolRuntimeConfig;
   /** OpenAI 工具链路配置。 */
